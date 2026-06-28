@@ -1,0 +1,36 @@
+[project]
+name = "packager"
+version = "0.1.0"
+description = "Per-item shaka-packager worker for katalog. Claims items with transcode=pending from the katalog claim API, runs ffmpeg + shaka-packager to build a CMAF/HLS tree under /var/lib/katalog/packages, reports transcode=done/failed back. Runs in its own pod so a packager crash doesn't take down the analyzer."
+requires-python = ">=3.11"
+dependencies = [
+  # HTTP client to katalog API (claim, upsert_step). Sync because the worker
+  # loop is one-item-at-a-time and packaging dominates the latency anyway.
+  "httpx==0.28.1",
+  # Structured JSON logs.
+  "structlog==25.4.0",
+  # Tiny FastAPI surface for /healthz + /readyz. uvicorn runs it side-car to
+  # the worker loop in the same process so kubelet probes work.
+  "fastapi==0.118.0",
+  "uvicorn[standard]==0.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff==0.7.0",
+  "pytest==8.3.3",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]

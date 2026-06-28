@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: packager
+  namespace: stube
+  labels:
+    app: packager
+    value-stream: stube
+    component: pipeline
+    plane: worker
+spec:
+  # 2 replicas. Packaging is CPU-bound, serial inside a pod, and the
+  # SKIP LOCKED claim endpoint is race-free, so this scales linearly.
+  # At ~1 item/min/replica the full ~17k-item library would clear in
+  # ~6 days end-to-end IF the whole queue were live; today the queue
+  # is paused (everything skipped) and items get un-skipped selectively,
+  # so most of the time these pods sit idle on the 30 s poll loop —
+  # ~2 HTTP requests/min total, negligible load on katalog-manager-api.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: packager
+  template:
+    metadata:
+      labels:
+        app: packager
+        value-stream: stube
+        component: pipeline
+        plane: worker
+    spec:
+      serviceAccountName: packager
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          image: zaentrum/packager:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: KATALOG_API_URL
+              # Workers point at the CAP Java manager API for both
+              # reads + writes (claim + upsert_step). Service URL with
+              # no /api suffix; the client prepends "/api/...".
+              value: "http://katalog-manager-api.stube.svc.cluster.local"
+            - name: OIDC_TOKEN_URL
+              # Your identity provider's OAuth2 token endpoint.
+              value: "https://sso.example.com/realms/your-realm/protocol/openid-connect/token"
+            - name: OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: katalog-oidc
+                  key: client-id
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: katalog-oidc
+                  key: client-secret
+            # Worker tuning. Packaging is serial — one item per pod at
+            # a time. Idle sleep on empty queue stays short so the pod
+            # picks up freshly-enqueued items without a noticeable
+            # latency hit.
+            - name: CLAIM_BATCH_SIZE
+              value: "1"
+            - name: IDLE_SLEEP_SECONDS
+              value: "30"
+          volumeMounts:
+            # Read-only source files. Same NFS export the analyzer reads.
+            - name: media
+              mountPath: /var/lib/katalog/media
+              readOnly: true
+            # Writeable packaged output tree. katalog-stream reads from
+            # the same PVC (RO there) to serve the CMAF segments.
+            - name: packages
+              mountPath: /var/lib/katalog/packages
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              # Packaging is CPU-bound (ffmpeg remux + shaka-packager
+              # walk). 4 vCPU keeps us under ~5 min per 2 h movie on
+              # the current node mix. Memory headroom mostly absorbs
+              # ffprobe's stream-table allocations on bigger files.
+              cpu: "4"
+              memory: 4Gi
+      volumes:
+        - name: media
+          persistentVolumeClaim:
+            claimName: media
+        - name: packages
+          persistentVolumeClaim:
+            claimName: packages
+# NOTE: the stale-claim janitor CronJob from the chino reference
+# (katalog-beta/katalog-janitor) is intentionally NOT recreated here.
+# It stays in katalog-beta as an operational utility against the live
+# postgres schema, owned by katalog-manager-api's deploy job — not
+# duplicated per worker.
