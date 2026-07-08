@@ -36,8 +36,10 @@ RUN curl -fsSL -o /usr/local/bin/packager \
 
 WORKDIR /app
 
-# Runtime deps first (cached separately from source).
-RUN pip install httpx==0.28.1 structlog==25.4.0 fastapi==0.118.0 "uvicorn[standard]==0.32.0"
+# Runtime deps first (cached separately from source). confluent-kafka's
+# manylinux wheel bundles librdkafka, so this glibc base needs no extra
+# apt packages for Kafka.
+RUN pip install httpx==0.28.1 confluent-kafka==2.5.3 structlog==25.4.0 fastapi==0.118.0 "uvicorn[standard]==0.32.0"
 
 COPY pyproject.toml ./
 COPY src ./src

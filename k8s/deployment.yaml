@@ -9,13 +9,12 @@ metadata:
     component: pipeline
     plane: worker
 spec:
-  # 2 replicas. Packaging is CPU-bound, serial inside a pod, and the
-  # SKIP LOCKED claim endpoint is race-free, so this scales linearly.
-  # At ~1 item/min/replica the full ~17k-item library would clear in
-  # ~6 days end-to-end IF the whole queue were live; today the queue
-  # is paused (everything skipped) and items get un-skipped selectively,
-  # so most of the time these pods sit idle on the 30 s poll loop —
-  # ~2 HTTP requests/min total, negligible load on katalog-manager-api.
+  # 2 replicas. Packaging is CPU-bound and serial inside a pod. The
+  # worker is a Kafka consumer in group `packager-workers`, so Kafka
+  # rebalances the `stube.catalog.item.transcoded` partitions across
+  # the replicas — this scales linearly up to the topic's partition
+  # count. When the queue is idle the pods block on a 1 s poll with no
+  # HTTP traffic to katalog-manager-api at all.
   replicas: 2
   strategy:
     type: RollingUpdate
@@ -44,9 +43,10 @@ spec:
               name: http
           env:
             - name: KATALOG_API_URL
-              # Workers point at the CAP Java manager API for both
-              # reads + writes (claim + upsert_step). Service URL with
-              # no /api suffix; the client prepends "/api/...".
+              # Workers point at the manager API for reads + writes
+              # (get_item, get_steps, upsert_step, packaging_complete).
+              # Service URL with no /api suffix; the client prepends
+              # "/api/...".
               value: "http://katalog-manager-api.stube.svc.cluster.local"
             - name: OIDC_TOKEN_URL
               # Your identity provider's OAuth2 token endpoint.
@@ -61,14 +61,18 @@ spec:
                 secretKeyRef:
                   name: katalog-oidc
                   key: client-secret
-            # Worker tuning. Packaging is serial — one item per pod at
-            # a time. Idle sleep on empty queue stays short so the pod
-            # picks up freshly-enqueued items without a noticeable
-            # latency hit.
-            - name: CLAIM_BATCH_SIZE
-              value: "1"
-            - name: IDLE_SLEEP_SECONDS
-              value: "30"
+            # Kafka. PLAINTEXT bootstrap broker(s); the packager consumes
+            # `stube.catalog.item.transcoded` in group `packager-workers`
+            # and produces nothing (terminal stage). Topic + group are
+            # env-overridable; the defaults match the shared contract.
+            - name: KAFKA_BROKERS
+              value: "kafka.stube.svc.cluster.local:9092"
+            - name: KAFKA_SECURITY_PROTOCOL
+              value: "PLAINTEXT"
+            - name: KAFKA_GROUP_ID
+              value: "packager-workers"
+            - name: CONSUME_TOPIC
+              value: "stube.catalog.item.transcoded"
           volumeMounts:
             # Read-only source files. Same NFS export the analyzer reads.
             - name: media

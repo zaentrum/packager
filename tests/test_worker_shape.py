@@ -28,14 +28,33 @@ def test_config_from_env_full(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OIDC_TOKEN_URL", "https://sso.example/token")
     monkeypatch.setenv("OIDC_CLIENT_ID", "katalog")
     monkeypatch.setenv("OIDC_CLIENT_SECRET", "x" * 32)
-    monkeypatch.setenv("CLAIM_BATCH_SIZE", "3")
-    monkeypatch.setenv("IDLE_SLEEP_SECONDS", "10")
     cfg = Config.from_env()
     assert cfg.katalog_api_url == "http://katalog-app"
-    assert cfg.claim_batch_size == 3
-    assert cfg.idle_sleep_seconds == 10.0
+    # Kafka defaults match the shared contract when env is not set.
+    assert cfg.kafka_brokers == "kafka:9092"
+    assert cfg.kafka_security_protocol == "PLAINTEXT"
+    assert cfg.kafka_group_id == "packager-workers"
+    assert cfg.consume_topic == "stube.catalog.item.transcoded"
+    # Terminal stage — no downstream event.
+    assert cfg.produce_topic == ""
     # Default value retained when env var is not set.
     assert cfg.packages_root == "/var/lib/katalog/packages"
+
+
+def test_config_kafka_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KATALOG_API_URL", "http://katalog-app")
+    monkeypatch.setenv("OIDC_TOKEN_URL", "https://sso.example/token")
+    monkeypatch.setenv("OIDC_CLIENT_ID", "katalog")
+    monkeypatch.setenv("OIDC_CLIENT_SECRET", "x")
+    monkeypatch.setenv("KAFKA_BROKERS", "b1:9092,b2:9092")
+    monkeypatch.setenv("KAFKA_SECURITY_PROTOCOL", "SSL")
+    monkeypatch.setenv("KAFKA_GROUP_ID", "packager-alt")
+    monkeypatch.setenv("CONSUME_TOPIC", "custom.topic")
+    cfg = Config.from_env()
+    assert cfg.kafka_brokers == "b1:9092,b2:9092"
+    assert cfg.kafka_security_protocol == "SSL"
+    assert cfg.kafka_group_id == "packager-alt"
+    assert cfg.consume_topic == "custom.topic"
 
 
 def test_config_packages_root_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -85,6 +104,7 @@ def test_module_layout_importable() -> None:
     # we'd notice here.
     import packager
     import packager.config
+    import packager.events
     import packager.katalog
     import packager.packager
     import packager.worker

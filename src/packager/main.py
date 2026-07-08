@@ -46,8 +46,9 @@ def main() -> int:
     log.info(
         "packager.start",
         katalog=cfg.katalog_api_url,
-        batch_size=cfg.claim_batch_size,
-        idle_sleep=cfg.idle_sleep_seconds,
+        brokers=cfg.kafka_brokers,
+        group_id=cfg.kafka_group_id,
+        consume_topic=cfg.consume_topic,
     )
 
     client = KatalogClient(
@@ -70,8 +71,10 @@ def main() -> int:
         target=run_worker,
         kwargs={
             "client": client,
-            "batch_size": cfg.claim_batch_size,
-            "idle_sleep": cfg.idle_sleep_seconds,
+            "brokers": cfg.kafka_brokers,
+            "group_id": cfg.kafka_group_id,
+            "consume_topic": cfg.consume_topic,
+            "security_protocol": cfg.kafka_security_protocol,
             "error_sleep": cfg.error_sleep_seconds,
             "stop": stop,
         },

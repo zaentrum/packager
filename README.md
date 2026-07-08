@@ -1,26 +1,32 @@
 # packager
 
-Per-item CMAF packager for the zaentrum platform. A small Python worker
-that claims items from the katalog API, runs `ffmpeg` + `shaka-packager`,
+Per-item CMAF packager for the zaentrum platform — the **terminal stage**
+of the catalog pipeline. A small Python worker that consumes the Kafka
+topic `stube.catalog.item.transcoded`, runs `ffmpeg` + `shaka-packager`,
 and emits a streaming-friendly CMAF/HLS tree (plus trickplay sprites and
 WebVTT subtitles) under the per-item output directory.
 
 ## Status
 
-**Scaffold; pipeline wiring in progress.**
+**Kafka event consumer.**
 
-The packager logic (HEVC passthrough, AAC transcode-on-demand, subtitle
-extraction, trickplay generation) is in place. The intended task contract
-is **Kafka topics** (`stube.processing.task.package.*`); the current worker
-still claims items over the HTTP claim API while that migration lands.
+The packager consumes `stube.catalog.item.transcoded` (consumer group
+`packager-workers`), resolves the item's full detail over the katalog
+HTTP API, runs the packaging (HEVC passthrough, AAC transcode-on-demand,
+subtitle extraction, trickplay generation), writes the `package` step +
+manifest back over HTTP, and produces **no** downstream event. Offsets
+are committed manually only after an item is fully processed, so a crash
+mid-work reprocesses (idempotent via the katalog `(item_id, step)`
+unique index + the done-step guard).
 
 ## Layout
 
 ```
-src/packager/main.py        # entry point: worker thread + FastAPI /healthz + /readyz
-src/packager/config.py      # env-driven config (KATALOG_API_URL, OIDC_*, batch/sleep tunables)
-src/packager/katalog.py     # HTTP client to the katalog API (claim + upsert_step), OIDC auth
-src/packager/worker.py      # claim loop: one item at a time, serial packaging
+src/packager/main.py        # entry point: consumer thread + FastAPI /healthz + /readyz
+src/packager/config.py      # env-driven config (KATALOG_API_URL, OIDC_*, KAFKA_* topic/group)
+src/packager/events.py      # Kafka consumer factory + envelope parsing
+src/packager/katalog.py     # HTTP client to the katalog API (get_item/get_steps/upsert_step/packaging_complete), OIDC auth
+src/packager/worker.py      # consumer loop: one item at a time, serial packaging
 src/packager/packager.py    # the package itself: ffmpeg remux + shaka-packager + trickplay + VTT
 scripts/                    # one-off backfill / diagnostics helpers
 k8s/                        # Deployment, Service, ServiceAccount, ServiceMonitor, GrafanaDashboard
@@ -56,9 +62,10 @@ docker build -t zaentrum/packager .
 
 Build and push the image to your own registry and update the image
 reference in `k8s/deployment.yaml` for your environment. The deployment
-expects two PVCs (read-only source media, writeable packaged output) and
+expects two PVCs (read-only source media, writeable packaged output),
 the `KATALOG_API_URL` / `OIDC_*` env vars wired to your katalog API and
-identity provider.
+identity provider, and `KAFKA_BROKERS` (+ optional `KAFKA_SECURITY_PROTOCOL`,
+`KAFKA_GROUP_ID`, `CONSUME_TOPIC`) pointing at your broker.
 
 ## License
 

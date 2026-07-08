@@ -1,11 +1,18 @@
 """HTTP client for the katalog Spring app.
 
-Three calls in scope for the packager:
-  * `POST /api/analyze/claim?pass=packager` — claim items whose
-    package step is pending (set by the transcoder after it
-    finishes or skips).
+Calls in scope for the packager (a PURE Kafka consumer — it no longer
+polls a claim endpoint; the itemId arrives on the
+`stube.catalog.item.transcoded` topic):
+  * `GET  /api/analyze/items/{id}` — fetch the full item detail from
+    the itemId carried on the Kafka event (the event carries only the
+    id; the client never trusts a payload-supplied path).
+  * `GET  /api/analyze/items/{id}/steps` — read the current step
+    statuses for the idempotency guard (skip work if package is
+    already done).
   * `PUT  /api/analyze/items/{id}/steps/package` — flip the step to
     in_progress / done / failed as the worker progresses.
+  * `POST /api/items/{id}/packaging-complete` — mirror the on-disk
+    manifest into the catalog DB after a successful package.
   * `POST /api/analyze/items/{id}/fail` — last-resort hard fail when
     the worker can't even attribute the error to the package step
     (e.g. the source file vanished from NFS).
@@ -149,21 +156,48 @@ class KatalogClient:
             log.warning("settings.fetch_failed", error=str(e)[:200])
             return {}
 
-    # ------------------------------------------------------------- claims
-    def claim(self, limit: int = 1) -> list[ClaimedItem]:
-        """Claim up to `limit` items in package=pending state. The
-        Java side flips package=in_progress as part of the same
-        transaction so a sibling packager pod won't grab the same
-        item between dequeue and the first heartbeat below."""
-        resp = self._request(
-            "POST",
-            f"/api/analyze/claim?pass=packager&limit={limit}",
-        )
+    # -------------------------------------------------------------- items
+    def get_item(self, item_id: str) -> ClaimedItem | None:
+        """Fetch one item's full detail from the itemId carried on the
+        Kafka event. The katalog endpoint returns the full shape
+        {id,type,title,year,durationMs,path,seasonNumber,episodeNumber,
+        seriesTitle,seriesTmdbId,movieTmdbId} — everything the packager
+        writes into a self-describing manifest. Returns None on 404 (the
+        item was deleted between the transcoder producing the event and
+        us consuming it) so the caller can commit + skip the message."""
+        resp = self._request("GET", f"/api/analyze/items/{item_id}")
+        if resp.status_code == 404:
+            return None
         resp.raise_for_status()
-        items = resp.json().get("items", [])
-        return [ClaimedItem.from_json(it) for it in items]
+        return ClaimedItem.from_json(resp.json())
 
     # ------------------------------------------------------------- steps
+    def get_steps(self, item_id: str) -> dict[str, str]:
+        """Return the current status of every analyze step on `item_id`
+        as a flat {step: status} map. Used by the consumer's idempotency
+        guard: if `package` is already 'done' we skip the (expensive)
+        packaging work on a redelivered event. Empty dict on any error —
+        the caller then treats the step as not-done and re-packages,
+        which is safe (packaging is idempotent on disk)."""
+        try:
+            resp = self._request(
+                "GET",
+                f"/api/analyze/items/{item_id}/steps",
+            )
+            if resp.status_code >= 400:
+                log.warning(
+                    "steps.get_failed",
+                    item_id=item_id,
+                    status=resp.status_code,
+                    body=resp.text[:200],
+                )
+                return {}
+            body = resp.json()
+            steps = body.get("steps") or {}
+            return {str(k): str(v) for k, v in steps.items()}
+        except Exception as e:
+            log.warning("steps.get_exception", item_id=item_id, error=str(e)[:200])
+            return {}
     def upsert_step(
         self,
         item_id: str,
