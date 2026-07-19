@@ -27,12 +27,29 @@ Go hub exactly):
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 import structlog
 from confluent_kafka import Consumer
 
 log = structlog.get_logger(__name__)
+
+
+def _security_conf(security_protocol: str) -> dict[str, str]:
+    """Kafka security settings. When KAFKA_CERT_DIR points at a mounted
+    mTLS secret (user.crt/user.key + the CLUSTER CA's ca.crt — the shared
+    Strimzi profile), it wins over `security_protocol`: a mounted cert dir
+    IS the operator's way of saying "this broker speaks mTLS"."""
+    cert_dir = os.environ.get("KAFKA_CERT_DIR", "").strip()
+    if cert_dir and os.path.isdir(cert_dir):
+        return {
+            "security.protocol": "SSL",
+            "ssl.ca.location": os.path.join(cert_dir, "ca.crt"),
+            "ssl.certificate.location": os.path.join(cert_dir, "user.crt"),
+            "ssl.key.location": os.path.join(cert_dir, "user.key"),
+        }
+    return {"security.protocol": security_protocol}
 
 
 def build_consumer(
@@ -48,7 +65,7 @@ def build_consumer(
         {
             "bootstrap.servers": brokers,
             "group.id": group_id,
-            "security.protocol": security_protocol,
+            **_security_conf(security_protocol),
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",
         }
