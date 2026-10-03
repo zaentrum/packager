@@ -10,6 +10,7 @@ the 5.1 companion, DEFAULT/FORCED flags, aligned segments, the manifest.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,9 +22,21 @@ from packager import worker
 from packager.hls import parse_attributes
 from packager.renditions import resolve_inputs
 
+
+def _ffmpeg_major() -> int:
+    """'ffmpeg version 7.1.5-0+deb13u1' / 'n7.1.5-…' / '8.1.2' -> 7 / 7 / 8."""
+    first = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL).stdout.split("\n", 1)[0]
+    m = re.search(r"version n?(\d+)\.", first)
+    return int(m.group(1)) if m else 99  # git builds ("N-12345-g…") are new
+
+
+# The handoff fixture encodes like the transcoder (ffmpeg 7.1:
+# -enc_time_base demux); older distro builds skip.
 pytestmark = pytest.mark.skipif(
-    any(shutil.which(b) is None for b in ("ffmpeg", "ffprobe", "packager")),
-    reason="needs ffmpeg, ffprobe and shaka-packager on PATH",
+    any(shutil.which(b) is None for b in ("ffmpeg", "ffprobe", "packager"))
+    or _ffmpeg_major() < 7,
+    reason="needs ffmpeg/ffprobe >= 7 and shaka-packager on PATH",
 )
 
 ITEM = "c0ffee00-0000-4000-8000-000000000007"
