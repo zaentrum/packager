@@ -580,7 +580,7 @@ def _surround_plan(
     """Which source tracks get a 5.1 companion: visible, >= 6 channels,
     not a commentary, first such track per language (a second English
     5.1 would be a duplicate). Stream-copied when the source already is
-    the target codec (WEB-DL E-AC-3), encoded otherwise (DTS, TrueHD,
+    the target codec (an E-AC-3 track), encoded otherwise (DTS, TrueHD,
     FLAC, PCM, AC-3 when the target is E-AC-3)."""
     codec = (options.surround_codec or "off").lower()
     if codec not in _SURROUND_CODECS:
