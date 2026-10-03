@@ -73,6 +73,18 @@ spec:
               value: "packager-workers"
             - name: CONSUME_TOPIC
               value: "stube.catalog.item.transcoded"
+            # 5.1 companion rendition (group audio-surround) for >= 6-channel
+            # tracks: eac3 | ac3 | off.
+            - name: SURROUND_AUDIO
+              value: "eac3"
+            # Reference the WebVTT HLS renditions from the master. Leave off
+            # until the playback routes serve hls/sN/ (README "Subtitles").
+            - name: HLS_SUBTITLES
+              value: "false"
+            # DEFAULT=YES audio language order; empty = the language
+            # whitelist setting's order.
+            - name: PREFERRED_LANGUAGES
+              value: ""
           volumeMounts:
             # Read-only source files. Same NFS export the analyzer reads.
             - name: media

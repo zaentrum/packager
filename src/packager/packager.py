@@ -1,20 +1,30 @@
 """Per-item CMAF packager.
 
-Takes a source file (HEVC video + AAC audio in any container), runs
-shaka-packager to emit a streaming-friendly CMAF tree under
-/var/lib/katalog/packages/{itemId}/, and writes the manifest.json that
-katalog-stream reads when deciding whether to serve a pre-packaged
-item or fall through to on-demand transcode.
+Takes the transcoder's handoff (one or more video renditions, see
+`packager.renditions`) or the original source, runs shaka-packager to
+emit a streaming-friendly CMAF/HLS tree under
+/var/lib/katalog/packages/{category}/{shard}/{itemId}/, and writes the
+manifest.json that chino-stream reads when deciding whether to serve a
+pre-packaged item or fall through to on-demand transcode.
 
-Design rules (Phase 2 MVP — first cut):
-* Video is HEVC passthrough. We never re-encode. If the source video
-  codec isn't hevc/h264 we fail the package job; the operator picks a
-  different source. This matches the user's "no re-encode" constraint.
-* Audio is AAC passthrough when the source track is already AAC,
-  otherwise we transcode to AAC-LC 48 kHz stereo via ffmpeg before
-  shaka-packager runs (browsers can't decode AC3/DTS/TrueHD natively
-  so this is the minimum needed for playback).
-* Subtitles are extracted to WebVTT.
+Design rules:
+* Video is passthrough. We never re-encode here. Every rendition must be
+  hevc/h264 (the transcoder produced or chose them); anything else fails
+  the package job.
+* N video renditions -> one master with one variant per rendition and
+  audio group, plus one I-frame playlist per rendition. The master is
+  assembled by `packager.hls` from shaka's media playlists.
+* Audio: every source track becomes an AAC-LC 48 kHz stereo rendition
+  (group "audio" — what every browser decodes). A visible source track
+  with >= 6 channels additionally gets a 5.1 E-AC-3 (or AC-3) rendition,
+  first per language, in group "audio-surround". Exactly one rendition
+  per group is DEFAULT=YES: the preferred-language track.
+* Subtitles are extracted to sidecar files (WebVTT for text, native
+  bitmap formats for PGS/VobSub/DVB) exactly as before. WebVTT tracks are
+  additionally packaged as HLS subtitle renditions (hls/sN/); the master
+  references them (TYPE=SUBTITLES, FORCED=YES where flagged) only when
+  HLS_SUBTITLES is on, so clients that draw their own sidecar subtitles
+  aren't surprised by in-manifest ones.
 * All state is on disk under the per-item output directory. The
   three sentinels {.packaging, .complete, .failed} are mutually
   exclusive and tell every reader where this package is in its
@@ -25,16 +35,20 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import structlog
+
+from . import hls
+from .renditions import PackageInputs, VideoInput
 
 log = structlog.get_logger("packager")
 
@@ -84,7 +98,9 @@ def _find_existing_root(item_id: str) -> Path | None:
 
 # Segment length in seconds. Same value the legacy on-demand pipeline
 # used; long enough to amortize HTTP overhead, short enough for snappy
-# seeks. shaka-packager will align cuts to source IDRs near this mark.
+# seeks. shaka-packager cuts at the first keyframe of each window, so
+# the transcoder forces keyframes at this interval (and tells us the
+# value it used in renditions.json, which wins over this default).
 SEGMENT_SECONDS = 6
 
 # Manifest schema version. Bump in lockstep with
@@ -97,12 +113,38 @@ SEGMENT_SECONDS = 6
 # seriesTitle + seasonNumber + episodeNumber + episodeCode). The
 # package directory then self-describes the item even if the catalog
 # DB is lost. durationMs moves to the top level since the stream
-# service needs it for the HLS playlist.
+# service needs it for the HLS playlist. Additive since: several
+# renditions.video entries, renditions.audioSurround, subtitles[].hls
+# and the hls block — readers that don't know them ignore them.
 #
 # v1: had source.{path,mtime,size,container,videoCodec,resolution,
 # frameRate,bitrateBps}. The stream side still reads v1 packages
 # unchanged (Source struct in manifest.go is optional now).
 MANIFEST_VERSION = 2
+
+# HLS group ids. "audio" is what shaka has always written for the stereo
+# group; clients key on nothing else.
+AUDIO_GROUP = "audio"
+SURROUND_GROUP = "audio-surround"
+SUBTITLE_GROUP = "subs"
+
+STEREO_BITRATE = "192k"
+_STEREO_FORMAT = "aformat=sample_rates=48000:channel_layouts=stereo"
+_SURROUND_FORMAT = "aformat=sample_rates=48000:channel_layouts=5.1(side)|5.1"
+_SURROUND_CODECS = {"eac3": "ec-3", "ac3": "ac-3"}
+
+
+@dataclass(frozen=True)
+class PackageOptions:
+    """Packager-wide knobs (env, see config.py)."""
+    segment_seconds: int = SEGMENT_SECONDS
+    # "eac3" | "ac3" | "off" — the 5.1 companion of >= 6-channel tracks.
+    surround_codec: str = "eac3"
+    surround_bitrate: str = "448k"
+    # Reference the WebVTT renditions from the master (TYPE=SUBTITLES).
+    hls_subtitles: bool = False
+    # Language preference for DEFAULT=YES; empty = the whitelist order.
+    preferred_languages: tuple[str, ...] = field(default_factory=tuple)
 
 
 def _episode_code(season: int | None, episode: int | None) -> str | None:
@@ -141,7 +183,7 @@ def _run_ffmpeg_capturing(label: str, args: list[str]) -> None:
     bulk-packaging queue. Capturing stderr + raising PackageError
     with a 1500-char snippet keeps the .failed sentinel actionable.
     """
-    result = subprocess.run(args, capture_output=True, text=True)
+    result = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
     if result.returncode != 0:
         stderr = (result.stderr or "").strip()
         raise PackageError(
@@ -156,6 +198,8 @@ class _Probe:
     video: dict[str, Any]
     audio: list[dict[str, Any]]
     subtitles: list[dict[str, Any]]
+    # Absolute stream index of `video` (the first non-cover-art video).
+    video_index: int | None = None
 
 
 def package_item(
@@ -171,33 +215,44 @@ def package_item(
     season_number: int | None = None,
     episode_number: int | None = None,
     tmdb_id: str | None = None,
+    inputs: PackageInputs | None = None,
+    options: PackageOptions | None = None,
 ) -> dict[str, Any]:
     """Package one item synchronously. Returns the written manifest.
 
     Safe to retry: a previous .failed or partial run is wiped before
     re-attempting. Concurrent calls for the same item_id are NOT
-    serialised here — the caller (the analyzer FastAPI layer) owns the
-    queue.
+    serialised here — the caller owns the queue.
 
     item_type is katalog's classification (movie/episode/album/…) and
     decides which top-level category directory the package lands under.
 
+    `inputs` is the resolved transcoder handoff (packager.renditions);
+    None packages `source_path` as the single rendition, as before.
+    `inputs.primary` (v0) carries the audio and subtitle tracks.
+
     language_whitelist is a list of lowercased ISO 639-1/2 codes
     (`en`, `de`, `zh`, …). Tracks (audio + subtitle) whose language
     tag is in the list get `visible: True` in the manifest; the rest
-    get `visible: False`. Every track is still encoded into the HLS
-    tree — the player consults the visibility flag when building its
+    get `visible: False`. Every audio track is still encoded into the
+    HLS tree — the player consults the visibility flag when building its
     language menu, but a power-user / future toggle can opt back in
     without re-packaging. An empty/None list marks every track
     visible. When the whitelist would mark nothing visible AND
     `keep_original_if_single` is True AND the source has exactly one
     distinct language tag, every track is marked visible — covers
     the anime / foreign-only case where en/de/zh wouldn't otherwise
-    match. Loaded from the Settings entity by the worker on each
-    claim cycle so an operator edit takes effect on the next item."""
-    src = Path(source_path)
+    match. The whitelist order is also the language preference for the
+    DEFAULT=YES audio track unless options.preferred_languages is set.
+    Loaded from the Settings entity by the worker on each item so an
+    operator edit takes effect on the next item."""
+    options = options or PackageOptions()
+    if inputs is None:
+        inputs = PackageInputs(video=[VideoInput("v0", Path(source_path))], kind="original")
+    src = inputs.primary.path
     if not src.exists():
-        raise PackageError(f"source not found: {source_path}")
+        raise PackageError(f"source not found: {src}")
+    segment_seconds = inputs.segment_seconds or options.segment_seconds
 
     out_root = _item_root(item_id, item_type)
     _reset_output_dir(out_root)
@@ -224,31 +279,50 @@ def package_item(
             probe.subtitles, language_whitelist,
             keep_original_if_single=keep_original_if_single,
         )
+        preferred = list(options.preferred_languages) or list(language_whitelist or [])
+        default_audio = _pick_default_audio(probe.audio, audio_visible, preferred)
+        surround = _surround_plan(probe.audio, audio_visible, options)
         log.info(
             "packager.lang_filter",
             whitelist=language_whitelist or None,
+            preferred=preferred or None,
             audio_total=len(probe.audio),
             audio_visible=len(audio_visible),
+            default_audio=default_audio,
+            surround=[s.source_index for s in surround] or None,
             sub_total=len(probe.subtitles),
             sub_visible=len(sub_visible),
+            video_renditions=len(inputs.video),
+            inputs=inputs.kind,
         )
 
-        # Stage source through ffmpeg if any audio track isn't already
-        # AAC. shaka-packager doesn't encode audio — it only packages —
-        # so non-AAC inputs need a pre-transmux pass. Subtitles are
-        # extracted in the same pass.
+        # Stage everything through ffmpeg: shaka-packager doesn't encode
+        # audio — it only packages — and doesn't read MKV for HEVC/H.264.
+        # Subtitles are extracted next to the package.
         with tempfile.TemporaryDirectory(prefix=f"pkg-{item_id}-") as tmp:
             tmpdir = Path(tmp)
-            packaging_source, audio_meta = _prepare_source(
+            packaging_source, audio_meta, surround_meta = _prepare_source(
                 src, probe, tmpdir,
                 audio_visible_indices=audio_visible,
+                default_index=default_audio,
+                surround=surround,
+                timeline=inputs.primary.timeline,
+                ts_offset=inputs.timestamp_offset,
             )
+            videos = [_StagedVideo(inputs.primary, packaging_source, probe)]
+            for rung in inputs.video[1:]:
+                staged = _remux_video(rung, tmpdir, inputs.timestamp_offset)
+                if staged is not None:
+                    videos.append(staged)
             subtitle_meta = _extract_subtitles(
                 src, probe, out_root / "subs",
                 visible_indices=sub_visible,
             )
-            video_meta, audio_meta = _run_shaka_packager(
-                packaging_source, probe, audio_meta, out_root
+            video_meta, audio_meta, surround_meta = _run_shaka_packager(
+                packaging_source, videos, audio_meta, surround_meta, out_root,
+                segment_seconds=segment_seconds,
+                hls_subtitles=options.hls_subtitles,
+                subtitle_meta=subtitle_meta,
             )
 
         # Trickplay runs against the original source — only 1 frame
@@ -273,10 +347,24 @@ def package_item(
             "packagedAt": datetime.now(UTC).isoformat(),
             "packager": _packager_version(),
             "renditions": {
-                "video": [video_meta],
+                "video": video_meta,
+                # Stereo AAC, one per source track: what /info lists.
                 "audio": audio_meta,
+                # 5.1 companions (group audio-surround); a separate key so
+                # readers that count or list `audio` see the same tracks
+                # as before.
+                "audioSurround": surround_meta,
             },
             "subtitles": subtitle_meta,
+            "hls": {
+                "master": "hls/master.m3u8",
+                "segmentSeconds": segment_seconds,
+                "audioGroups": ([AUDIO_GROUP] if audio_meta else [])
+                + ([SURROUND_GROUP] if surround_meta else []),
+                "subtitleGroup": SUBTITLE_GROUP if (
+                    options.hls_subtitles and any(s.get("hls") for s in subtitle_meta)
+                ) else None,
+            },
         }
         if item_type == "episode":
             # Episodes need their own coordinates + the parent series
@@ -336,13 +424,20 @@ def _ffprobe(path: Path) -> _Probe:
         capture_output=True,
         check=True,
         text=True,
+        stdin=subprocess.DEVNULL,
     )
     raw = json.loads(out.stdout)
     fmt = raw.get("format", {})
     duration_ms = int(float(fmt.get("duration", "0")) * 1000)
     streams = raw.get("streams", [])
 
-    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    videos = [s for s in streams if s.get("codec_type") == "video"]
+    # Cover art rides along as a "video" stream with attached_pic set;
+    # the picture is the first video stream that isn't one.
+    video = next(
+        (s for s in videos if not (s.get("disposition") or {}).get("attached_pic")),
+        videos[0] if videos else {},
+    )
     audio = [s for s in streams if s.get("codec_type") == "audio"]
     subtitles = [s for s in streams if s.get("codec_type") == "subtitle"]
     return _Probe(
@@ -351,7 +446,33 @@ def _ffprobe(path: Path) -> _Probe:
         video=video,
         audio=audio,
         subtitles=subtitles,
+        video_index=video.get("index") if video else None,
     )
+
+
+# ISO 639-2 (bibliographic + terminology) -> 639-1 for the languages a
+# catalog realistically carries, so a whitelist / preference of "de"
+# matches tracks tagged "ger" or "deu" (and "en" matches "eng").
+_ISO639_1 = {
+    "eng": "en", "deu": "de", "ger": "de", "fra": "fr", "fre": "fr",
+    "spa": "es", "ita": "it", "jpn": "ja", "zho": "zh", "chi": "zh",
+    "por": "pt", "rus": "ru", "nld": "nl", "dut": "nl", "swe": "sv",
+    "nor": "no", "nob": "nb", "nno": "nn", "dan": "da", "fin": "fi",
+    "pol": "pl", "ces": "cs", "cze": "cs", "slk": "sk", "slo": "sk",
+    "hun": "hu", "ron": "ro", "rum": "ro", "tur": "tr", "ell": "el",
+    "gre": "el", "heb": "he", "ara": "ar", "hin": "hi", "kor": "ko",
+    "tha": "th", "vie": "vi", "ukr": "uk", "hrv": "hr", "srp": "sr",
+    "slv": "sl", "bul": "bg", "cat": "ca", "ind": "id", "msa": "ms",
+    "may": "ms", "fas": "fa", "per": "fa", "isl": "is", "ice": "is",
+    "roh": "rm", "lat": "la", "est": "et", "lav": "lv", "lit": "lt",
+}
+
+
+def _lang_key(tag: str | None) -> str:
+    """Comparable language key: ISO 639-1 when known ('ger' -> 'de'),
+    the bare primary subtag otherwise ('de-CH' -> 'de', 'gsw' -> 'gsw')."""
+    t = (tag or "und").strip().lower().replace("_", "-").split("-")[0]
+    return _ISO639_1.get(t, t) or "und"
 
 
 def _track_language(stream: dict[str, Any]) -> str:
@@ -381,70 +502,165 @@ def _visible_indices(
       1. Empty/None whitelist → every track is visible.
       2. Streams tagged 'und' (undefined) are always visible — better
          to surface a wrongly-tagged track than hide the only one.
-      3. Streams whose lang is in the whitelist are visible.
+      3. Streams whose language is in the whitelist are visible, compared
+         as ISO 639-1 keys ('ger'/'deu' match 'de').
       4. If the result is empty AND `keep_original_if_single` is True
          AND the source has exactly one distinct language, mark every
          stream visible. Anime / foreign-only fallback.
     """
     if not whitelist:
         return set(range(len(streams)))
+    wanted = {_lang_key(w) for w in whitelist}
     visible: set[int] = set()
     for i, s in enumerate(streams):
-        lang = _track_language(s)
-        if lang == "und" or lang in whitelist or lang[:2] in whitelist:
+        key = _lang_key(_track_language(s))
+        if key == "und" or key in wanted:
             visible.add(i)
     if visible:
         return visible
     if keep_original_if_single:
-        distinct = {_track_language(s) for s in streams}
+        distinct = {_lang_key(_track_language(s)) for s in streams}
         distinct.discard("und")
         if len(distinct) == 1:
             return set(range(len(streams)))
     return visible
 
 
+def _is_commentary(stream: dict[str, Any]) -> bool:
+    disp = stream.get("disposition") or {}
+    title = ((stream.get("tags") or {}).get("title") or "").lower()
+    return bool(disp.get("comment")) or "comment" in title or "kommentar" in title
+
+
+def _pick_default_audio(
+    streams: list[dict[str, Any]],
+    visible: set[int],
+    preferred: list[str],
+) -> int | None:
+    """The one audio track marked DEFAULT=YES: the first preferred
+    language that has a track wins; within a language, a visible
+    non-commentary track flagged default in the source, else the first
+    one. No preference match -> the source's default-flagged track, else
+    the first visible track."""
+    if not streams:
+        return None
+
+    def rank(i: int) -> tuple[bool, bool, bool, int]:
+        s = streams[i]
+        return (
+            i not in visible,
+            _is_commentary(s),
+            not (s.get("disposition") or {}).get("default"),
+            i,
+        )
+
+    keys = [_lang_key(_track_language(s)) for s in streams]
+    for pref in preferred:
+        want = _lang_key(pref)
+        candidates = [i for i, k in enumerate(keys) if k == want]
+        if candidates:
+            return min(candidates, key=rank)
+    return min(range(len(streams)), key=rank)
+
+
+@dataclass(frozen=True)
+class _SurroundTrack:
+    source_index: int
+    mode: str        # "copy" | "encode"
+    codec: str       # ffmpeg codec name: eac3 | ac3
+    hls_codec: str   # CODECS token: ec-3 | ac-3
+    bitrate: str
+
+
+def _surround_plan(
+    streams: list[dict[str, Any]],
+    visible: set[int],
+    options: PackageOptions,
+) -> list[_SurroundTrack]:
+    """Which source tracks get a 5.1 companion: visible, >= 6 channels,
+    not a commentary, first such track per language (a second English
+    5.1 would be a duplicate). Stream-copied when the source already is
+    the target codec (WEB-DL E-AC-3), encoded otherwise (DTS, TrueHD,
+    FLAC, PCM, AC-3 when the target is E-AC-3)."""
+    codec = (options.surround_codec or "off").lower()
+    if codec not in _SURROUND_CODECS:
+        return []
+    plan: list[_SurroundTrack] = []
+    seen: set[str] = set()
+    for i, s in enumerate(streams):
+        if i not in visible or int(s.get("channels") or 0) < 6 or _is_commentary(s):
+            continue
+        key = _lang_key(_track_language(s))
+        if key in seen:
+            continue
+        seen.add(key)
+        mode = "copy" if (s.get("codec_name") or "").lower() == codec else "encode"
+        plan.append(_SurroundTrack(i, mode, codec, _SURROUND_CODECS[codec],
+                                   options.surround_bitrate))
+    return plan
+
+
+def _timeline_input_args(timeline: str) -> list[str]:
+    """`keep` / `offset` inputs are on the contract's shared timeline (or
+    moved onto it): don't let ffmpeg renormalise them per file."""
+    return ["-copyts"] if timeline in ("keep", "offset") else []
+
+
+def _timeline_output_args(timeline: str, ts_offset: float) -> list[str]:
+    if timeline == "offset" and ts_offset:
+        return ["-output_ts_offset", f"{ts_offset:.6f}"]
+    return []
+
+
 def _prepare_source(
     src: Path, probe: _Probe, tmpdir: Path,
     *,
     audio_visible_indices: set[int] | None = None,
-) -> tuple[Path, list[dict[str, Any]]]:
-    """Return a path shaka-packager can consume + per-audio-track
-    metadata.
+    default_index: int | None = None,
+    surround: list[_SurroundTrack] | None = None,
+    timeline: str = "normalize",
+    ts_offset: float = 0.0,
+) -> tuple[Path, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return an MP4 shaka-packager can consume (v0 video stream-copied,
+    then one AAC stereo track per source audio track, then the 5.1
+    companions) + the stereo and surround track metadata.
 
     shaka-packager only accepts MP4/fMP4/TS as input containers for
     HEVC — feeding it an MKV makes the WebM demuxer choke ("Unsupported
-    video codec"). So when the source isn't MP4 we always remux to an
-    MP4 intermediate (video stream copy, no re-encode). Audio is also
-    copied when it's already AAC, otherwise transcoded to AAC-LC
-    48 kHz stereo (the minimum compatible with browsers).
+    video codec"). So we always remux (video copy, no re-encode).
 
-    The one fast path: source is already MP4 AND every audio track is
-    AAC → hand the source to shaka-packager directly with no
-    intermediate. Most rips don't hit this so it's a small but real
-    optimization for the items that do.
+    Stereo: every source track is re-encoded to AAC-LC 48 kHz stereo
+    192 kbps — even tracks that are already AAC — for a correctness
+    guarantee: every stereo rendition has identical channel count,
+    sample rate, and known channel layout. 5.1 / 7.1 source audio left
+    as-is with channel_layout=unknown is what Chrome's MSE rejects with
+    CHUNK_DEMUXER_ERROR_APPEND_FAILED. The channel conversion is done in
+    the filter graph (aformat), never by per-stream `-ac:a:N`, which
+    silently no-ops for channel counts.
+
+    Surround: per `_surround_plan`, a stream copy or an E-AC-3/AC-3 5.1
+    encode at 48 kHz of the same decoded audio (asplit, one decode).
 
     audio_meta is a list of dicts with keys {idx, codec, language,
-    title, channels, default}, indexed in the order the audio streams
-    appear in the output (preserved source order, so audio_meta[N]
-    matches the Nth audio stream)."""
-    # Always go through the remux pass even when the source is already
-    # MP4-with-AAC. The original short-circuit (return src directly)
-    # would have preserved 5.1 / 7.1 layouts, undefined channel
-    # layouts, and unusual sample rates — every one of which trips
-    # Chrome MSE's AAC parser. Video is a stream-copy so the cost is
-    # ~30 s per movie even on a remuxed-MKV source.
+    title, channels, default, visible}, in source order (audio_meta[N]
+    is the Nth audio stream of the MP4 after the video)."""
+    surround = surround or []
     log.info(
         "packager.prepare",
         strategy="remux_to_mp4",
         container=probe.container,
         audio_count=len(probe.audio),
         non_aac=[s.get("codec_name") for s in probe.audio if s.get("codec_name") != "aac"],
+        surround=[f"{s.source_index}:{s.mode}" for s in surround] or None,
+        timeline=timeline,
     )
     transmuxed = tmpdir / "transmux.mp4"
+    vmap = f"0:{probe.video_index}" if probe.video_index is not None else "0:v:0"
     args = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
+        *_timeline_input_args(timeline),
         "-i", str(src),
-        "-map", "0:v:0",
+        "-map", vmap,
         "-c:v", "copy",
     ]
     if probe.video.get("codec_name") == "hevc":
@@ -454,41 +670,112 @@ def _prepare_source(
         # makes ffmpeg refuse with "Tag hvc1 incompatible with output
         # codec id '27' (avc1)".
         args += ["-tag:v", "hvc1"]
-    for i, _stream in enumerate(probe.audio):
-        args += ["-map", f"0:a:{i}"]
-    # ALL audio output streams are re-encoded to AAC-LC stereo 48 kHz
-    # 192 kbps. Even tracks that are already AAC are re-encoded — we
-    # lose the passthrough optimization for a critical correctness
-    # guarantee: every audio rendition has identical channel count,
-    # sample rate, and known channel layout. Per-stream ffmpeg options
-    # (`-ac:a:N`, `-b:a:N`, …) are widely supported in the docs but in
-    # practice silently no-op for channel-count specs, leaving 5.1
-    # source audio as 5.1 output with channel_layout=unknown — which
-    # Chrome's MSE then rejects with CHUNK_DEMUXER_ERROR_APPEND_FAILED.
-    # Global options apply uniformly and avoid that trap.
-    args += [
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-ar", "48000",
-        "-ac", "2",
-    ]
-    # No subtitle streams in the intermediate — they're extracted
-    # separately to WebVTT.
-    args += ["-sn", "-movflags", "+faststart", str(transmuxed)]
+
+    encode_surround = {s.source_index for s in surround if s.mode == "encode"}
+    chains: list[str] = []
+    for i in range(len(probe.audio)):
+        if i in encode_surround:
+            chains += [
+                f"[0:a:{i}]asplit=2[as{i}][am{i}]",
+                f"[as{i}]{_STEREO_FORMAT}[s{i}]",
+                f"[am{i}]{_SURROUND_FORMAT}[m{i}]",
+            ]
+        else:
+            chains.append(f"[0:a:{i}]{_STEREO_FORMAT}[s{i}]")
+    if chains:
+        args += ["-filter_complex", ";".join(chains)]
+
+    out = 0
+    for i, stream in enumerate(probe.audio):
+        args += [
+            "-map", f"[s{i}]",
+            f"-c:a:{out}", "aac", f"-b:a:{out}", STEREO_BITRATE,
+            f"-metadata:s:a:{out}", f"language={_track_language(stream)}",
+        ]
+        out += 1
+    for s in surround:
+        if s.mode == "copy":
+            args += ["-map", f"0:a:{s.source_index}", f"-c:a:{out}", "copy"]
+        else:
+            args += ["-map", f"[m{s.source_index}]", f"-c:a:{out}", s.codec,
+                     f"-b:a:{out}", s.bitrate]
+        args += [f"-metadata:s:a:{out}",
+                 f"language={_track_language(probe.audio[s.source_index])}"]
+        out += 1
+
+    # No subtitle / data streams in the intermediate — subtitles are
+    # extracted separately to sidecar files.
+    args += ["-sn", "-dn", *_timeline_output_args(timeline, ts_offset),
+             "-movflags", "+faststart", str(transmuxed)]
     _run_ffmpeg_capturing("transmux", args)
-    # Audio is always re-encoded → transcoded=True for every track.
+
     # Visibility is attached per-meta-entry, not by dropping tracks —
     # every audio stream is packaged into the HLS tree; the client
     # decides which to show in the language menu using the `visible`
-    # flag.
+    # flag. Exactly one entry is the default.
     meta: list[dict[str, Any]] = []
     for i, s in enumerate(probe.audio):
         entry = _audio_meta_from_stream(i, s, transcoded=True)
         entry["visible"] = (
             audio_visible_indices is None or i in audio_visible_indices
         )
+        entry["default"] = i == default_index
         meta.append(entry)
-    return transmuxed, meta
+    surround_meta: list[dict[str, Any]] = []
+    for s in surround:
+        stream = probe.audio[s.source_index]
+        tags = stream.get("tags") or {}
+        surround_meta.append({
+            "idx": s.source_index,
+            "codec": s.hls_codec,
+            "language": tags.get("language") or "und",
+            "title": tags.get("title") or "",
+            "channels": int(stream.get("channels") or 6) if s.mode == "copy" else 6,
+            "default": s.source_index == default_index,
+            "visible": True,
+            "mode": s.mode,
+        })
+    return transmuxed, meta, surround_meta
+
+
+@dataclass(frozen=True)
+class _StagedVideo:
+    rung: VideoInput
+    mp4: Path
+    probe: _Probe
+
+
+def _remux_video(rung: VideoInput, tmpdir: Path, ts_offset: float) -> _StagedVideo | None:
+    """Stream-copy a lower rung's video into an MP4 for shaka, on the
+    shared timeline. A rung that can't be packaged is skipped (logged):
+    the item still gets its top rendition."""
+    try:
+        probe = _ffprobe(rung.path)
+    except (subprocess.CalledProcessError, ValueError) as e:
+        log.warning("packager.rung.probe_failed", rung=rung.id, error=str(e)[:300])
+        return None
+    codec = probe.video.get("codec_name")
+    if codec not in ("hevc", "h264"):
+        log.warning("packager.rung.unsupported_codec", rung=rung.id, codec=codec)
+        return None
+    target = tmpdir / f"{rung.id}.mp4"
+    vmap = f"0:{probe.video_index}" if probe.video_index is not None else "0:v:0"
+    args = [
+        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
+        *_timeline_input_args(rung.timeline),
+        "-i", str(rung.path),
+        "-map", vmap, "-c:v", "copy",
+        *(["-tag:v", "hvc1"] if codec == "hevc" else []),
+        "-an", "-sn", "-dn",
+        *_timeline_output_args(rung.timeline, ts_offset),
+        "-movflags", "+faststart", str(target),
+    ]
+    try:
+        _run_ffmpeg_capturing(f"remux {rung.id}", args)
+    except PackageError as e:
+        log.warning("packager.rung.remux_failed", rung=rung.id, error=str(e)[:300])
+        return None
+    return _StagedVideo(rung, target, probe)
 
 
 # Markers that, when present in an audio track's source `title`, tell
@@ -569,7 +856,7 @@ def _extract_subtitles(
     DVB) so a client with an image-subtitle renderer can overlay
     them frame-accurate; clients without one can ignore the
     `format` hint and fall back to the WebVTT tracks for the same
-    language.
+    language. HLS can't carry the image formats; they stay sidecar-only.
 
     Returns the list of subtitle entries for the manifest. Each
     entry carries `format` so the catalog (and downstream clients)
@@ -607,7 +894,7 @@ def _extract_subtitles(
             try:
                 subprocess.run(
                     [
-                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
                         "-i", str(src),
                         "-map", f"0:s:{i}",
                         "-c:s", "copy",
@@ -630,7 +917,7 @@ def _extract_subtitles(
             try:
                 subprocess.run(
                     [
-                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
                         "-i", str(src),
                         "-map", f"0:s:{i}",
                         "-c:s", "copy",
@@ -653,7 +940,7 @@ def _extract_subtitles(
             try:
                 subprocess.run(
                     [
-                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
                         "-i", str(src),
                         "-map", f"0:s:{i}",
                         "-c:s", "copy",
@@ -671,7 +958,7 @@ def _extract_subtitles(
         try:
             subprocess.run(
                 [
-                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                    "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
                     "-i", str(src),
                     "-map", f"0:s:{i}",
                     "-c:s", "webvtt",
@@ -722,7 +1009,7 @@ def _generate_trickplay(src: Path, probe: _Probe, out_dir: Path) -> dict[str, An
         f"tile={TRICKPLAY_GRID_COLS}x{TRICKPLAY_GRID_ROWS}"
     )
     args = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
         # -skip_frame nokey makes the HEVC decoder discard non-keyframe
         # samples instead of fully decoding them. We only need 1 frame
         # every 10 s and HEVC GOPs are typically <= 10 s long, so
@@ -813,118 +1100,317 @@ def _ms_to_vtt(ms: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{mmm:03d}"
 
 
+def _descriptor_value(value: str) -> str:
+    """shaka-packager uses ',' and '=' as stream-descriptor field
+    separators with no escape mechanism."""
+    return value.replace(",", ";").replace("=", "-")
+
+
+_LANG_TAG = re.compile(r"^[a-z]{2,3}(-[a-z0-9]{2,8})*$")
+
+
+def _shaka_command(
+    descriptors: list[str], segment_seconds: int, master: str,
+) -> list[str]:
+    return [
+        "packager", *descriptors,
+        "--segment_duration", str(segment_seconds),
+        "--hls_master_playlist_output", master,
+        "--hls_playlist_type", "VOD",
+    ]
+
+
+def _run_shaka(cmd: list[str], cwd: Path, label: str) -> None:
+    log.info("packager.shaka.start", label=label, cmd=cmd, cwd=str(cwd))
+    t0 = time.monotonic()
+    result = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True,
+                            stdin=subprocess.DEVNULL)
+    if result.returncode != 0:
+        raise PackageError(
+            f"shaka-packager ({label}) exited {result.returncode}: "
+            f"{result.stderr.strip()[-500:]}"
+        )
+    log.info("packager.shaka.done", label=label, elapsed_s=round(time.monotonic() - t0, 1))
+
+
+def _frame_rate(stream: dict[str, Any]) -> tuple[str, float | None]:
+    """ffprobe's fraction string and its value ('24000/1001', 23.976)."""
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        rate = stream.get(key) or ""
+        num, _, den = rate.partition("/")
+        try:
+            value = float(num) / float(den or 1)
+        except (ValueError, ZeroDivisionError):
+            continue
+        if value > 0:
+            return rate, value
+    return "", None
+
+
+def _video_range(stream: dict[str, Any]) -> str:
+    transfer = (stream.get("color_transfer") or "").lower()
+    return {"smpte2084": "PQ", "arib-std-b67": "HLG"}.get(transfer, "SDR")
+
+
 def _run_shaka_packager(
-    src: Path,
-    probe: _Probe,
+    primary: Path,
+    videos: list[_StagedVideo],
     audio_meta: list[dict[str, Any]],
+    surround_meta: list[dict[str, Any]],
     out_root: Path,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Invoke shaka-packager with one stream descriptor per output
-    rendition. Returns the (video_rendition, audio_renditions) entries
-    that go into the manifest."""
+    *,
+    segment_seconds: int = SEGMENT_SECONDS,
+    hls_subtitles: bool = False,
+    subtitle_meta: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Package every video rung + audio rendition in one shaka run (media
+    playlists + one I-frame playlist per rung), the WebVTT subtitles in
+    one isolated run each, then assemble hls/master.m3u8. Returns the
+    manifest entries for video, stereo audio and surround audio; the
+    subtitle entries gain an `hls` dir when their rendition was written.
+
+    shaka-packager selects streams by absolute MP4 stream index when
+    given a number, or by type ("video"/"audio"/"text") to pick the first
+    stream of that type. Each rung MP4 has exactly one video stream; the
+    primary MP4 has video at index 0, stereo tracks at 1..N and the
+    surround tracks after them."""
     hls_dir = out_root / "hls"
     hls_dir.mkdir(parents=True, exist_ok=True)
 
-    # shaka-packager selects streams by absolute MP4 stream index when
-    # given a number, or by type ("video"/"audio"/"text") to pick the
-    # first stream of that type. We use the type form for video (there's
-    # only one) and the absolute index for each audio track (the only
-    # way to pick the Nth — `stream_selector` is just an alias of
-    # `stream` so the original `stream=audio,stream_selector=N` failed
-    # with "stream=0 not available"). Our intermediate MP4 always has
-    # video at index 0 and audio at indices 1..N, so audio i sits at
-    # absolute index (i + 1).
     descriptors = [
         ",".join([
-            f"in={src}",
+            f"in={v.mp4}",
             "stream=video",
-            "init_segment=hls/v0/init.mp4",
-            "segment_template=hls/v0/seg-$Number%05d$.m4s",
-            "playlist_name=hls/v0/playlist.m3u8",
-            "iframe_playlist_name=hls/v0/iframes.m3u8",
+            f"init_segment=hls/{v.rung.id}/init.mp4",
+            f"segment_template=hls/{v.rung.id}/seg-$Number%05d$.m4s",
+            f"playlist_name=hls/{v.rung.id}/playlist.m3u8",
+            f"iframe_playlist_name=hls/{v.rung.id}/iframes.m3u8",
         ])
+        for v in videos
     ]
-    for i, meta in enumerate(audio_meta):
+    audio_entries = [(AUDIO_GROUP, m) for m in audio_meta] + [
+        (SURROUND_GROUP, m) for m in surround_meta
+    ]
+    for n, (group, meta) in enumerate(audio_entries):
         # Pick a name that describes the track *content*, not the
         # source codec. Source titles like "DTS-HD Master Audio /
         # 5.1 / 48 kHz / 2618 kbps / 24-bit" are misleading once we've
         # transcoded to stereo AAC — they're really codec metadata
         # masquerading as a title. _audio_display_name strips those.
-        # shaka-packager uses ',' and '=' as stream-descriptor field
-        # separators with no escape mechanism, so we also sanitize.
-        raw_name = _audio_display_name(meta, i)
-        safe_name = raw_name.replace(",", ";").replace("=", "-")
+        name = _audio_display_name(meta, meta["idx"])
+        if group == SURROUND_GROUP:
+            name = f"{name} 5.1"
+        meta["_name"] = name
         descriptors.append(",".join([
-            f"in={src}",
-            f"stream={i + 1}",
-            f"init_segment=hls/a{i}/init.mp4",
-            f"segment_template=hls/a{i}/seg-$Number%05d$.m4s",
-            f"playlist_name=hls/a{i}/playlist.m3u8",
-            "hls_group_id=audio",
-            f"hls_name={safe_name}",
+            f"in={primary}",
+            f"stream={n + 1}",
+            f"init_segment=hls/a{n}/init.mp4",
+            f"segment_template=hls/a{n}/seg-$Number%05d$.m4s",
+            f"playlist_name=hls/a{n}/playlist.m3u8",
+            f"hls_group_id={group}",
+            f"hls_name={_descriptor_value(name)}",
         ]))
+    scratch = "hls/.shaka-master.m3u8"
+    _run_shaka(_shaka_command(descriptors, segment_seconds, scratch), out_root, "media")
+    shaka = hls.read_shaka_master(out_root / scratch)
+    (out_root / scratch).unlink(missing_ok=True)
 
-    cmd = [
-        "packager", *descriptors,
-        "--segment_duration", str(SEGMENT_SECONDS),
-        "--hls_master_playlist_output", "hls/master.m3u8",
-        "--hls_playlist_type", "VOD",
-    ]
-    log.info("packager.shaka.start", cmd=cmd, cwd=str(out_root))
-    t0 = time.monotonic()
-    result = subprocess.run(cmd, cwd=str(out_root), capture_output=True, text=True)
-    if result.returncode != 0:
-        raise PackageError(
-            f"shaka-packager exited {result.returncode}: {result.stderr.strip()[:500]}"
-        )
-    log.info("packager.shaka.done", elapsed_s=round(time.monotonic() - t0, 1))
+    # ---- video
+    video_meta: list[dict[str, Any]] = []
+    variants: list[hls.VideoVariant] = []
+    for v in videos:
+        uri = f"{v.rung.id}/playlist.m3u8"
+        stats = hls.playlist_stats(hls_dir / v.rung.id / "playlist.m3u8")
+        attrs = shaka.video.get(uri, {})
+        codecs = [c for c in attrs.get("CODECS", "").split(",") if c]
+        codec = codecs[0] if codecs else _codec_string_for_video(v.probe.video)
+        width = int(v.probe.video.get("width") or 0)
+        height = int(v.probe.video.get("height") or 0)
+        if "RESOLUTION" in attrs:
+            w, _, h = attrs["RESOLUTION"].partition("x")
+            width, height = int(w), int(h)
+        rate, fps = _frame_rate(v.probe.video)
+        if fps is None and attrs.get("FRAME-RATE"):
+            fps = float(attrs["FRAME-RATE"])
+        video_range = _video_range(v.probe.video)
+        variants.append(hls.VideoVariant(
+            uri=uri, codec=codec, width=width, height=height, frame_rate=fps,
+            video_range=video_range, stats=stats,
+        ))
+        video_meta.append({
+            "id": v.rung.id,
+            "dir": f"hls/{v.rung.id}",
+            "codec": codec,
+            "width": width,
+            "height": height,
+            "bitrateBps": stats.avg_bps,
+            "peakBitrateBps": stats.peak_bps,
+            "hdr": video_range != "SDR",
+            "videoRange": video_range,
+            "frameRate": rate,
+            "segments": stats.segments,
+            "targetDuration": stats.target_duration or segment_seconds,
+            "label": v.rung.label,
+            "encoder": v.rung.encoder,
+        })
 
-    video_count = len(list((out_root / "hls/v0").glob("seg-*.m4s")))
-    video_rendition = {
-        "id": "v0",
-        "dir": "hls/v0",
-        "codec": _codec_string_for_video(probe.video),
-        "width": probe.video.get("width") or 0,
-        "height": probe.video.get("height") or 0,
-        "bitrateBps": int(probe.video.get("bit_rate") or 0),
-        "hdr": _is_hdr(probe.video),
-        "frameRate": probe.video.get("avg_frame_rate") or probe.video.get("r_frame_rate") or "",
-        "segments": video_count,
-        "targetDuration": SEGMENT_SECONDS,
-    }
-    audio_renditions: list[dict[str, Any]] = []
-    for i, meta in enumerate(audio_meta):
-        seg_count = len(list((out_root / f"hls/a{i}").glob("seg-*.m4s")))
-        audio_renditions.append({
-            "id": f"a{i}",
-            "dir": f"hls/a{i}",
-            "codec": "mp4a.40.2",
-            "language": meta["language"],
-            "title": meta["title"],
-            "default": meta["default"] or (i == 0),
-            "channels": meta["channels"],
-            "bitrateBps": 192000,
-            "segments": seg_count,
+    # ---- audio (exactly one DEFAULT per group; AUTOSELECT on the first
+    # visible rendition per language, so commentary isn't auto-picked)
+    groups: dict[str, list[hls.AudioRendition]] = {}
+    out_audio: dict[str, list[dict[str, Any]]] = {AUDIO_GROUP: [], SURROUND_GROUP: []}
+    for n, (group, meta) in enumerate(audio_entries):
+        uri = f"a{n}/playlist.m3u8"
+        stats = hls.playlist_stats(hls_dir / f"a{n}" / "playlist.m3u8")
+        media = shaka.media.get(uri, {})
+        codec_list = shaka.group_codecs.get(group) or []
+        codec = codec_list[0] if codec_list else (
+            "mp4a.40.2" if group == AUDIO_GROUP else meta["codec"])
+        groups.setdefault(group, []).append(hls.AudioRendition(
+            uri=uri, group=group, language=media.get("LANGUAGE", ""),
+            name=meta.pop("_name"), default=bool(meta["default"]),
+            autoselect=False, channels=media.get("CHANNELS", str(meta["channels"])),
+            codec=codec, stats=stats,
+        ))
+        out_audio[group].append({
+            **meta,
+            "id": f"a{n}",
+            "dir": f"hls/a{n}",
+            "codec": codec,
+            "bitrateBps": stats.avg_bps,
+            "segments": stats.segments,
+            "group": group,
             # Client visibility hint propagated from _prepare_source.
-            # True when no whitelist is active or the source lang
-            # matches; False for tracks that are present in the HLS
-            # tree but shouldn't show in the language picker by
-            # default. Falls back to True if the upstream meta
-            # didn't set it (older manifests).
             "visible": meta.get("visible", True),
         })
-    return video_rendition, audio_renditions
+    for group, renditions in groups.items():
+        groups[group] = _finish_group(renditions, out_audio[group])
+
+    # ---- subtitles: WebVTT -> HLS renditions, one isolated shaka run
+    # each so a cue file shaka rejects costs that track, not the package.
+    subtitle_renditions = _package_text_tracks(subtitle_meta or [], out_root, segment_seconds)
+
+    master = hls.build_master(
+        variants,
+        groups,
+        subtitle_renditions if hls_subtitles else None,
+        shaka.iframes,
+        subtitle_group=SUBTITLE_GROUP,
+        header_comment=(
+            f"## Media playlists by {_packager_version()}; master assembled by the "
+            "zaentrum packager"
+        ),
+    )
+    _write_atomic(hls_dir / "master.m3u8", master.encode())
+    return video_meta, out_audio[AUDIO_GROUP], out_audio[SURROUND_GROUP]
+
+
+def _finish_group(
+    renditions: list[hls.AudioRendition], metas: list[dict[str, Any]],
+) -> list[hls.AudioRendition]:
+    """Unique NAMEs, AUTOSELECT on the first visible rendition of each
+    language (plus the default)."""
+    names = hls.unique_names([r.name for r in renditions])
+    seen: set[str] = set()
+    out: list[hls.AudioRendition] = []
+    for r, name, meta in zip(renditions, names, metas, strict=True):
+        key = _lang_key(r.language or meta.get("language"))
+        autoselect = bool(meta.get("visible", True)) and key not in seen
+        if autoselect:
+            seen.add(key)
+        meta["name"] = name
+        out.append(hls.AudioRendition(**{**r.__dict__, "name": name, "autoselect": autoselect}))
+    return out
+
+
+def _package_text_tracks(
+    subtitle_meta: list[dict[str, Any]], out_root: Path, segment_seconds: int,
+) -> list[hls.SubtitleRendition]:
+    """Segment every visible WebVTT sidecar into an HLS subtitle
+    rendition at hls/sN/ (N = the sidecar's source index). Marks the
+    manifest entry with `hls`. PGS / VobSub / DVB stay sidecar-only."""
+    renditions: list[hls.SubtitleRendition] = []
+    seen: set[str] = set()
+    for entry in subtitle_meta:
+        if entry.get("format") != "webvtt" or not entry.get("visible", True):
+            continue
+        idx = entry["id"].removeprefix("sub")
+        rid = f"s{idx}"
+        lang = (entry.get("language") or "und").lower()
+        name = _subtitle_display_name(entry, idx)
+        fields = [
+            f"in={entry['path']}",
+            "stream=text",
+            f"segment_template=hls/{rid}/seg-$Number%05d$.vtt",
+            f"playlist_name=hls/{rid}/playlist.m3u8",
+            f"hls_group_id={SUBTITLE_GROUP}",
+            f"hls_name={_descriptor_value(name)}",
+        ]
+        if _LANG_TAG.match(lang) and lang != "und":
+            fields.append(f"language={lang}")
+        if entry.get("forced"):
+            fields.append("forced_subtitle=1")
+        scratch = f"hls/{rid}/.shaka-master.m3u8"
+        try:
+            _run_shaka(_shaka_command([",".join(fields)], segment_seconds, scratch),
+                       out_root, f"text {rid}")
+            media = hls.read_shaka_master(out_root / scratch).media.get(
+                f"{rid}/playlist.m3u8", {})
+            stats = hls.playlist_stats(out_root / "hls" / rid / "playlist.m3u8")
+        except (PackageError, OSError, ValueError) as e:
+            log.warning("packager.subs.hls_failed", rendition=rid, error=str(e)[:300])
+            shutil.rmtree(out_root / "hls" / rid, ignore_errors=True)
+            continue
+        (out_root / scratch).unlink(missing_ok=True)
+        if stats.segments == 0:
+            shutil.rmtree(out_root / "hls" / rid, ignore_errors=True)
+            continue
+        forced = bool(entry.get("forced"))
+        key = (_lang_key(lang), forced)
+        autoselect = forced or key not in seen
+        seen.add(key)
+        entry["hls"] = f"hls/{rid}"
+        renditions.append(hls.SubtitleRendition(
+            uri=f"{rid}/playlist.m3u8",
+            language=media.get("LANGUAGE", _lang_key(lang) if lang != "und" else ""),
+            name=name, forced=forced, autoselect=autoselect, stats=stats,
+        ))
+    names = hls.unique_names([r.name for r in renditions])
+    return [hls.SubtitleRendition(**{**r.__dict__, "name": n})
+            for r, n in zip(renditions, names, strict=True)]
+
+
+# Subtitle titles that only describe the track's kind; on their own they
+# make a useless menu entry ("Forced"), so they're combined with the
+# language ("English (Forced)").
+_SUBTITLE_KIND_TITLES = {
+    "forced", "full", "sdh", "cc", "hi", "signs", "signs & songs", "songs",
+    "default", "subtitles", "subs",
+}
+
+
+def _subtitle_display_name(entry: dict[str, Any], idx: str) -> str:
+    lang = (entry.get("language") or "und").lower()
+    language = _LANG_DISPLAY.get(lang, lang if lang != "und" else "")
+    title = (entry.get("title") or "").strip()
+    if not title:
+        name = language or f"Subtitles {idx}"
+    elif title.lower() in _SUBTITLE_KIND_TITLES and language:
+        name = f"{language} ({title})"
+    else:
+        name = title
+    if entry.get("forced") and "forced" not in name.lower():
+        name = f"{name} (forced)"
+    return name
 
 
 def _codec_string_for_video(stream: dict[str, Any]) -> str:
-    """Compose the MP4 codec string the master playlist will advertise
-    in CODECS=. shaka-packager writes the real avcC/hvcC bytes; this
-    string just has to match what's inside the init segment."""
+    """Fallback codec string when shaka's master didn't carry one; the
+    real one (read from the bitstream by shaka) is preferred."""
     codec = stream.get("codec_name", "")
     if codec == "h264":
-        return "avc1.640028"  # placeholder — packager rewrites; refine in Phase 2b
+        return "avc1.640028"
     if codec == "hevc":
-        return "hev1.1.6.L120.B0"  # ditto
+        return "hev1.1.6.L120.B0"
     return codec
 
 
@@ -950,6 +1436,7 @@ def _packager_version() -> str:
             capture_output=True,
             text=True,
             check=True,
+            stdin=subprocess.DEVNULL,
         )
         return out.stdout.strip().splitlines()[0] if out.stdout else "shaka-packager"
     except Exception:

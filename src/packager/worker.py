@@ -23,12 +23,12 @@ CPU-bound and disk-bound. To scale, add Deployment replicas; the Kafka
 consumer group rebalances partitions across them.
 
 Source-file selection: when katalog-transcoder ran ahead of us it
-leaves a handoff MKV at `{PACKAGES_ROOT}/_inbox/{itemId}/prepared.mkv`.
-That file is HEVC (NVENC) with every subtitle track from the source
-intact — the only thing the packager needs to know is to read *that*
-instead of `item.path`. When no prepared file exists (transcoder
-marked the source not_applicable because it was already HEVC) we fall
-through to the original source path.
+leaves a handoff under `{PACKAGES_ROOT}/_inbox/{itemId}/` —
+`renditions.json` listing N video rungs (prepared.mkv / v1.mkv / ... or
+the original for a stream-copied rung), or just `prepared.mkv` from an
+older transcoder. `packager.renditions.resolve_inputs` reads it. When no
+handoff exists (the transcoder marked the source not_applicable because
+it was already HEVC) we fall through to the original source path.
 """
 
 from __future__ import annotations
@@ -37,13 +37,13 @@ import os
 import shutil
 import threading
 import time
-from pathlib import Path
 
 import structlog
 
 from .events import build_consumer, parse_item_id
 from .katalog import ClaimedItem, KatalogClient
-from .packager import PACKAGES_ROOT, package_item
+from .packager import PACKAGES_ROOT, PackageOptions, package_item
+from .renditions import ContractError, resolve_inputs
 
 log = structlog.get_logger(__name__)
 
@@ -57,16 +57,6 @@ _POLL_TIMEOUT_SECONDS = 1.0
 
 
 _INBOX_ROOT = PACKAGES_ROOT / "_inbox"
-
-
-def _prepared_source(item_id: str) -> Path | None:
-    """Return the transcoder's prepared.mkv for this item if it exists.
-
-    The transcoder writes atomically (`prepared.mkv.partial` → rename)
-    so the presence of `prepared.mkv` itself implies a complete file.
-    """
-    candidate = _INBOX_ROOT / item_id / "prepared.mkv"
-    return candidate if candidate.exists() else None
 
 
 def _cleanup_inbox(item_id: str) -> None:
@@ -100,20 +90,30 @@ def _parse_settings(raw: dict[str, str]) -> tuple[list[str], bool]:
     return whitelist, keep_original
 
 
-def _process_one(item: ClaimedItem, client: KatalogClient) -> None:
+def _process_one(
+    item: ClaimedItem,
+    client: KatalogClient,
+    options: PackageOptions | None = None,
+) -> None:
     """Run packaging for one item. Heartbeats the package step at start
     (in_progress) and end (done / failed). The step-status writes here
     are the STATE the Activity monitor reads — they are the source of
     truth for pipeline progress, not the (now removed) claim state."""
-    prepared = _prepared_source(item.id)
-    effective_path = str(prepared) if prepared is not None else item.path
+    try:
+        inputs = resolve_inputs(_INBOX_ROOT / item.id, item.path)
+    except ContractError as e:
+        log.warning("packager.item.bad_handoff", item_id=item.id, error=str(e))
+        client.upsert_step(item.id, "failed", error=f"transcoder handoff: {e}"[:500])
+        return
+    effective_path = str(inputs.primary.path)
     log.info(
         "packager.item.start",
         item_id=item.id,
         title=item.title,
         type=item.type,
         path=effective_path,
-        source="transcoder_prepared" if prepared is not None else "original",
+        source=inputs.kind,
+        video_renditions=len(inputs.video),
     )
 
     if not os.path.exists(effective_path):
@@ -150,6 +150,8 @@ def _process_one(item: ClaimedItem, client: KatalogClient) -> None:
             season_number=item.season_number,
             episode_number=item.episode_number,
             tmdb_id=item.tmdb_id,
+            inputs=inputs,
+            options=options,
         )
     except Exception as e:
         # package_item already wrote `.failed` to the package dir and
@@ -167,6 +169,9 @@ def _process_one(item: ClaimedItem, client: KatalogClient) -> None:
     video_renditions = renditions.get("video", []) if isinstance(renditions, dict) else []
     audio_renditions = renditions.get("audio", []) if isinstance(renditions, dict) else []
     subtitles = manifest.get("subtitles", []) if isinstance(manifest, dict) else []
+    surround_renditions = (
+        renditions.get("audioSurround", []) if isinstance(renditions, dict) else []
+    )
     video_codec = (
         video_renditions[0].get("codec")
         if video_renditions and isinstance(video_renditions[0], dict)
@@ -175,6 +180,8 @@ def _process_one(item: ClaimedItem, client: KatalogClient) -> None:
     details = (
         f"v={video_codec} a={len(audio_renditions)} "
         f"subs={len(subtitles)} dur_s={seconds}"
+        + (f" vr={len(video_renditions)}" if len(video_renditions) > 1 else "")
+        + (f" a51={len(surround_renditions)}" if surround_renditions else "")
     )
     # Mirror the manifest into the catalog DB so the Object Page Files
     # facet picks up codec/resolution/bitrate + the packaged-asset row
@@ -186,9 +193,9 @@ def _process_one(item: ClaimedItem, client: KatalogClient) -> None:
 
     client.upsert_step(item.id, "done", details=details)
     # Drop the transcoder handoff (if any) only after the row is
-    # marked done — keeps the file around for forensics if any of the
+    # marked done — keeps the files around for forensics if any of the
     # bookkeeping calls above raised.
-    if prepared is not None:
+    if inputs.kind != "original" or (_INBOX_ROOT / item.id).exists():
         _cleanup_inbox(item.id)
     log.info(
         "packager.item.done",
@@ -201,7 +208,11 @@ def _process_one(item: ClaimedItem, client: KatalogClient) -> None:
     )
 
 
-def _handle_message(item_id: str, client: KatalogClient) -> None:
+def _handle_message(
+    item_id: str,
+    client: KatalogClient,
+    options: PackageOptions | None = None,
+) -> None:
     """Resolve, guard, and package a single item. Any error that the
     packaging body owns is already attributed to the `package` step by
     `_process_one`; this wrapper only owns the resolve + idempotency
@@ -222,9 +233,9 @@ def _handle_message(item_id: str, client: KatalogClient) -> None:
         log.info("packager.item.already_done", item_id=item_id)
         return
 
-    # 3. Run the existing packaging body (unchanged) with all its
-    #    katalog HTTP writes (upsert_step, packaging_complete).
-    _process_one(item, client)
+    # 3. Run the packaging body with all its katalog HTTP writes
+    #    (upsert_step, packaging_complete).
+    _process_one(item, client, options)
 
 
 def run_worker(
@@ -235,6 +246,7 @@ def run_worker(
     security_protocol: str,
     error_sleep: float,
     stop: threading.Event,
+    options: PackageOptions | None = None,
 ) -> None:
     """Blocking Kafka consumer loop. Exits when `stop` is set (SIGTERM
     handler in main). Offsets are committed manually only after an item
@@ -278,7 +290,7 @@ def run_worker(
                 continue
 
             try:
-                _handle_message(item_id, client)
+                _handle_message(item_id, client, options)
             except Exception as e:
                 # _process_one already attributed any packaging error to
                 # the package step; anything that escapes is a bug in the

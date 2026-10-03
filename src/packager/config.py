@@ -13,6 +13,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from .packager import PackageOptions
+
 
 @dataclass(frozen=True)
 class Config:
@@ -39,9 +41,26 @@ class Config:
     # Output root for packaged items. Mounted from the katalog-packages
     # PVC in the deployment.
     packages_root: str = "/var/lib/katalog/packages"
+    # --- packaging --------------------------------------------------------
+    # HLS segment length when the transcoder's renditions.json doesn't say
+    # (it records the keyframe interval it encoded with, which wins).
+    segment_seconds: int = 6
+    # 5.1 companion for >= 6-channel tracks: eac3 | ac3 | off.
+    surround_audio: str = "eac3"
+    surround_bitrate: str = "448k"
+    # Reference the WebVTT HLS renditions from the master. Off by default:
+    # the clients draw sidecar subtitles themselves, and the API routes
+    # don't serve hls/sN/ yet (see README "Subtitles").
+    hls_subtitles: bool = False
+    # Language preference for DEFAULT=YES audio, comma-separated; empty =
+    # the order of the packager.language_whitelist setting.
+    preferred_languages: str = ""
 
     @classmethod
     def from_env(cls) -> Config:
+        surround = os.environ.get("SURROUND_AUDIO", "eac3").strip().lower()
+        if surround not in ("eac3", "ac3", "off"):
+            raise RuntimeError(f"SURROUND_AUDIO must be eac3, ac3 or off (got {surround!r})")
         return cls(
             katalog_api_url=_require("KATALOG_API_URL"),
             oidc_token_url=_require("OIDC_TOKEN_URL"),
@@ -58,6 +77,23 @@ class Config:
             produce_topic=os.environ.get("PRODUCE_TOPIC", ""),
             error_sleep_seconds=float(os.environ.get("ERROR_SLEEP_SECONDS", "60")),
             packages_root=os.environ.get("PACKAGES_ROOT", "/var/lib/katalog/packages"),
+            segment_seconds=int(os.environ.get("SEGMENT_SECONDS", "6")),
+            surround_audio=surround,
+            surround_bitrate=os.environ.get("SURROUND_BITRATE", "448k"),
+            hls_subtitles=os.environ.get("HLS_SUBTITLES", "false").strip().lower()
+            in ("1", "true", "yes"),
+            preferred_languages=os.environ.get("PREFERRED_LANGUAGES", ""),
+        )
+
+    def package_options(self) -> PackageOptions:
+        return PackageOptions(
+            segment_seconds=self.segment_seconds,
+            surround_codec=self.surround_audio,
+            surround_bitrate=self.surround_bitrate,
+            hls_subtitles=self.hls_subtitles,
+            preferred_languages=tuple(
+                t.strip().lower() for t in self.preferred_languages.split(",") if t.strip()
+            ),
         )
 
 

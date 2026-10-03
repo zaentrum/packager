@@ -49,6 +49,11 @@ def main() -> int:
         brokers=cfg.kafka_brokers,
         group_id=cfg.kafka_group_id,
         consume_topic=cfg.consume_topic,
+        segment_seconds=cfg.segment_seconds,
+        surround_audio=cfg.surround_audio,
+        surround_bitrate=cfg.surround_bitrate,
+        hls_subtitles=cfg.hls_subtitles,
+        preferred_languages=cfg.preferred_languages or None,
     )
 
     client = KatalogClient(
@@ -77,6 +82,7 @@ def main() -> int:
             "security_protocol": cfg.kafka_security_protocol,
             "error_sleep": cfg.error_sleep_seconds,
             "stop": stop,
+            "options": cfg.package_options(),
         },
         daemon=True,
         name="packager-worker",
