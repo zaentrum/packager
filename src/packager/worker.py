@@ -39,13 +39,15 @@ import os
 import shutil
 import threading
 import time
+from pathlib import Path
+from typing import Any
 
 import structlog
 
 from .events import build_consumer, is_retry, parse_envelope, parse_item_id
 from .katalog import ClaimedItem, KatalogClient
-from .packager import PACKAGES_ROOT, PackageOptions, package_item
-from .renditions import ContractError, resolve_inputs
+from .packager import PACKAGES_ROOT, PackageOptions, package_item, probe_source
+from .renditions import ContractError, PackageInputs, resolve_inputs
 
 log = structlog.get_logger(__name__)
 
@@ -80,6 +82,31 @@ def _cleanup_inbox(item_id: str) -> None:
         shutil.rmtree(inbox_dir)
     except OSError as e:
         log.warning("packager.inbox.cleanup_failed", item_id=item_id, error=str(e))
+
+
+# What the catalog keeps of a title's source, in the names of the
+# transcoder's renditions.json source block (packaging-complete reads
+# them, as it reads the v1 manifest's names).
+SOURCE_KEYS = ("codec", "width", "height", "durationMs", "bitRate")
+
+
+def _source_block(inputs: PackageInputs, original: str) -> dict[str, Any]:
+    """The source block of the packaging-complete call: renditions.json's
+    `source` (the transcoder's probe of the original), completed by a
+    probe of the original for whatever it doesn't say — all of it when
+    there is no handoff (a source that needed no encode), the duration and
+    bit rate when the transcoder predates them. The package's own probe
+    can't stand in: for an encoded v0 it reads the encode. Only the
+    catalog gets this; the on-disk manifest (v2) keeps no source block."""
+    raw = inputs.contract.get("source")
+    # null is unknown, and so is a 0 / "" for one of the five (a size the
+    # transcoder's probe didn't get); other keys (hdr: false) pass as they are.
+    block = {k: v for k, v in raw.items()
+             if v is not None and (v or k not in SOURCE_KEYS)} if isinstance(raw, dict) else {}
+    if any(k not in block for k in SOURCE_KEYS) and os.path.exists(original):
+        for key, value in probe_source(Path(original)).items():
+            block.setdefault(key, value)
+    return block
 
 
 def _parse_settings(raw: dict[str, str]) -> tuple[list[str], bool]:
@@ -192,11 +219,13 @@ def _process_one(
     )
     # Mirror the manifest into the catalog DB so the Object Page Files
     # facet picks up codec/resolution/bitrate + the packaged-asset row
-    # + per-track SubtitleAssets without a separate scan pass. Step
+    # + per-track SubtitleAssets without a separate scan pass, and the
+    # source asset its exact probe (the source block). Step
     # bookkeeping happens after — if the manifest ingest fails, the
     # packaging itself is still "done" (data is on disk; the operator
     # can re-trigger a Validate to repair).
-    client.packaging_complete(item.id, manifest)
+    source = _source_block(inputs, item.path)
+    client.packaging_complete(item.id, {**manifest, "source": source} if source else manifest)
 
     client.upsert_step(item.id, "done", details=details)
     # Drop the transcoder handoff (if any) only after the row is

@@ -246,3 +246,17 @@ def test_worker_consumes_the_handoff(tmp_path: Path, monkeypatch, handoff) -> No
     assert "vr=3" in str(client.steps[-1][1]["details"])
     assert len(client.manifests[0]["renditions"]["video"]) == 3
     assert not work.exists()  # handoff cleaned up after a successful package
+
+    # The catalog gets the source as probed (this handoff's contract has no
+    # source block, so all of it comes from a probe of the original); the
+    # manifest on disk keeps none (v2).
+    fmt = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration,bit_rate", "-of", "json",
+         str(src)], capture_output=True, text=True, check=True).stdout)["format"]
+    assert client.manifests[0]["source"] == {
+        "codec": "h264", "width": 1280, "height": 720,
+        "durationMs": int(float(fmt["duration"]) * 1000), "bitRate": int(fmt["bit_rate"]),
+    }
+    on_disk = json.loads((tmp_path / "packages" / "movies" / ITEM[:2] / ITEM
+                          / "manifest.json").read_text())
+    assert "source" not in on_disk

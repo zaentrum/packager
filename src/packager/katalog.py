@@ -12,7 +12,9 @@ polls a claim endpoint; the itemId arrives on the
   * `PUT  /api/analyze/items/{id}/steps/package` — flip the step to
     in_progress / done / failed as the worker progresses.
   * `POST /api/items/{id}/packaging-complete` — mirror the on-disk
-    manifest into the catalog DB after a successful package.
+    manifest into the catalog DB after a successful package, with a
+    `source` block (codec, width, height, durationMs, bitRate) the
+    catalog keeps as the title's source asset.
   * `POST /api/analyze/items/{id}/fail` — last-resort hard fail when
     the worker can't even attribute the error to the package step
     (e.g. the source file vanished from NFS).

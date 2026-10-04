@@ -13,7 +13,12 @@ subtitle sidecars) under the per-item output directory.
 The packager consumes `stube.catalog.item.transcoded` (consumer group
 `packager-workers`), resolves the item's full detail over the katalog
 HTTP API, packages it, writes the `package` step + manifest back over
-HTTP, and produces **no** downstream event. Offsets are committed
+HTTP, and produces **no** downstream event. The manifest it sends the
+catalog carries a `source` block (`codec`, `width`, `height`,
+`durationMs`, `bitRate`), which the catalog keeps as the title's source
+asset: the transcoder's renditions.json `source`, completed by a probe of
+the original for what it doesn't say (all of it when there is no
+handoff). `manifest.json` on disk keeps no source block. Offsets are committed
 manually only after an item is fully processed, so a crash mid-work
 reprocesses (idempotent via the katalog `(item_id, step)` unique index +
 the finished-step guard).

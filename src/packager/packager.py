@@ -200,6 +200,8 @@ class _Probe:
     subtitles: list[dict[str, Any]]
     # Absolute stream index of `video` (the first non-cover-art video).
     video_index: int | None = None
+    # The container's overall bit rate (bit/s), None when ffprobe has none.
+    bit_rate: int | None = None
 
 
 def package_item(
@@ -440,6 +442,10 @@ def _ffprobe(path: Path) -> _Probe:
     )
     audio = [s for s in streams if s.get("codec_type") == "audio"]
     subtitles = [s for s in streams if s.get("codec_type") == "subtitle"]
+    try:
+        bit_rate = int(fmt.get("bit_rate") or 0) or None
+    except (TypeError, ValueError):
+        bit_rate = None
     return _Probe(
         container=fmt.get("format_name", ""),
         duration_ms=duration_ms,
@@ -447,7 +453,32 @@ def _ffprobe(path: Path) -> _Probe:
         audio=audio,
         subtitles=subtitles,
         video_index=video.get("index") if video else None,
+        bit_rate=bit_rate,
     )
+
+
+def probe_source(path: Path) -> dict[str, Any]:
+    """What the catalog keeps of a title's source file, in the names of
+    the transcoder's renditions.json source block: ffprobe's codec name
+    and the picture's coded size (`codec`, `width`, `height`), the
+    container's duration and overall bit rate (`durationMs`, `bitRate`).
+    What ffprobe can't tell is left out; {} when the file can't be probed."""
+    try:
+        probe = _ffprobe(path)
+    except (OSError, ValueError, subprocess.CalledProcessError) as e:
+        log.warning("packager.source_probe_failed", path=str(path), error=str(e)[:200])
+        return {}
+    out: dict[str, Any] = {}
+    if probe.video.get("codec_name"):
+        out["codec"] = str(probe.video["codec_name"]).lower()
+    width, height = int(probe.video.get("width") or 0), int(probe.video.get("height") or 0)
+    if width > 0 and height > 0:
+        out["width"], out["height"] = width, height
+    if probe.duration_ms > 0:
+        out["durationMs"] = probe.duration_ms
+    if probe.bit_rate:
+        out["bitRate"] = probe.bit_rate
+    return out
 
 
 # ISO 639-2 (bibliographic + terminology) -> 639-1 for the languages a
