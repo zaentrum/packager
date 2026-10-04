@@ -104,7 +104,11 @@ readers that count or list `audio` see the same tracks as before.
 **Subtitles.** Sidecars are extracted exactly as before; PGS / VobSub /
 DVB stay sidecar-only because HLS can't carry them. Every visible WebVTT
 track is also segmented into an HLS rendition `hls/sN/` (N = the sidecar
-index; `subtitles[].hls` in the manifest). The master references them
+index; `subtitles[].hls` in the manifest). Their segments carry no
+`X-TIMESTAMP-MAP`, which HLS reads as cue time = media time: shaka's
+default map (`MPEGTS:9000`, the 100 ms it shifts MPEG-TS output by) put
+every cue 100 ms after its frame against our fMP4 media, which start
+at 0. The master references them
 (TYPE=SUBTITLES, DEFAULT=NO, FORCED=YES on forced tracks) only with
 `HLS_SUBTITLES=true`, which is **off by default**. The clients draw the
 sidecars themselves, and the playback API doesn't route `sN/` yet.

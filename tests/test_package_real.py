@@ -5,6 +5,8 @@ original (H.264, 5.1 AAC English, stereo AC-3 German, three SRT tracks
 one of them forced) plus two lower rungs with the source's keyframes —
 and packages it: N video variants x 2 audio groups, I-frame playlists,
 the 5.1 companion, DEFAULT/FORCED flags, aligned segments, the manifest.
+A clip with cues at known times checks that the WebVTT renditions put
+every cue on its frame.
 """
 
 from __future__ import annotations
@@ -214,6 +216,82 @@ def test_single_rendition_without_handoff(tmp_path: Path, monkeypatch, handoff) 
     assert len(manifest["renditions"]["video"]) == 1
     assert manifest["renditions"]["audioSurround"] == []
     assert (root / ".complete").exists()
+
+
+_CUE = re.compile(r"^(\d+):(\d\d):(\d\d)\.(\d{3}) --> ")
+_MAP = re.compile(r"^X-TIMESTAMP-MAP=(.*)$")
+
+
+def _seconds(h: str, m: str, s: str, ms: str) -> float:
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+
+
+def _mapped_cues(rendition: Path) -> list[tuple[int, float, str]]:
+    """(segment number, start on the media timeline, text) of every cue of
+    a WebVTT rendition, read as a player does: the cue time mapped through
+    the segment's X-TIMESTAMP-MAP (MPEGTS at 90 kHz, LOCAL a cue time) —
+    LOCAL 0 = MPEGTS 0 when a segment has none (RFC 8216 3.5)."""
+    out = []
+    for n, seg in enumerate(sorted(rendition.glob("seg-*.vtt")), start=1):
+        lines = seg.read_text().splitlines()
+        local, mpegts = 0.0, 0
+        for line in lines:
+            if m := _MAP.match(line):
+                attrs = dict(kv.split(":", 1) for kv in m.group(1).split(","))
+                local = _seconds(*re.match(r"(\d+):(\d\d):(\d\d)\.(\d{3})",
+                                           attrs["LOCAL"]).groups())
+                mpegts = int(attrs["MPEGTS"])
+        for i, line in enumerate(lines):
+            if m := _CUE.match(line):
+                out.append((n, _seconds(*m.groups()) - local + mpegts / 90_000, lines[i + 1]))
+    return out
+
+
+@pytest.mark.parametrize("start", [0.0, 0.5])
+def test_webvtt_cues_line_up_with_the_media(tmp_path: Path, monkeypatch, start: float) -> None:
+    # Cues 2 s and 7.5 s after the first frame of a clip with no B-frames
+    # (first PTS = first decode time, what hls.js anchors the media
+    # timeline on) and a keyframe every 2 s. shaka's default wrote
+    # MPEGTS:9000 into every segment — each cue 100 ms after its frame.
+    # A clip starting at 0 is packaged as is; one starting later goes the
+    # transcoder's way, a contract moving the original onto the timeline
+    # that starts at 0 (timestampOffset).
+    d = tmp_path / "clip"
+    d.mkdir()
+    (d / "cues.srt").write_text("1\n00:00:02,000 --> 00:00:03,000\nAt two.\n\n"
+                                "2\n00:00:07,500 --> 00:00:08,500\nAt seven and a half.\n")
+    src = d / "cues.mkv"
+    _ff("-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=12",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=12",
+        "-i", str(d / "cues.srt"), "-map", "0:v", "-map", "1:a", "-map", "2",
+        "-c:v", "libx264", "-preset", "ultrafast", "-bf", "0", "-g", "50",
+        "-c:a", "aac", "-c:s", "srt", "-metadata:s:s:0", "language=eng",
+        *(["-output_ts_offset", str(start)] if start else []), str(src))
+    assert _start_time(src) == pytest.approx(start, abs=0.001)
+    inbox = None
+    if start:
+        inbox = d / "_inbox" / ITEM
+        inbox.mkdir(parents=True)
+        (inbox / "renditions.json").write_text(json.dumps({
+            "version": 1, "segmentSeconds": 6, "keyframes": "source",
+            "timestampOffset": -start,
+            "video": [{"id": "v0", "label": "source", "file": None, "mode": "copy"}],
+        }))
+    _manifest, root = _package(tmp_path, monkeypatch, src, inbox, hls_subtitles=True,
+                               surround_codec="off")
+
+    video = _segment_starts(root / "hls" / "v0")
+    assert video == pytest.approx([0.0, 6.0], abs=0.001)
+    # Every cue sits in the segment whose window holds it, at its source
+    # time on the media's timeline, to the millisecond.
+    assert [(n, round(t - video[0], 3), text) for n, t, text in
+            _mapped_cues(root / "hls" / "s0")] == [
+        (1, 2.0, "At two."), (2, 7.5, "At seven and a half.")]
+    # ... and the subtitle playlist's segments span the video's.
+    extinf = [float(line.split(":", 1)[1].rstrip(","))
+              for line in (root / "hls" / "s0" / "playlist.m3u8").read_text().splitlines()
+              if line.startswith("#EXTINF:")]
+    assert [sum(extinf[:i]) for i in range(len(extinf))] == pytest.approx(video, abs=0.001)
 
 
 def test_worker_consumes_the_handoff(tmp_path: Path, monkeypatch, handoff) -> None:

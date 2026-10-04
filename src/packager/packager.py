@@ -1139,6 +1139,15 @@ def _descriptor_value(value: str) -> str:
 
 _LANG_TAG = re.compile(r"^[a-z]{2,3}(-[a-z0-9]{2,8})*$")
 
+# shaka writes every WebVTT segment with X-TIMESTAMP-MAP=LOCAL:00:00:00.000,
+# MPEGTS:<--transport_stream_timestamp_offset_ms x 90>: by default 9000, the
+# 100 ms it shifts MPEG-TS output by to keep timestamps positive. Our media
+# are fMP4, which it doesn't shift, so the map put every cue 100 ms after its
+# frame in players that honour it (hls.js). With 0 shaka writes no map, which
+# HLS (RFC 8216 3.5) reads as cue time 0 = media time 0: the sidecar's cue
+# times are the media's, as both come from the same input timeline.
+_TEXT_TIMING = ["--transport_stream_timestamp_offset_ms", "0"]
+
 
 def _shaka_command(
     descriptors: list[str], segment_seconds: int, master: str,
@@ -1382,8 +1391,8 @@ def _package_text_tracks(
             fields.append("forced_subtitle=1")
         scratch = f"hls/{rid}/.shaka-master.m3u8"
         try:
-            _run_shaka(_shaka_command([",".join(fields)], segment_seconds, scratch),
-                       out_root, f"text {rid}")
+            _run_shaka(_shaka_command([",".join(fields)], segment_seconds, scratch)
+                       + _TEXT_TIMING, out_root, f"text {rid}")
             media = hls.read_shaka_master(out_root / scratch).media.get(
                 f"{rid}/playlist.m3u8", {})
             stats = hls.playlist_stats(out_root / "hls" / rid / "playlist.m3u8")
