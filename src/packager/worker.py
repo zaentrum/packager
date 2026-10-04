@@ -8,7 +8,9 @@ Lifecycle contract (mirrors the analyzer + transcoder consumers):
   * Block on `consumer.poll`; exit cleanly on SIGTERM / SIGINT (the
     `stop` event set by main's signal handler).
   * Per message: parse envelope → itemId → get_item detail →
-    idempotency guard on the `package` step → run the EXISTING packaging
+    idempotency guard on the `package` step (finished: done,
+    not_applicable or skipped — nothing to do, also for a retry the
+    catalog sent before the step finished) → run the EXISTING packaging
     body (unchanged) with all its katalog HTTP writes → commit the
     offset. The offset is committed ONLY after the item is fully
     processed (or definitively failed), so a crash mid-work reprocesses
@@ -40,16 +42,21 @@ import time
 
 import structlog
 
-from .events import build_consumer, parse_item_id
+from .events import build_consumer, is_retry, parse_envelope, parse_item_id
 from .katalog import ClaimedItem, KatalogClient
 from .packager import PACKAGES_ROOT, PackageOptions, package_item
 from .renditions import ContractError, resolve_inputs
 
 log = structlog.get_logger(__name__)
 
-# The owning step for this worker. If it's already `done` on a
+# The owning step for this worker. If it's already finished on a
 # redelivered event we skip the (expensive) packaging work.
 PACKAGE_STEP = "package"
+
+# The package step's statuses that need no run: `done` (packaged), and
+# `not_applicable` / `skipped` (final by the catalog's word). The catalog
+# retries none of them.
+FINISHED_STATUSES = frozenset({"done", "not_applicable", "skipped"})
 
 # How long a single consumer.poll() blocks before returning None. Short
 # enough that the stop event is honoured promptly on SIGTERM.
@@ -212,6 +219,8 @@ def _handle_message(
     item_id: str,
     client: KatalogClient,
     options: PackageOptions | None = None,
+    *,
+    retry: bool = False,
 ) -> None:
     """Resolve, guard, and package a single item. Any error that the
     packaging body owns is already attributed to the `package` step by
@@ -224,13 +233,19 @@ def _handle_message(
         log.warning("packager.item.unknown", item_id=item_id)
         return
 
-    # 2. Idempotency guard: on a redelivered event whose package step is
-    #    already `done`, skip the expensive work. The packager is
+    # 2. Idempotency guard: on a redelivered event whose package step has
+    #    already finished, skip the expensive work. The packager is
     #    TERMINAL, so there is nothing downstream to re-emit — just
-    #    return and let the caller commit.
-    steps = client.get_steps(item_id)
-    if steps.get(PACKAGE_STEP) == "done":
-        log.info("packager.item.already_done", item_id=item_id)
+    #    return and let the caller commit. A `retry` (the catalog sent
+    #    the trigger again for a failed or silent step) finds its step
+    #    finished when the run the reaper took for dead reported done
+    #    after all: one log line, nothing else.
+    status = client.get_steps(item_id).get(PACKAGE_STEP)
+    if status in FINISHED_STATUSES:
+        if retry:
+            log.info("packager.retry.already_finished", item_id=item_id, status=status)
+        else:
+            log.info("packager.item.already_done", item_id=item_id, status=status)
         return
 
     # 3. Run the packaging body with all its katalog HTTP writes
@@ -290,7 +305,8 @@ def run_worker(
                 continue
 
             try:
-                _handle_message(item_id, client, options)
+                _handle_message(item_id, client, options,
+                                retry=is_retry(parse_envelope(msg.value())))
             except Exception as e:
                 # _process_one already attributed any packaging error to
                 # the package step; anything that escapes is a bug in the

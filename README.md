@@ -16,7 +16,15 @@ HTTP API, packages it, writes the `package` step + manifest back over
 HTTP, and produces **no** downstream event. Offsets are committed
 manually only after an item is fully processed, so a crash mid-work
 reprocesses (idempotent via the katalog `(item_id, step)` unique index +
-the done-step guard).
+the finished-step guard).
+
+The package step is finished when it is `done`, `not_applicable` or
+`skipped`; an event for a finished item packages nothing. The catalog
+retries a failed or silent package by sending its `transcoded` event
+again, marked `"status": "retry"`. A retry whose step has finished since
+— a long run the catalog's reaper took for dead that reported done after
+all — is acked with one log line (`packager.retry.already_finished`) and
+nothing else; any other retry packages as usual.
 
 ## Inputs
 

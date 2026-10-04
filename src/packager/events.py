@@ -72,6 +72,26 @@ def build_consumer(
     )
 
 
+def parse_envelope(raw_value: bytes | str | None) -> dict[str, Any]:
+    """The decoded envelope, or {} when it isn't a JSON object (the
+    caller has already skipped a message without an itemId)."""
+    try:
+        if isinstance(raw_value, bytes):
+            raw_value = raw_value.decode("utf-8")
+        envelope = json.loads(raw_value) if raw_value is not None else None
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    return envelope if isinstance(envelope, dict) else {}
+
+
+def is_retry(envelope: dict[str, Any]) -> bool:
+    """True for an event the catalog sent again to retry a failed or
+    silent step (status "retry", source "retry"). Its step may have
+    finished since it was sent — a run the catalog's reaper took for dead
+    that reported done after all — and then there is nothing to do."""
+    return envelope.get("status") == "retry" or envelope.get("source") == "retry"
+
+
 def parse_item_id(raw_value: bytes | str | None) -> str | None:
     """Parse an event envelope and return its itemId, or None when the
     message is malformed / missing itemId. The caller logs a warning and

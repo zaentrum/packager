@@ -7,8 +7,8 @@ polls a claim endpoint; the itemId arrives on the
     the itemId carried on the Kafka event (the event carries only the
     id; the client never trusts a payload-supplied path).
   * `GET  /api/analyze/items/{id}/steps` — read the current step
-    statuses for the idempotency guard (skip work if package is
-    already done).
+    statuses for the idempotency guard (skip work if package has
+    already finished).
   * `PUT  /api/analyze/items/{id}/steps/package` — flip the step to
     in_progress / done / failed as the worker progresses.
   * `POST /api/items/{id}/packaging-complete` — mirror the on-disk
@@ -175,8 +175,9 @@ class KatalogClient:
     def get_steps(self, item_id: str) -> dict[str, str]:
         """Return the current status of every analyze step on `item_id`
         as a flat {step: status} map. Used by the consumer's idempotency
-        guard: if `package` is already 'done' we skip the (expensive)
-        packaging work on a redelivered event. Empty dict on any error —
+        guard: if `package` has already finished (done, not_applicable,
+        skipped) we skip the (expensive) packaging work on a redelivered
+        or retried event. Empty dict on any error —
         the caller then treats the step as not-done and re-packages,
         which is safe (packaging is idempotent on disk)."""
         try:
