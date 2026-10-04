@@ -54,6 +54,7 @@ def main() -> int:
         surround_bitrate=cfg.surround_bitrate,
         hls_subtitles=cfg.hls_subtitles,
         preferred_languages=cfg.preferred_languages or None,
+        old_package_grace_seconds=cfg.old_package_grace_seconds,
     )
 
     client = KatalogClient(

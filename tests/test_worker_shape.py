@@ -80,6 +80,19 @@ def test_config_surround_is_off_unless_asked(monkeypatch: pytest.MonkeyPatch) ->
     assert Config.from_env().package_options().surround_codec == "eac3"
 
 
+def test_config_old_package_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    # How long a package a re-encode replaced stays for the requests that
+    # started on it: 10 minutes unless set.
+    monkeypatch.setenv("KATALOG_API_URL", "http://katalog-app")
+    monkeypatch.setenv("OIDC_TOKEN_URL", "https://sso.example/token")
+    monkeypatch.setenv("OIDC_CLIENT_ID", "katalog")
+    monkeypatch.setenv("OIDC_CLIENT_SECRET", "x")
+    monkeypatch.delenv("OLD_PACKAGE_GRACE_SECONDS", raising=False)
+    assert Config.from_env().package_options().old_package_grace_seconds == 600
+    monkeypatch.setenv("OLD_PACKAGE_GRACE_SECONDS", "90")
+    assert Config.from_env().package_options().old_package_grace_seconds == 90
+
+
 def test_claimed_item_from_json_minimum() -> None:
     body = {
         "id": "00111617-5a35-4c0c-afaa-ff9aae094f86",

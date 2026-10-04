@@ -57,6 +57,10 @@ class Config:
     # Language preference for DEFAULT=YES audio, comma-separated; empty =
     # the order of the packager.language_whitelist setting.
     preferred_languages: str = ""
+    # Seconds a package replaced by a new one (a title packaged again)
+    # stays on disk for the requests that started on it. Keep it well
+    # above the NFS mounts' attribute cache time (acdirmax).
+    old_package_grace_seconds: float = 600.0
 
     @classmethod
     def from_env(cls) -> Config:
@@ -85,6 +89,7 @@ class Config:
             hls_subtitles=os.environ.get("HLS_SUBTITLES", "false").strip().lower()
             in ("1", "true", "yes"),
             preferred_languages=os.environ.get("PREFERRED_LANGUAGES", ""),
+            old_package_grace_seconds=float(os.environ.get("OLD_PACKAGE_GRACE_SECONDS", "600")),
         )
 
     def package_options(self) -> PackageOptions:
@@ -96,6 +101,7 @@ class Config:
             preferred_languages=tuple(
                 t.strip().lower() for t in self.preferred_languages.split(",") if t.strip()
             ),
+            old_package_grace_seconds=self.old_package_grace_seconds,
         )
 
 

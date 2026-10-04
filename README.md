@@ -144,9 +144,10 @@ manifest only once everything it names is in place; between an entry's
 two renames, a request for it misses. Until the swap the title plays
 from its old package, and a run that fails removes `.next/`, writes
 `.failed` and leaves the live package, `.complete` included, as it was.
-The replaced package stays for 10 minutes, for the requests that started
-on it and the NFS clients that still have it cached, then goes; when the
-process exits first, the item's next run removes it. A viewer already
+The replaced package stays for `OLD_PACKAGE_GRACE_SECONDS` (10 minutes),
+for the requests that started on it and the NFS clients that still have
+it cached, then goes; when the process exits first, the item's next run
+removes it. A viewer already
 watching gets the new package's files from the swap on, under the same
 names: seamless where a rendition is unchanged (a copied v0, the audio),
 not where a rung was encoded anew.
@@ -178,6 +179,7 @@ Dockerfile
 | `SURROUND_BITRATE` | `448k` | Bitrate of an encoded 5.1 companion |
 | `HLS_SUBTITLES` | `false` | Reference the WebVTT renditions from the master |
 | `PREFERRED_LANGUAGES` | (empty) | DEFAULT=YES language order, e.g. `de,en`; empty = whitelist order |
+| `OLD_PACKAGE_GRACE_SECONDS` | `600` | How long a package replaced by a new one stays on disk for the requests that started on it (see "Packaging again"); keep it well above the NFS mounts' attribute cache time |
 
 ## Local development
 
