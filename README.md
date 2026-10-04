@@ -68,6 +68,8 @@ hls/a0/ a1/ …   init.mp4 seg-NNNNN.m4s playlist.m3u8
 hls/s0/ s2/ …   seg-NNNNN.vtt playlist.m3u8   (WebVTT tracks only)
 subs/N.vtt|.sup|.idx|.dvb                sidecars, as before
 trickplay/  manifest.json  .complete
+.next/                                  a run's staging folder, same layout
+hls.old-<stamp>/ subs.old-<stamp>/ …    replaced, until its grace period ends
 ```
 
 **Master.** shaka writes the media and I-frame playlists; the master is
@@ -126,6 +128,28 @@ is still the top rung. Before a ladder is enabled, the playback service
 must filter the master per client. Players don't switch between HEVC
 and H.264, and hls.js starts on H.264 whenever the HEVC variant's
 BANDWIDTH is above its 5 Mbit/s initial estimate.
+
+**Packaging again.** A run leaves the live package alone while it
+works: it builds the new one in `.next/` inside the item folder (the
+item folder itself is never moved or created again: the playback
+service caches its path and NFS clients its handle) and swaps it in only
+once it is whole: every playlist the master and the manifest name is
+there and ends, and every init section, segment, sidecar and sprite they
+reference is there. The swap goes entry by entry, `subs/` and
+`trickplay/` first and `hls/` last: the live entry is renamed
+`<name>.old-<stamp>` in the item folder, then the new one moved up from
+`.next/`. Then `manifest.json` is replaced in one rename and `.complete`
+written again. A reader gets the old package or the new one, and the new
+manifest only once everything it names is in place; between an entry's
+two renames, a request for it misses. Until the swap the title plays
+from its old package, and a run that fails removes `.next/`, writes
+`.failed` and leaves the live package, `.complete` included, as it was.
+The replaced package stays for 10 minutes, for the requests that started
+on it and the NFS clients that still have it cached, then goes; when the
+process exits first, the item's next run removes it. A viewer already
+watching gets the new package's files from the swap on, under the same
+names: seamless where a rendition is unchanged (a copied v0, the audio),
+not where a rung was encoded anew.
 
 ## Layout
 

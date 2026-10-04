@@ -26,6 +26,8 @@ from pathlib import Path
 
 # `KEY=value` / `KEY="quoted, with commas"` pairs of an attribute list.
 _ATTR = re.compile(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)')
+_URI_ATTR = re.compile(r'URI="([^"]*)"')
+_URI_TAGS = ("#EXT-X-MEDIA:", "#EXT-X-I-FRAME-STREAM-INF:", "#EXT-X-MAP:")
 
 
 def parse_attributes(attr_list: str) -> dict[str, str]:
@@ -33,6 +35,20 @@ def parse_attributes(attr_list: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for key, value in _ATTR.findall(attr_list):
         out[key] = value[1:-1] if value.startswith('"') else value
+    return out
+
+
+def playlist_uris(text: str) -> list[str]:
+    """Every URI a playlist references, in order: a master's variant lines
+    and the URI of its EXT-X-MEDIA and I-frame lines; a media playlist's
+    EXT-X-MAP and segments."""
+    out: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith(_URI_TAGS):
+            out += _URI_ATTR.findall(line)
+        elif line and not line.startswith("#"):
+            out.append(line)
     return out
 
 

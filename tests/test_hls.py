@@ -37,6 +37,20 @@ def test_unique_names() -> None:
     ]
 
 
+def test_playlist_uris() -> None:
+    master = (FIXTURES / "shaka-master.m3u8").read_text()
+    assert hls.playlist_uris(master) == [
+        "a0/playlist.m3u8", "a1/playlist.m3u8", "a2/playlist.m3u8",
+        "s1/playlist.m3u8", "s2/playlist.m3u8", "s0/playlist.m3u8",
+        *[f"v{i}/playlist.m3u8" for i in range(3)] * 2,
+        *[f"v{i}/iframes.m3u8" for i in range(3)],
+    ]
+    media = ('#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI="init.mp4"\n'
+             "#EXTINF:6.000,\n#EXT-X-BYTERANGE:17748@84\nseg-00001.m4s\n"
+             "#EXTINF:2.000,\n\nseg-00002.m4s\n#EXT-X-ENDLIST\n")
+    assert hls.playlist_uris(media) == ["init.mp4", "seg-00001.m4s", "seg-00002.m4s"]
+
+
 def _playlist(tmp: Path, segs: list[tuple[float, int]], target: int, byterange=False) -> Path:
     lines = ["#EXTM3U", "#EXT-X-VERSION:6", f"#EXT-X-TARGETDURATION:{target}",
              "#EXT-X-PLAYLIST-TYPE:VOD", '#EXT-X-MAP:URI="init.mp4"']

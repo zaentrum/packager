@@ -6,7 +6,8 @@ one of them forced) plus two lower rungs with the source's keyframes —
 and packages it: N video variants x 2 audio groups, I-frame playlists,
 the 5.1 companion, DEFAULT/FORCED flags, aligned segments, the manifest.
 A clip with cues at known times checks that the WebVTT renditions put
-every cue on its frame.
+every cue on its frame. Packaging a title again leaves its package as it
+was until the new one is complete, then swaps the new one in.
 """
 
 from __future__ import annotations
@@ -15,12 +16,14 @@ import json
 import re
 import shutil
 import subprocess
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from packager import hls, worker
 from packager import packager as pk
-from packager import worker
 from packager.hls import parse_attributes
 from packager.renditions import resolve_inputs
 
@@ -352,3 +355,178 @@ def test_worker_consumes_the_handoff(tmp_path: Path, monkeypatch, handoff) -> No
     on_disk = json.loads((tmp_path / "packages" / "movies" / ITEM[:2] / ITEM
                           / "manifest.json").read_text())
     assert "source" not in on_disk
+
+
+# ------------------------------------------------------- packaging again
+
+def _tree(root: Path) -> dict[str, bytes]:
+    """Every file under root, by its path relative to it."""
+    return {p.relative_to(root).as_posix(): p.read_bytes()
+            for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def _live(root: Path) -> dict[str, bytes]:
+    """The item folder without a run's staging folder and the packages a
+    swap replaced."""
+    return {rel: body for rel, body in _tree(root).items()
+            if rel.split("/", 1)[0] != pk.STAGING_DIR and ".old-" not in rel.split("/", 1)[0]}
+
+
+def _served(root: Path) -> dict[str, bytes]:
+    """What a player gets, by the paths the stream service reads: the
+    manifest, the master, every playlist the master names and every init
+    section and segment those name."""
+    out = {pk.MANIFEST_FILE: (root / pk.MANIFEST_FILE).read_bytes()}
+    master = (root / "hls" / "master.m3u8").read_text()
+    out["hls/master.m3u8"] = master.encode()
+    for uri in hls.playlist_uris(master):
+        playlist = root / "hls" / uri
+        out[f"hls/{uri}"] = playlist.read_bytes()
+        for name in hls.playlist_uris(playlist.read_text()):
+            out[(Path("hls") / uri).parent.joinpath(name).as_posix()] = (
+                playlist.parent / name).read_bytes()
+    return out
+
+
+def _replaced(root: Path) -> dict[str, Path]:
+    return {p.name.split(".old-")[0]: p for p in root.iterdir() if ".old-" in p.name}
+
+
+def test_packaging_again_swaps_the_new_package_in(tmp_path: Path, monkeypatch, handoff) -> None:
+    # A title packaged before it had a ladder (the original, one rendition)
+    # is packaged again with three rungs and the 5.1 group, as a re-encode
+    # does. The old package is served byte for byte while the new one is
+    # written; once it is complete, the new one is what a player gets.
+    src, inbox = handoff
+    _first, root = _package(tmp_path, monkeypatch, src, None, surround_codec="off")
+    old, old_served = _live(root), _served(root)
+    real_shaka, real_swap = pk._run_shaka, pk._swap_in
+    staged: dict[str, bytes] = {}
+
+    def shaka(cmd: list[str], cwd: Path, label: str) -> None:
+        assert cwd == root / pk.STAGING_DIR
+        assert _live(root) == old and _served(root) == old_served
+        real_shaka(cmd, cwd, label)
+
+    def swap(out_root: Path, stage: Path) -> list[Path]:
+        assert _live(out_root) == old
+        staged.update(_tree(stage))
+        return real_swap(out_root, stage)
+
+    monkeypatch.setattr(pk, "_run_shaka", shaka)
+    monkeypatch.setattr(pk, "_swap_in", swap)
+    manifest, _root = _package(tmp_path, monkeypatch, src, inbox)
+
+    # Every staged file is live, as it was staged, and is what is served.
+    staged.pop(pk.SENTINEL)
+    live = _live(root)
+    assert set(live) == {*staged, ".complete"}
+    assert all(live[rel] == body for rel, body in staged.items())
+    served = _served(root)
+    assert served == {rel: staged[rel] for rel in served}
+    assert json.loads(served[pk.MANIFEST_FILE]) == manifest
+    assert [uri for tag, _a, uri in _master(root) if tag == "#EXT-X-STREAM-INF"] == [
+        f"v{i}/playlist.m3u8" for i in range(3)] * 2
+    # Nothing points into the staging folder, which is gone.
+    assert not (root / pk.STAGING_DIR).exists()
+    assert not [rel for rel, body in served.items()
+                if rel.endswith((".m3u8", ".json")) and pk.STAGING_DIR.encode() in body]
+    # The old package waits beside the new one, as it was, for the
+    # requests that started on it.
+    replaced = _replaced(root)
+    assert sorted(replaced) == ["hls", "subs", "trickplay"]
+    for name, path in replaced.items():
+        assert _tree(path) == {rel.split("/", 1)[1]: body for rel, body in old.items()
+                               if rel.startswith(f"{name}/")}
+
+
+def test_a_run_that_fails_leaves_the_live_package_as_it_was(
+    tmp_path: Path, monkeypatch, handoff,
+) -> None:
+    src, inbox = handoff
+    _first, root = _package(tmp_path, monkeypatch, src, None, surround_codec="off")
+    old = _live(root)
+    real_shaka = pk._run_shaka
+
+    def shaka(cmd: list[str], cwd: Path, label: str) -> None:
+        real_shaka(cmd, cwd, label)
+        if label == "media":  # its segments written, then the disk is full
+            raise pk.PackageError("shaka-packager (media) exited 1: No space left on device")
+
+    monkeypatch.setattr(pk, "_run_shaka", shaka)
+    with pytest.raises(pk.PackageError, match="No space left"):
+        _package(tmp_path, monkeypatch, src, inbox)
+    assert {rel: body for rel, body in _live(root).items() if rel != ".failed"} == old
+    assert sorted(p.name for p in root.iterdir()) == [
+        ".complete", ".failed", "hls", pk.MANIFEST_FILE, "subs", "trickplay"]
+    assert "No space left" in json.loads((root / ".failed").read_text())["error"]
+
+    # A run that succeeds clears .failed.
+    monkeypatch.setattr(pk, "_run_shaka", real_shaka)
+    _package(tmp_path, monkeypatch, src, inbox)
+    assert not (root / ".failed").exists()
+
+
+def test_a_package_with_a_segment_missing_is_not_swapped_in(
+    tmp_path: Path, monkeypatch, handoff,
+) -> None:
+    src, inbox = handoff
+    _first, root = _package(tmp_path, monkeypatch, src, None, surround_codec="off")
+    old = _live(root)
+    real = pk._run_shaka_packager
+
+    def lose_a_segment(*args, **kwargs):
+        out = real(*args, **kwargs)
+        (root / pk.STAGING_DIR / "hls" / "v1" / "seg-00002.m4s").unlink()
+        return out
+
+    monkeypatch.setattr(pk, "_run_shaka_packager", lose_a_segment)
+    with pytest.raises(pk.PackageError, match=r"not swapped in: 1 missing: hls/v1/seg-00002\.m4s"):
+        _package(tmp_path, monkeypatch, src, inbox)
+    assert {rel: body for rel, body in _live(root).items() if rel != ".failed"} == old
+    assert not (root / pk.STAGING_DIR).exists() and not _replaced(root)
+
+
+def test_the_replaced_package_goes_after_the_grace_period(
+    tmp_path: Path, monkeypatch, handoff,
+) -> None:
+    src, inbox = handoff
+    _package(tmp_path, monkeypatch, src, None, surround_codec="off")
+    _manifest, root = _package(tmp_path, monkeypatch, src, inbox, old_package_grace_seconds=1.0)
+    new = _live(root)
+    replaced = list(_replaced(root).values())
+    assert len(replaced) == 3  # the grace period has just begun
+    deadline = time.monotonic() + 15
+    while any(p.exists() for p in replaced) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not [p for p in replaced if p.exists()]
+    assert _live(root) == new
+
+
+class _Killed(BaseException):
+    """The process dies mid-run (SIGKILL, the OOM killer): no handler runs."""
+
+
+def test_the_next_run_clears_what_a_dead_run_left(tmp_path: Path, monkeypatch, handoff) -> None:
+    src, inbox = handoff
+    _first, root = _package(tmp_path, monkeypatch, src, None, surround_codec="off")
+    old = _live(root)
+    real_shaka = pk._run_shaka
+
+    def killed(cmd: list[str], cwd: Path, label: str) -> None:
+        real_shaka(cmd, cwd, label)
+        raise _Killed
+
+    monkeypatch.setattr(pk, "_run_shaka", killed)
+    with pytest.raises(_Killed):
+        _package(tmp_path, monkeypatch, src, inbox)
+    assert (root / pk.STAGING_DIR / "hls" / "v0" / "init.mp4").exists()
+    assert _live(root) == old
+    # ... and a package replaced an hour ago whose timer died with its process.
+    expired = root / f"hls.old-{(datetime.now(UTC) - timedelta(hours=1)).strftime(pk._STAMP)}"
+    shutil.copytree(root / "hls", expired)
+
+    monkeypatch.setattr(pk, "_run_shaka", real_shaka)
+    _package(tmp_path, monkeypatch, src, inbox)
+    assert not (root / pk.STAGING_DIR).exists() and not expired.exists()
+    assert sorted(_replaced(root)) == ["hls", "subs", "trickplay"]  # this run's, in their grace

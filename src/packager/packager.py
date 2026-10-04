@@ -27,20 +27,25 @@ Design rules:
   references them (TYPE=SUBTITLES, FORCED=YES where flagged) only when
   HLS_SUBTITLES is on, so clients that draw their own sidecar subtitles
   aren't surprised by in-manifest ones.
-* All state is on disk under the per-item output directory. The
-  three sentinels {.packaging, .complete, .failed} are mutually
-  exclusive and tell every reader where this package is in its
-  lifecycle without needing a database round-trip.
+* All state is on disk under the per-item output directory, which is
+  never moved or created again. `.complete` says the package in it is
+  whole and live. A run builds the next one in `.next/` (its sentinel
+  `.next/.packaging`) and swaps it in only once it is complete, so
+  readers get the old package or the new one, never a half-written one,
+  and a run that fails (`.failed`) leaves the live package as it was.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -98,6 +103,25 @@ def _find_existing_root(item_id: str) -> Path | None:
             return path
     return None
 
+
+# A run builds the next package in this folder inside the item folder, in
+# the item folder's own layout (hls/, subs/, trickplay/, manifest.json),
+# and moves it into place only once it is complete (_swap_in). Its
+# sentinel, .packaging, is in there too.
+STAGING_DIR = ".next"
+SENTINEL = ".packaging"
+MANIFEST_FILE = "manifest.json"
+# A live entry the swap replaces is renamed <name>.old-<UTC stamp> beside
+# it, in the item folder, and removed once the grace period is over.
+_OLD = ".old-"
+_STAMP = "%Y%m%dT%H%M%S.%fZ"
+_REPLACED = re.compile(r"^(?P<name>.+)\.old-(?P<stamp>\d{8}T\d{6}\.\d{6}Z)$")
+# How long a replaced package stays by default: well past a segment read
+# under NFS load and an NFS client's cache of the folder it was in
+# (acdirmax, 60 s by default), so a request that started on the old
+# package ends on it.
+OLD_PACKAGE_GRACE_SECONDS = 600.0
+
 # Segment length in seconds. Same value the legacy on-demand pipeline
 # used; long enough to amortize HTTP overhead, short enough for snappy
 # seeks. shaka-packager cuts at the first keyframe of each window, so
@@ -147,6 +171,8 @@ class PackageOptions:
     hls_subtitles: bool = False
     # Language preference for DEFAULT=YES; empty = the whitelist order.
     preferred_languages: tuple[str, ...] = field(default_factory=tuple)
+    # Seconds a package replaced by a new one stays on disk.
+    old_package_grace_seconds: float = OLD_PACKAGE_GRACE_SECONDS
 
 
 def _episode_code(season: int | None, episode: int | None) -> str | None:
@@ -224,9 +250,13 @@ def package_item(
 ) -> dict[str, Any]:
     """Package one item synchronously. Returns the written manifest.
 
-    Safe to retry: a previous .failed or partial run is wiped before
-    re-attempting. Concurrent calls for the same item_id are NOT
-    serialised here — the caller owns the queue.
+    The new package is built in the item folder's staging folder and
+    swapped in only once it is complete; until then an existing package
+    stays live, untouched, and a run that fails leaves it so. A package
+    it replaces is removed after options.old_package_grace_seconds. Safe
+    to retry: what an earlier run left in the staging folder is cleared
+    first. Concurrent calls for the same item_id are NOT serialised here
+    — the caller owns the queue.
 
     item_type is katalog's classification (movie/episode/album/…) and
     decides which top-level category directory the package lands under.
@@ -259,12 +289,12 @@ def package_item(
     segment_seconds = inputs.segment_seconds or options.segment_seconds
 
     out_root = _item_root(item_id, item_type)
-    _reset_output_dir(out_root)
-    (out_root / ".packaging").write_text(
-        json.dumps({"started_at": datetime.now(UTC).isoformat(), "pid": os.getpid()})
-    )
+    # Everything below writes into the staging folder; the live package,
+    # if there is one, plays on until _swap_in.
+    stage = out_root / STAGING_DIR
 
     try:
+        _open_staging(out_root, options.old_package_grace_seconds)
         probe = _ffprobe(src)
         if probe.video.get("codec_name") not in ("hevc", "h264"):
             raise PackageError(
@@ -322,11 +352,11 @@ def package_item(
                 if staged is not None:
                     videos.append(staged)
             subtitle_meta = _extract_subtitles(
-                src, probe, out_root / "subs",
+                src, probe, stage / "subs",
                 visible_indices=sub_visible,
             )
             video_meta, audio_meta, surround_meta = _run_shaka_packager(
-                packaging_source, videos, audio_meta, surround_meta, out_root,
+                packaging_source, videos, audio_meta, surround_meta, stage,
                 segment_seconds=segment_seconds,
                 hls_subtitles=options.hls_subtitles,
                 subtitle_meta=subtitle_meta,
@@ -336,7 +366,7 @@ def package_item(
         # per TRICKPLAY_INTERVAL_SEC, so HEVC decode cost is small
         # (~30 s on a 90 min movie) and we don't need the
         # transmuxed intermediate to still exist.
-        trickplay_meta = _generate_trickplay(src, probe, out_root / "trickplay")
+        trickplay_meta = _generate_trickplay(src, probe, stage / "trickplay")
 
         # v2 manifest: self-describing catalog metadata at the top
         # level, no `source` block. If the catalog DB is ever lost,
@@ -385,37 +415,245 @@ def package_item(
                 manifest["episodeCode"] = ec
         if trickplay_meta is not None:
             manifest["trickplay"] = trickplay_meta
-        _write_atomic(out_root / "manifest.json", json.dumps(manifest, indent=2).encode())
+        _write_atomic(stage / MANIFEST_FILE, json.dumps(manifest, indent=2).encode())
 
-        # Flip the sentinel atomically so a partially-written package is
-        # never observable as .complete.
-        (out_root / ".packaging").unlink(missing_ok=True)
-        (out_root / ".complete").write_text(
-            datetime.now(UTC).isoformat() + "\n"
-        )
-        log.info("packager.complete", item_id=item_id, dir=str(out_root))
+        # Only a whole package replaces the live one. The live one is kept
+        # beside it for the grace period, for the requests that started on
+        # it, then removed.
+        _verify_staged(stage)
+        replaced = _swap_in(out_root, stage)
+        log.info("packager.complete", item_id=item_id, dir=str(out_root),
+                 replaced=[p.name for p in replaced] or None)
+        _remove_after(replaced, options.old_package_grace_seconds)
         return manifest
 
     except Exception as e:
-        (out_root / ".packaging").unlink(missing_ok=True)
-        (out_root / ".failed").write_text(
-            json.dumps({"error": str(e), "at": datetime.now(UTC).isoformat()}, indent=2)
-        )
+        # The live package is as it was (a swap that fails moves it back);
+        # only this run's staging folder goes.
+        shutil.rmtree(stage, ignore_errors=True)
+        _write_failed(out_root, e)
         log.exception("packager.failed", item_id=item_id, error=str(e))
         raise
 
 
-def _reset_output_dir(out_root: Path) -> None:
-    """Clear any prior package contents so a retry starts clean.
-    We keep the directory itself (NFS bind mount lives here) and just
-    wipe its contents."""
-    if out_root.exists():
-        for child in out_root.iterdir():
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
+def _open_staging(out_root: Path, grace_seconds: float) -> Path:
+    """Create the run's staging folder, empty but for its sentinel.
+
+    The item folder itself is never moved, emptied or created again (NFS
+    bind mount lives here): chino-stream caches its path for the life of
+    a pod and stats its .complete, other pods' NFS clients hold its handle
+    (a folder created again is another inode, and their next request on
+    the old handle fails), and chino-stream lists the shard folders,
+    taking every folder in them with a .complete for an item, so nothing
+    may go beside it. The next package is built inside it instead.
+
+    What an earlier run left in it goes first: its staging folder (a run
+    that crashed; an item packages on one replica at a time, as its
+    events share a Kafka partition) and the packages it replaced whose
+    grace period is over."""
     out_root.mkdir(parents=True, exist_ok=True)
+    _remove_replaced(out_root, grace_seconds)
+    stage = out_root / STAGING_DIR
+    if os.path.lexists(stage):
+        shutil.rmtree(stage)
+    stage.mkdir()
+    (stage / SENTINEL).write_text(json.dumps({
+        "started_at": datetime.now(UTC).isoformat(),
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+    }))
+    return stage
+
+
+def _verify_staged(stage: Path) -> None:
+    """Refuse a staged package that isn't whole: every playlist the master
+    or the manifest names is there and ends (#EXT-X-ENDLIST), and every
+    init section, segment, sidecar and trickplay sprite they reference is
+    there, inside the package and, but for a sidecar (a track without a
+    cue extracts to an empty file), not empty. Raises PackageError."""
+    manifest = json.loads((stage / MANIFEST_FILE).read_text())
+    listings: dict[str, dict[str, int]] = {}
+    missing: dict[str, None] = {}  # an ordered set: I-frame playlists name the segments again
+
+    def size(rel: str) -> int | None:
+        # One listing per folder: a film has thousands of segments, and
+        # a folder listing is one NFS round trip where a stat each is not.
+        folder, name = posixpath.split(rel)
+        if folder not in listings:
+            try:
+                with os.scandir(stage / folder) as it:
+                    listings[folder] = {e.name: e.stat(follow_symlinks=False).st_size
+                                        for e in it if e.is_file(follow_symlinks=False)}
+            except OSError:
+                listings[folder] = {}
+        return listings[folder].get(name)
+
+    def need(base: str, uri: str, *, empty_ok: bool = False) -> str | None:
+        rel = posixpath.normpath(posixpath.join(base, uri))
+        if "://" in uri or posixpath.isabs(uri) or rel == ".." or rel.startswith("../"):
+            missing[f"{uri} (outside the package)"] = None
+            return None
+        n = size(rel)
+        if n is None or (n == 0 and not empty_ok):
+            missing[rel if n is None else f"{rel} (empty)"] = None
+            return None
+        return rel
+
+    playlists: dict[str, str] = {}  # rel path -> the folder its URIs resolve from
+    master = need("", (manifest.get("hls") or {}).get("master") or "hls/master.m3u8")
+    if master:
+        for uri in hls.playlist_uris((stage / master).read_text()):
+            rel = need(posixpath.dirname(master), uri)
+            if rel:
+                playlists[rel] = posixpath.dirname(rel)
+    renditions = manifest.get("renditions") or {}
+    for entry in [*renditions.get("video", []), *renditions.get("audio", []),
+                  *renditions.get("audioSurround", [])]:
+        if rel := need(entry["dir"], "playlist.m3u8"):
+            playlists[rel] = entry["dir"]
+    for sub in manifest.get("subtitles") or []:
+        need("", sub["path"], empty_ok=True)
+        if sub.get("format") == "vobsub":
+            need("", posixpath.splitext(sub["path"])[0] + ".sub", empty_ok=True)
+        if sub.get("hls") and (rel := need(sub["hls"], "playlist.m3u8")):
+            playlists[rel] = sub["hls"]
+    for rel, folder in playlists.items():
+        text = (stage / rel).read_text()
+        if "#EXT-X-ENDLIST" not in text:
+            missing[f"{rel} (no #EXT-X-ENDLIST)"] = None
+        for uri in dict.fromkeys(hls.playlist_uris(text)):
+            need(folder, uri)
+    trickplay = manifest.get("trickplay")
+    if trickplay and (vtt := need("", trickplay["vttPath"])):
+        sprites = re.findall(r"^([^#\s]+\.jpg)#", (stage / vtt).read_text(), re.MULTILINE)
+        for sprite in dict.fromkeys(sprites):
+            need(posixpath.dirname(vtt), sprite)
+    if missing:
+        names = list(missing)
+        raise PackageError(
+            f"package incomplete, not swapped in: {len(names)} missing: "
+            + ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")
+        )
+
+
+def _swap_in(out_root: Path, stage: Path) -> list[Path]:
+    """Move the staged package into the item folder in place of the live
+    one. Returns what it replaced, renamed <name>.old-<stamp> beside it.
+
+    Entry by entry, subs/ and trickplay/ first and hls/ (the master's
+    tree) last: the live one is renamed within the item folder, so NFS
+    clients that have it cached keep reading it (the grace period), and
+    the staged one moved up from the staging folder, which no reader has
+    ever looked into. Between the two renames the entry is missing.
+    manifest.json is replaced last, in one rename: readers get the old
+    manifest or the new one, whole, and the new one only once everything
+    it names is in place. A failure up to there moves everything back.
+    Then what the old package had beyond the new one is retired too, and
+    .complete is written."""
+    stamp = datetime.now(UTC).strftime(_STAMP)
+    names = sorted((p.name for p in stage.iterdir() if p.name not in (SENTINEL, MANIFEST_FILE)),
+                   key=lambda name: (name == "hls", name))
+    replaced: list[Path] = []
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for name in names:
+            live = out_root / name
+            if os.path.lexists(live):
+                old = out_root / f"{name}{_OLD}{stamp}"
+                os.rename(live, old)
+                moved.append((live, old))
+                replaced.append(old)
+            os.rename(stage / name, live)
+            moved.append((stage / name, live))
+        os.replace(stage / MANIFEST_FILE, out_root / MANIFEST_FILE)
+    except BaseException:
+        for src, dst in reversed(moved):
+            try:
+                os.rename(dst, src)
+            except OSError as e:
+                log.error("packager.swap.undo_failed", path=str(dst), error=str(e)[:200])
+        raise
+    # The new manifest names none of what is left: a trickplay folder the
+    # new run didn't write, a stray file of an older packager.
+    keep = {*names, MANIFEST_FILE, STAGING_DIR, ".complete", ".failed"}
+    for entry in sorted(out_root.iterdir()):
+        if entry.name in keep or _REPLACED.match(entry.name):
+            continue
+        old = out_root / f"{entry.name}{_OLD}{stamp}"
+        try:
+            os.rename(entry, old)
+            replaced.append(old)
+        except OSError as e:
+            log.warning("packager.swap.retire_failed", path=str(entry), error=str(e)[:200])
+    _write_atomic(out_root / ".complete", (datetime.now(UTC).isoformat() + "\n").encode())
+    (out_root / ".failed").unlink(missing_ok=True)
+    shutil.rmtree(stage, ignore_errors=True)
+    return replaced
+
+
+def _remove_after(paths: list[Path], seconds: float) -> None:
+    """Remove a replaced package once the grace period is over, on a timer
+    thread. When the process exits first, the item's next run removes it."""
+    if not paths:
+        return
+
+    def remove() -> None:
+        gone = [p.name for p in paths if _remove(p)]
+        log.info("packager.replaced.removed", dir=str(paths[0].parent), removed=gone)
+
+    if seconds <= 0:
+        remove()
+        return
+    timer = threading.Timer(seconds, remove)
+    timer.daemon = True
+    timer.start()
+
+
+def _remove_replaced(item_root: Path, grace_seconds: float) -> int:
+    """Remove the entries of replaced packages in one item folder whose
+    grace period is over (by the stamp in their names). Returns how many
+    went."""
+    now = time.time()
+    removed = 0
+    try:
+        with os.scandir(item_root) as it:
+            names = [e.name for e in it]
+    except OSError:
+        return 0
+    for name in names:
+        m = _REPLACED.match(name)
+        if not m:
+            continue
+        try:
+            at = datetime.strptime(m["stamp"], _STAMP).replace(tzinfo=UTC).timestamp()
+        except ValueError:
+            continue
+        if at + grace_seconds <= now and _remove(item_root / name):
+            removed += 1
+    return removed
+
+
+def _remove(path: Path) -> bool:
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("packager.remove_failed", path=str(path), error=str(e)[:200])
+        return False
+    return True
+
+
+def _write_failed(out_root: Path, error: Exception) -> None:
+    """The .failed sentinel, for operators. Best effort: an item folder
+    that can't be written must not hide the error that failed the run."""
+    try:
+        (out_root / ".failed").write_text(
+            json.dumps({"error": str(error), "at": datetime.now(UTC).isoformat()}, indent=2)
+        )
+    except OSError as e:
+        log.warning("packager.failed_unwritable", dir=str(out_root), error=str(e)[:200])
 
 
 def _ffprobe(path: Path) -> _Probe:
@@ -1524,8 +1762,9 @@ def package_status(item_id: str) -> dict[str, Any]:
     """Report the current packaging state of one item. Filesystem-only;
     cheap to call frequently. Possible states:
       - "absent": no output directory exists yet
-      - "packaging": .packaging sentinel present
-      - "complete": .complete sentinel present (manifest.json is canonical)
+      - "complete": .complete sentinel present (manifest.json is canonical),
+        also while a run builds its replacement
+      - "packaging": a run's .next/.packaging sentinel present
       - "failed": .failed sentinel present
 
     Probes all category dirs (movies/shows/music/other) so the caller
@@ -1547,9 +1786,9 @@ def package_status(item_id: str) -> dict[str, Any]:
             "completedAt": (out_root / ".complete").read_text().strip(),
             "manifest": manifest,
         }
-    if (out_root / ".packaging").exists():
+    if (out_root / STAGING_DIR / SENTINEL).exists():
         try:
-            info = json.loads((out_root / ".packaging").read_text())
+            info = json.loads((out_root / STAGING_DIR / SENTINEL).read_text())
         except Exception:
             info = {}
         return {"state": "packaging", "item_id": item_id, **info}
