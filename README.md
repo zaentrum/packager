@@ -18,6 +18,16 @@ manually only after an item is fully processed, so a crash mid-work
 reprocesses (idempotent via the katalog `(item_id, step)` unique index +
 the finished-step guard).
 
+Packaging runs on the Kafka poll thread, one item at a time, as in the
+analyzer, and the consumer's `max.poll.interval.ms` is 24 h (librdkafka's
+maximum). A long film with many tracks packages for far longer than the
+5-minute default, and a worker that polls too late loses its partition:
+the broker would hand the item, not committed yet, to the other replica,
+which would package it again into the same directory. It is the
+catalog's reaper, not Kafka, that decides when a silent run is dead. A
+rebalance (a replica joining or leaving) waits until every busy replica
+has finished its item.
+
 The package step is finished when it is `done`, `not_applicable` or
 `skipped`; an event for a finished item packages nothing. The catalog
 retries a failed or silent package by sending its `transcoded` event

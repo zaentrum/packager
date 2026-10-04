@@ -17,7 +17,7 @@ import httpx
 import pytest
 from structlog.testing import capture_logs
 
-from packager import worker
+from packager import events, worker
 from packager.events import is_retry, parse_envelope
 from packager.katalog import KatalogClient
 
@@ -153,6 +153,21 @@ def test_unfinished_package_is_packaged(
     broker, _catalog, packaged = run(monkeypatch, [make()], steps)
     assert packaged == [ITEM]
     assert broker.committed == [0]
+
+
+def test_consumer_keeps_its_partition_through_a_long_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # librdkafka's default (5 min) is shorter than packaging a long film:
+    # the broker would hand the uncommitted item to the other replica,
+    # which packages it again into the same directory. The interval must
+    # outlast the catalog's package timeout (2 h), up to librdkafka's
+    # ceiling (24 h).
+    seen: dict = {}
+    monkeypatch.setattr(events, "Consumer", lambda conf: seen.update(conf))
+    events.build_consumer(brokers="broker.test:9092", group_id="packager-workers")
+    assert 2 * 3600 * 1000 < seen["max.poll.interval.ms"] <= 86_400_000
+    assert seen["enable.auto.commit"] is False
 
 
 def test_retry_marker() -> None:

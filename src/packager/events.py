@@ -14,7 +14,8 @@ Go hub exactly):
     auto.offset.reset=earliest. The offset is committed by the caller
     ONLY after the item is fully processed, so a crash mid-work
     reprocesses the message (idempotent by the katalog (item_id, step)
-    unique index + the pre-work step-status guard).
+    unique index + the pre-work step-status guard). The work runs on the
+    poll thread, so max.poll.interval.ms outlasts the longest run.
 
   * Envelope (JSON value):
         {"eventId": <uuid4 hex>, "itemId": <str>, "type": <str>,
@@ -34,6 +35,19 @@ import structlog
 from confluent_kafka import Consumer
 
 log = structlog.get_logger(__name__)
+
+# How long the worker may go between two polls before the broker takes
+# its partitions away and gives them — and the item in hand, whose offset
+# is not committed yet — to another replica, which would package the same
+# item a second time into the same directory (wiping the first run's
+# output as it starts). Packaging runs on the poll thread, one item at a
+# time, as in the analyzer; a long film with many audio and subtitle
+# tracks takes well over librdkafka's default of 5 minutes, and on slow
+# storage hours. So the worker holds its partition for as long as
+# librdkafka allows (24 h); the catalog's reaper, not Kafka, decides when
+# a silent run is dead. The price: a rebalance (a replica joining or
+# leaving) waits until every busy replica has finished its item.
+MAX_POLL_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 
 def _security_conf(security_protocol: str) -> dict[str, str]:
@@ -60,7 +74,8 @@ def build_consumer(
 ) -> Consumer:
     """Construct a manual-commit consumer. The caller subscribes and
     drives the poll loop; offsets are committed explicitly only after an
-    item is fully processed."""
+    item is fully processed, and the partition is held through the
+    longest packaging run (MAX_POLL_INTERVAL_MS)."""
     return Consumer(
         {
             "bootstrap.servers": brokers,
@@ -68,6 +83,7 @@ def build_consumer(
             **_security_conf(security_protocol),
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",
+            "max.poll.interval.ms": MAX_POLL_INTERVAL_MS,
         }
     )
 
