@@ -147,10 +147,13 @@ from its old package, and a run that fails removes `.next/`, writes
 The replaced package stays for `OLD_PACKAGE_GRACE_SECONDS` (10 minutes),
 for the requests that started on it and the NFS clients that still have
 it cached, then goes; when the process exits first, the item's next run
-removes it. A viewer already
-watching gets the new package's files from the swap on, under the same
-names: seamless where a rendition is unchanged (a copied v0, the audio),
-not where a rung was encoded anew.
+or the sweep at startup removes it. The sweep, on a thread of its own,
+also removes the staging folder of a run that started more than a day
+ago: no run lasts that long (it would have lost its partition), so that
+run died; a younger one may be another replica's, at work. A viewer
+already watching gets the new package's files from the swap on, under
+the same names: seamless where a rendition is unchanged (a copied v0,
+the audio), not where a rung was encoded anew.
 
 ## Layout
 

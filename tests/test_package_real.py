@@ -7,12 +7,14 @@ and packages it: N video variants x 2 audio groups, I-frame playlists,
 the 5.1 companion, DEFAULT/FORCED flags, aligned segments, the manifest.
 A clip with cues at known times checks that the WebVTT renditions put
 every cue on its frame. Packaging a title again leaves its package as it
-was until the new one is complete, then swaps the new one in.
+was until the new one is complete, then swaps the new one in; the
+startup sweep clears what runs that died left.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -530,3 +532,36 @@ def test_the_next_run_clears_what_a_dead_run_left(tmp_path: Path, monkeypatch, h
     _package(tmp_path, monkeypatch, src, inbox)
     assert not (root / pk.STAGING_DIR).exists() and not expired.exists()
     assert sorted(_replaced(root)) == ["hls", "subs", "trickplay"]  # this run's, in their grace
+
+
+def test_a_startup_sweep_clears_what_dead_runs_left(tmp_path: Path, monkeypatch, handoff) -> None:
+    src, inbox = handoff
+    _package(tmp_path, monkeypatch, src, None, surround_codec="off")
+    _manifest, root = _package(tmp_path, monkeypatch, src, inbox)
+    real_shaka = pk._run_shaka
+
+    def killed(cmd: list[str], cwd: Path, label: str) -> None:
+        real_shaka(cmd, cwd, label)
+        raise _Killed
+
+    monkeypatch.setattr(pk, "_run_shaka", killed)
+    with pytest.raises(_Killed):
+        _package(tmp_path, monkeypatch, src, inbox)
+    live = _live(root)
+    # Days later: the process died with the replaced package's timer, an
+    # hour past its grace period, and with the run it was in.
+    hour_ago = (datetime.now(UTC) - timedelta(minutes=70)).strftime(pk._STAMP)
+    expired = [path.rename(root / f"{name}.old-{hour_ago}")
+               for name, path in _replaced(root).items()]
+    two_days_ago = time.time() - 2 * 86400
+    os.utime(root / pk.STAGING_DIR / pk.SENTINEL, (two_days_ago, two_days_ago))
+    # Another replica packages another title right now.
+    busy = root.parent / "c0ffee00-0000-4000-8000-0000000000aa" / pk.STAGING_DIR
+    busy.mkdir(parents=True)
+    (busy / pk.SENTINEL).write_text("{}")
+
+    assert pk.sweep_leftovers(600) == len(expired) + 1
+    assert len(expired) == 3 and not [p for p in expired if p.exists()]
+    assert not (root / pk.STAGING_DIR).exists()
+    assert _live(root) == live
+    assert (busy / pk.SENTINEL).exists()

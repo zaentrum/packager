@@ -1,11 +1,13 @@
 """Swapping a staged package into its item folder, without binaries: the
 check a staged package passes first, a swap that fails half-way, what a
-swap retires, and which replaced packages a run clears."""
+swap retires, which replaced packages a run clears, and what the startup
+sweep clears."""
 
 from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -162,3 +164,42 @@ def test_a_run_clears_the_replaced_packages_past_their_grace(tmp_path: Path) -> 
             (tmp_path / name / "seg-00001.m4s").write_text("x")
     assert pk._remove_replaced(tmp_path, 600) == len(expired)
     assert sorted(p.name for p in tmp_path.iterdir()) == sorted(recent + other)
+
+
+def test_the_startup_sweep_clears_only_what_dead_runs_left(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(pk, "PACKAGES_ROOT", tmp_path)
+    hour_ago, now = _stamp(timedelta(hours=1)), _stamp(timedelta())
+    two_days_ago = time.time() - 2 * 86400
+    # A run that died, and a replaced package whose timer died with it.
+    dead = tmp_path / "movies" / "c0" / "c0ffee00-0000-4000-8000-000000000001"
+    # Another replica's run at work, and a package it has just replaced.
+    busy = tmp_path / "shows" / "5e" / "5e1f0000-0000-4000-8000-000000000002"
+    # A run that died before it wrote its sentinel.
+    early = tmp_path / "other" / "ab" / "ab000000-0000-4000-8000-000000000003"
+    for item in (dead, busy, early):
+        _write_package(item, "live")
+        (item / ".complete").write_text("x")
+        (item / pk.STAGING_DIR / "hls").mkdir(parents=True)
+    (dead / pk.STAGING_DIR / pk.SENTINEL).write_text("{}")
+    os.utime(dead / pk.STAGING_DIR / pk.SENTINEL, (two_days_ago, two_days_ago))
+    (dead / f"hls.old-{hour_ago}").mkdir()
+    (dead / f"subs.old-{hour_ago}").mkdir()
+    (busy / pk.STAGING_DIR / pk.SENTINEL).write_text("{}")
+    (busy / f"hls.old-{now}").mkdir()
+    os.utime(early / pk.STAGING_DIR, (two_days_ago, two_days_ago))
+    handoff = tmp_path / "_inbox" / "c0ffee00-0000-4000-8000-000000000001" / "renditions.json"
+    handoff.parent.mkdir(parents=True)
+    handoff.write_text("{}")
+    package = ["hls", pk.MANIFEST_FILE, "subs", "trickplay", ".complete"]
+
+    def live(item: Path) -> dict[str, str]:
+        return {rel: text for rel, text in _tree(item).items() if rel.split("/")[0] in package}
+
+    before = {item: live(item) for item in (dead, busy, early)}
+    assert pk.sweep_leftovers(600) == 4
+    assert sorted(p.name for p in dead.iterdir()) == sorted(package)
+    assert sorted(p.name for p in early.iterdir()) == sorted(package)
+    assert sorted(p.name for p in busy.iterdir()) == sorted(
+        [*package, pk.STAGING_DIR, f"hls.old-{now}"])
+    assert {item: live(item) for item in (dead, busy, early)} == before
+    assert handoff.exists()

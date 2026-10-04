@@ -121,6 +121,11 @@ _REPLACED = re.compile(r"^(?P<name>.+)\.old-(?P<stamp>\d{8}T\d{6}\.\d{6}Z)$")
 # (acdirmax, 60 s by default), so a request that started on the old
 # package ends on it.
 OLD_PACKAGE_GRACE_SECONDS = 600.0
+# A staging folder whose run started longer ago than this is a dead run's:
+# no run lasts that long, as one that did would have lost its Kafka
+# partition (max.poll.interval.ms, 24 h). A younger one may be another
+# replica's live run.
+STALE_STAGING_SECONDS = 24 * 3600.0
 
 # Segment length in seconds. Same value the legacy on-demand pipeline
 # used; long enough to amortize HTTP overhead, short enough for snappy
@@ -593,7 +598,8 @@ def _swap_in(out_root: Path, stage: Path) -> list[Path]:
 
 def _remove_after(paths: list[Path], seconds: float) -> None:
     """Remove a replaced package once the grace period is over, on a timer
-    thread. When the process exits first, the item's next run removes it."""
+    thread. When the process exits first, the item's next run or the
+    startup sweep (sweep_leftovers) removes it."""
     if not paths:
         return
 
@@ -631,6 +637,54 @@ def _remove_replaced(item_root: Path, grace_seconds: float) -> int:
         if at + grace_seconds <= now and _remove(item_root / name):
             removed += 1
     return removed
+
+
+def sweep_leftovers(
+    grace_seconds: float, *, stale_after_seconds: float = STALE_STAGING_SECONDS,
+) -> int:
+    """Clear what runs that ended uncleanly left in the item folders: the
+    packages swaps replaced whose grace period is over (their timer died
+    with its process) and the staging folders of runs that started more
+    than stale_after_seconds ago (the run died; a younger one may be
+    another replica's, at work). Returns how many entries went. Walks
+    every item folder, so it runs at startup off the worker thread."""
+    t0 = time.monotonic()
+    cutoff = time.time() - stale_after_seconds
+    items = removed = 0
+    for category in sorted({*_CATEGORY_BY_TYPE.values(), "other"}):
+        for shard in _subdirs(PACKAGES_ROOT / category):
+            for item in _subdirs(shard):
+                items += 1
+                removed += _remove_replaced(item, grace_seconds)
+                stage = item / STAGING_DIR
+                if _started_before(stage, cutoff) and _remove(stage):
+                    log.info("packager.sweep.dead_run", dir=str(item))
+                    removed += 1
+    log.info("packager.sweep.done", items=items, removed=removed,
+             elapsed_s=round(time.monotonic() - t0, 1))
+    return removed
+
+
+def _subdirs(path: Path) -> list[Path]:
+    try:
+        with os.scandir(path) as it:
+            return [Path(e.path) for e in it if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return []
+
+
+def _started_before(stage: Path, cutoff: float) -> bool:
+    """Whether the run a staging folder belongs to started before cutoff,
+    by its sentinel (the folder itself when the run died before writing
+    one). False without a staging folder."""
+    for path in (stage / SENTINEL, stage):
+        try:
+            return path.stat().st_mtime < cutoff
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+    return False
 
 
 def _remove(path: Path) -> bool:

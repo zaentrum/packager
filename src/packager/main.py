@@ -1,5 +1,7 @@
 """Entry point. One process runs:
   - the worker loop (thread)
+  - at startup, a sweep of what runs that ended uncleanly left in the
+    item folders (thread)
   - a tiny FastAPI server for /healthz and /readyz, so kubelet probes work.
 
 Same shape as katalog-analyzer's main — intentionally — so anyone
@@ -19,6 +21,7 @@ from fastapi import FastAPI
 
 from .config import Config
 from .katalog import KatalogClient
+from .packager import sweep_leftovers
 from .worker import run_worker
 
 # Pods run with a random non-root UID in GID 0. Without this, mkdir creates
@@ -37,6 +40,16 @@ def _configure_logging() -> None:
         ],
         wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
     )
+
+
+def _sweep(grace_seconds: float) -> None:
+    """The startup sweep (sweep_leftovers): what runs that ended uncleanly
+    left in the item folders. A walk of every item folder, so on its own
+    thread; the worker doesn't wait for it."""
+    try:
+        sweep_leftovers(grace_seconds)
+    except Exception:
+        structlog.get_logger("packager.main").exception("packager.sweep.failed")
 
 
 def main() -> int:
@@ -72,6 +85,9 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
+
+    threading.Thread(target=_sweep, args=(cfg.old_package_grace_seconds,),
+                     daemon=True, name="packager-sweep").start()
 
     worker_thread = threading.Thread(
         target=run_worker,
