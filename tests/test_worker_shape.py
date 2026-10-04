@@ -67,6 +67,19 @@ def test_config_packages_root_override(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.packages_root == "/mnt/test/packages"
 
 
+def test_config_surround_is_off_unless_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Off by default: a master with an audio-surround group reaches clients
+    # that can't decode it until chino-stream filters it per client.
+    monkeypatch.setenv("KATALOG_API_URL", "http://katalog-app")
+    monkeypatch.setenv("OIDC_TOKEN_URL", "https://sso.example/token")
+    monkeypatch.setenv("OIDC_CLIENT_ID", "katalog")
+    monkeypatch.setenv("OIDC_CLIENT_SECRET", "x")
+    monkeypatch.delenv("SURROUND_AUDIO", raising=False)
+    assert Config.from_env().package_options().surround_codec == "off"
+    monkeypatch.setenv("SURROUND_AUDIO", "EAC3")
+    assert Config.from_env().package_options().surround_codec == "eac3"
+
+
 def test_claimed_item_from_json_minimum() -> None:
     body = {
         "id": "00111617-5a35-4c0c-afaa-ff9aae094f86",

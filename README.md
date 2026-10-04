@@ -66,9 +66,10 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   auto-picked. NAMEs are unique within a group.
 
 **Audio.** Every source track becomes an AAC-LC 48 kHz stereo rendition
-in group `audio`, as before. A visible track with ≥ 6 channels also
-gets a 5.1 E-AC-3 rendition in group `audio-surround`, first per
-language, commentary excluded. The source track is stream-copied when it
+in group `audio`, as before. With `SURROUND_AUDIO` set (it is `off` by
+default until chino-stream filters the master per client), a visible
+track with ≥ 6 channels also gets a 5.1 E-AC-3 rendition in group
+`audio-surround`, first per language, commentary excluded. The source track is stream-copied when it
 already is E-AC-3, encoded at 448k otherwise. DEFAULT=YES goes to the
 first language of `PREFERRED_LANGUAGES` (default: the
 `packager.language_whitelist` order) that has a track. Language tags
@@ -117,7 +118,7 @@ Dockerfile
 | `KATALOG_API_URL`, `OIDC_*` | (required) | katalog API + client credentials |
 | `KAFKA_BROKERS` | `kafka:9092` | Bootstrap brokers (`KAFKA_SECURITY_PROTOCOL`, `KAFKA_GROUP_ID`, `CONSUME_TOPIC`) |
 | `SEGMENT_SECONDS` | `6` | Segment length when renditions.json doesn't set it |
-| `SURROUND_AUDIO` | `eac3` | 5.1 companion codec: `eac3`, `ac3` or `off` |
+| `SURROUND_AUDIO` | `off` | 5.1 companion codec: `eac3`, `ac3` or `off`. Turn on only once chino-stream drops the `audio-surround` group for clients that can't decode it |
 | `SURROUND_BITRATE` | `448k` | Bitrate of an encoded 5.1 companion |
 | `HLS_SUBTITLES` | `false` | Reference the WebVTT renditions from the master |
 | `PREFERRED_LANGUAGES` | (empty) | DEFAULT=YES language order, e.g. `de,en`; empty = whitelist order |
