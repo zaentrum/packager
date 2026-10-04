@@ -109,7 +109,7 @@ def _package(tmp_path: Path, monkeypatch, src: Path, inbox: Path | None, **optio
     inputs = resolve_inputs(inbox, str(src)) if inbox else None
     manifest = pk.package_item(
         ITEM, str(src), "movie", title="clip", inputs=inputs,
-        options=pk.PackageOptions(preferred_languages=("en",), **options),
+        options=pk.PackageOptions(**{"preferred_languages": ("en",), **options}),
     )
     return manifest, tmp_path / "packages" / "movies" / ITEM[:2] / ITEM
 
@@ -196,6 +196,20 @@ def test_ladder_package(tmp_path: Path, monkeypatch, handoff) -> None:
                                "subtitleGroup": "subs"}
     assert not list((root / "hls").rglob(".shaka-master.m3u8"))
 
+
+
+def test_every_audio_group_has_exactly_one_default(tmp_path: Path, monkeypatch, handoff) -> None:
+    # German preferred: the stereo default is the German track, which has
+    # no 5.1. The 5.1 group's only rendition (English) used to get
+    # DEFAULT=NO, leaving that group without a default.
+    src, inbox = handoff
+    manifest, root = _package(tmp_path, monkeypatch, src, inbox, preferred_languages=("de",))
+    audio = [a for tag, a, _ in _master(root) if tag == "#EXT-X-MEDIA" and a["TYPE"] == "AUDIO"]
+    assert {g: [a["LANGUAGE"] for a in audio if a["GROUP-ID"] == g and a["DEFAULT"] == "YES"]
+            for g in ("audio", "audio-surround")} == {"audio": ["de"], "audio-surround": ["en"]}
+    r = manifest["renditions"]
+    assert [a["default"] for a in r["audio"]] == [False, True]
+    assert [a["default"] for a in r["audioSurround"]] == [True]
 
 def test_subtitle_group_off_by_default(tmp_path: Path, monkeypatch, handoff) -> None:
     src, inbox = handoff

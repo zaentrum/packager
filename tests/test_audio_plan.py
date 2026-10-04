@@ -64,6 +64,37 @@ def test_surround_plan_first_per_language_copy_or_encode() -> None:
     assert [(s.mode, s.hls_codec) for s in ac3] == [("copy", "ac-3")]
 
 
+
+def test_surround_group_gets_exactly_one_default() -> None:
+    # The stereo default's own companion when it has one ...
+    streams = [_a("eng", 6, "dts"), _a("ger", 6, "eac3", default=True), _a("fre", 2)]
+    plan = pk._surround_plan(streams, {0, 1, 2}, pk.PackageOptions())
+    assert pk._pick_default_surround(plan, streams, 1, ["de", "en"]) == 1
+    # ... else the 5.1 of the default's language (another track of it) ...
+    streams = [_a("ger", 2, "aac"), _a("eng", 6, "dts"), _a("ger", 6, "dts")]
+    plan = pk._surround_plan(streams, {0, 1, 2}, pk.PackageOptions())
+    assert pk._pick_default_surround(plan, streams, 0, ["de"]) == 2
+    # ... else the first preferred language with one: a German default
+    # that has no 5.1 left the group without any DEFAULT=YES.
+    streams = [_a("ger", 2, "ac3"), _a("fre", 6, "dts"), _a("eng", 6, "dts")]
+    plan = pk._surround_plan(streams, {0, 1, 2}, pk.PackageOptions())
+    assert pk._pick_default_surround(plan, streams, 0, ["de", "en", "fr"]) == 2
+    # ... else the first.
+    assert pk._pick_default_surround(plan, streams, 0, []) == 1
+    assert pk._pick_default_surround([], streams, 0, ["de"]) is None
+
+
+def test_prepare_source_marks_the_picked_surround_default(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: None)
+    audio = [_a("ger", 2, "ac3"), _a("eng", 6, "dts")]
+    surround = pk._surround_plan(audio, {0, 1}, pk.PackageOptions())
+    _mp4, meta, surround_meta = pk._prepare_source(
+        Path("/m/src.mkv"), _probe(audio), tmp_path, audio_visible_indices={0, 1},
+        default_index=0, surround=surround, surround_default=1,
+    )
+    assert [m["default"] for m in meta] == [True, False]
+    assert [(m["idx"], m["default"]) for m in surround_meta] == [(1, True)]
+
 def _probe(audio: list[dict], codec: str = "hevc") -> pk._Probe:
     return pk._Probe(container="matroska,webm", duration_ms=60_000,
                      video={"codec_name": codec, "index": 0}, audio=audio, subtitles=[],
@@ -78,7 +109,9 @@ def test_prepare_source_command(monkeypatch, tmp_path: Path) -> None:
     surround = pk._surround_plan(audio, {0, 1, 2}, pk.PackageOptions())
     mp4, meta, surround_meta = pk._prepare_source(
         Path("/m/src.mkv"), probe, tmp_path, audio_visible_indices={0, 1, 2},
-        default_index=1, surround=surround, timeline="offset", ts_offset=0.021,
+        default_index=1, surround=surround,
+        surround_default=pk._pick_default_surround(surround, audio, 1, []),
+        timeline="offset", ts_offset=0.021,
     )
     [args] = calls
     assert args[:args.index("-i")] == [

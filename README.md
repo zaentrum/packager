@@ -93,13 +93,18 @@ in group `audio`, as before. With `SURROUND_AUDIO` set (it is `off` by
 default until chino-stream filters the master per client), a visible
 track with ≥ 6 channels also gets a 5.1 E-AC-3 rendition in group
 `audio-surround`, first per language, commentary excluded. The source track is stream-copied when it
-already is E-AC-3, encoded at 448k otherwise. DEFAULT=YES goes to the
-first language of `PREFERRED_LANGUAGES` (default: the
-`packager.language_whitelist` order) that has a track. Language tags
+already is E-AC-3, encoded at 448k otherwise. In the stereo group,
+DEFAULT=YES goes to the first language of `PREFERRED_LANGUAGES`
+(default: the `packager.language_whitelist` order) that has a track. In
+the 5.1 group it goes to that track's 5.1 companion; when it has none,
+to the 5.1 rendition of its language, else of the first preferred
+language that has one, else to the first — so the 5.1 group has its one
+default even when the default language has no 5.1 track. Language tags
 match across ISO 639-1/-2 (`de` = `ger` = `deu`). In `manifest.json`,
 `renditions.audio` still lists the stereo tracks only, with exactly one
-`default`. The 5.1 renditions go under `renditions.audioSurround`, so
-readers that count or list `audio` see the same tracks as before.
+`default`. The 5.1 renditions go under `renditions.audioSurround` (also
+with exactly one `default`), so readers that count or list `audio` see
+the same tracks as before.
 
 **Subtitles.** Sidecars are extracted exactly as before; PGS / VobSub /
 DVB stay sidecar-only because HLS can't carry them. Every visible WebVTT

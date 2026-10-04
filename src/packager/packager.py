@@ -18,7 +18,9 @@ Design rules:
   (group "audio" — what every browser decodes). A visible source track
   with >= 6 channels additionally gets a 5.1 E-AC-3 (or AC-3) rendition,
   first per language, in group "audio-surround". Exactly one rendition
-  per group is DEFAULT=YES: the preferred-language track.
+  per group is DEFAULT=YES: the preferred-language track; in the 5.1
+  group its companion, else the 5.1 rendition of its language, else that
+  of the first preferred language with one, else the first.
 * Subtitles are extracted to sidecar files (WebVTT for text, native
   bitmap formats for PGS/VobSub/DVB) exactly as before. WebVTT tracks are
   additionally packaged as HLS subtitle renditions (hls/sN/); the master
@@ -284,6 +286,7 @@ def package_item(
         preferred = list(options.preferred_languages) or list(language_whitelist or [])
         default_audio = _pick_default_audio(probe.audio, audio_visible, preferred)
         surround = _surround_plan(probe.audio, audio_visible, options)
+        default_surround = _pick_default_surround(surround, probe.audio, default_audio, preferred)
         log.info(
             "packager.lang_filter",
             whitelist=language_whitelist or None,
@@ -292,6 +295,7 @@ def package_item(
             audio_visible=len(audio_visible),
             default_audio=default_audio,
             surround=[s.source_index for s in surround] or None,
+            default_surround=default_surround,
             sub_total=len(probe.subtitles),
             sub_visible=len(sub_visible),
             video_renditions=len(inputs.video),
@@ -308,6 +312,7 @@ def package_item(
                 audio_visible_indices=audio_visible,
                 default_index=default_audio,
                 surround=surround,
+                surround_default=default_surround,
                 timeline=inputs.primary.timeline,
                 ts_offset=inputs.timestamp_offset,
             )
@@ -631,6 +636,32 @@ def _surround_plan(
     return plan
 
 
+def _pick_default_surround(
+    plan: list[_SurroundTrack],
+    streams: list[dict[str, Any]],
+    default_index: int | None,
+    preferred: list[str],
+) -> int | None:
+    """The source index of the one 5.1 rendition marked DEFAULT=YES, so the
+    5.1 group has exactly one, as the stereo group does: the default stereo
+    track's own companion; else the 5.1 rendition in the default track's
+    language (a companion of another track of it); else the one in the
+    first preferred language that has one; else the first. None without 5.1
+    renditions. (The plan holds at most one per language.)"""
+    if not plan:
+        return None
+    default_key = (_lang_key(_track_language(streams[default_index]))
+                   if default_index is not None else None)
+    wanted = [_lang_key(p) for p in preferred]
+
+    def rank(s: _SurroundTrack) -> tuple[bool, bool, int]:
+        key = _lang_key(_track_language(streams[s.source_index]))
+        return (s.source_index != default_index, key != default_key,
+                wanted.index(key) if key in wanted else len(wanted))
+
+    return min(plan, key=rank).source_index
+
+
 def _timeline_input_args(timeline: str) -> list[str]:
     """`keep` / `offset` inputs are on the contract's shared timeline (or
     moved onto it): don't let ffmpeg renormalise them per file."""
@@ -649,6 +680,7 @@ def _prepare_source(
     audio_visible_indices: set[int] | None = None,
     default_index: int | None = None,
     surround: list[_SurroundTrack] | None = None,
+    surround_default: int | None = None,
     timeline: str = "normalize",
     ts_offset: float = 0.0,
 ) -> tuple[Path, list[dict[str, Any]], list[dict[str, Any]]]:
@@ -670,7 +702,8 @@ def _prepare_source(
     silently no-ops for channel counts.
 
     Surround: per `_surround_plan`, a stream copy or an E-AC-3/AC-3 5.1
-    encode at 48 kHz of the same decoded audio (asplit, one decode).
+    encode at 48 kHz of the same decoded audio (asplit, one decode). The
+    one marked default is `surround_default` (`_pick_default_surround`).
 
     audio_meta is a list of dicts with keys {idx, codec, language,
     title, channels, default, visible}, in source order (audio_meta[N]
@@ -762,7 +795,7 @@ def _prepare_source(
             "language": tags.get("language") or "und",
             "title": tags.get("title") or "",
             "channels": int(stream.get("channels") or 6) if s.mode == "copy" else 6,
-            "default": s.source_index == default_index,
+            "default": s.source_index == surround_default,
             "visible": True,
             "mode": s.mode,
         })
