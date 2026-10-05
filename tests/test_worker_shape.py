@@ -122,6 +122,68 @@ def test_claimed_item_from_json_handles_null_year() -> None:
     assert item.year is None
     assert item.duration_ms is None
     assert item.title == ""   # None → "" so log fields stay strings
+    assert item.track_languages == []  # a record without them, as before
+
+
+@pytest.mark.parametrize("value", [None, "eng", {"kind": "audio"}, 3])
+def test_claimed_item_track_languages_that_are_no_list_are_none(value) -> None:
+    item = ClaimedItem.from_json({"id": "x", "type": "movie", "path": "/m.mkv",
+                                  "trackLanguages": value})
+    assert item.track_languages == []
+
+
+def test_claimed_item_track_languages() -> None:
+    # Passed on as the catalog sent them, but for what isn't an object;
+    # package_item checks each entry's fields.
+    entries = [{"kind": "audio", "ordinal": 0, "language": "zxx"},
+               {"kind": "subtitle", "ordinal": 9, "language": "nope"}]
+    item = ClaimedItem.from_json({"id": "x", "type": "movie", "path": "/m.mkv",
+                                  "trackLanguages": [*entries, "audio 1 eng", None, 7]})
+    assert item.track_languages == entries
+
+
+def test_worker_hands_the_packager_the_source_and_its_track_languages(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # v0 is the transcoder's encode; the catalog's ordinals count the
+    # tracks of the source, so the packager gets the source's path too.
+    from packager import worker
+
+    item_id = "c0ffee00-0000-4000-8000-0000000000bb"
+    source = tmp_path / "media" / "movie.mkv"
+    source.parent.mkdir()
+    source.write_bytes(b"x")
+    inbox = tmp_path / "_inbox"
+    (inbox / item_id).mkdir(parents=True)
+    (inbox / item_id / "prepared.mkv").write_bytes(b"x")
+    monkeypatch.setattr(worker, "_INBOX_ROOT", inbox)
+    monkeypatch.setattr(worker, "probe_source", lambda _path: {})
+    calls: list[tuple[tuple, dict]] = []
+
+    def package_item(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"renditions": {"video": [{"codec": "hvc1"}], "audio": []}, "subtitles": []}
+
+    monkeypatch.setattr(worker, "package_item", package_item)
+
+    class Client:
+        def settings(self) -> dict:
+            return {}
+
+        def upsert_step(self, *_args, **_kw) -> None:
+            pass
+
+        def packaging_complete(self, *_args) -> None:
+            pass
+
+    overrides = [{"kind": "audio", "ordinal": 0, "language": "zxx"}]
+    item = ClaimedItem(id=item_id, type="movie", title="Clip", year=None, duration_ms=None,
+                       path=str(source), track_languages=overrides)
+    worker._process_one(item, Client())  # type: ignore[arg-type]
+    [(args, kwargs)] = calls
+    assert args == (item_id, str(source))
+    assert kwargs["inputs"].primary.path == inbox / item_id / "prepared.mkv"
+    assert kwargs["track_languages"] == overrides
 
 
 def test_module_layout_importable() -> None:

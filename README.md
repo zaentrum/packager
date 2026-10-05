@@ -59,6 +59,18 @@ the transcoder README, "Rendition contract"):
 
 The handoff is deleted after a successful package.
 
+The item record may carry `trackLanguages`, the catalog's language for
+tracks whose tag is missing or wrong: `[{"kind": "audio" | "subtitle",
+"ordinal": 0, "language": "eng"}]`, `ordinal` counting the source's
+tracks of that kind in ffprobe order, `language` an ISO 639-2 code (B or
+T form; `zxx` no dialogue, `und` unknown). A track's language is its
+override, else its tag, else `und`, everywhere: the remux, the manifest,
+the playlists, the whitelist and the DEFAULT pick. When v0 is the
+transcoder's encode, which leaves out the subtitle tracks Matroska can't
+stream-copy, an ordinal finds its track through a probe of the source.
+Malformed entries, and ordinals no packaged track has, are ignored and
+logged.
+
 ## Output
 
 ```

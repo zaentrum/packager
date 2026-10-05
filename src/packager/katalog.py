@@ -28,7 +28,7 @@ shape.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -59,6 +59,12 @@ class ClaimedItem:
     series_title: str | None = None
     series_tmdb_id: str | None = None
     movie_tmdb_id: str | None = None
+    # The catalog's language for a track where it knows better than the
+    # file's tag: [{"kind": "audio" | "subtitle", "ordinal": 0,
+    # "language": "eng"}], `ordinal` counting the source's tracks of that
+    # kind in ffprobe order. Passed on as sent; package_item checks every
+    # entry. Empty when the record has none.
+    track_languages: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def tmdb_id(self) -> str | None:
@@ -82,7 +88,14 @@ class ClaimedItem:
             series_title=body.get("seriesTitle") or None,
             series_tmdb_id=body.get("seriesTmdbId"),
             movie_tmdb_id=body.get("movieTmdbId"),
+            track_languages=_objects(body.get("trackLanguages")),
         )
+
+
+def _objects(value: Any) -> list[dict[str, Any]]:
+    """The JSON objects of an optional list field; [] when it is absent,
+    null or not a list."""
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
 
 
 class KatalogClient:
@@ -164,7 +177,8 @@ class KatalogClient:
         Kafka event. The katalog endpoint returns the full shape
         {id,type,title,year,durationMs,path,seasonNumber,episodeNumber,
         seriesTitle,seriesTmdbId,movieTmdbId} — everything the packager
-        writes into a self-describing manifest. Returns None on 404 (the
+        writes into a self-describing manifest — and, optionally,
+        trackLanguages. Returns None on 404 (the
         item was deleted between the transcoder producing the event and
         us consuming it) so the caller can commit + skip the message."""
         resp = self._request("GET", f"/api/analyze/items/{item_id}")

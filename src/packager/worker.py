@@ -172,9 +172,13 @@ def _process_one(
     t0 = time.monotonic()
     try:
         manifest = package_item(
-            item.id, effective_path, item_type=item.type,
+            # The source as the catalog has it: v0 (inputs.primary) may be
+            # the transcoder's encode of it, and the catalog's per-track
+            # languages count the source's tracks.
+            item.id, item.path, item_type=item.type,
             language_whitelist=language_whitelist,
             keep_original_if_single=keep_original,
+            track_languages=item.track_languages,
             # Catalog identity passed through to the manifest so the
             # package self-describes even if the DB is later lost.
             # See ClaimedItem.tmdb_id for the movie-vs-episode rule.

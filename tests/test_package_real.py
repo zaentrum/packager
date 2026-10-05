@@ -109,12 +109,16 @@ def handoff(tmp_path_factory) -> tuple[Path, Path]:
     return src, inbox
 
 
-def _package(tmp_path: Path, monkeypatch, src: Path, inbox: Path | None, **options):
+def _package(tmp_path: Path, monkeypatch, src: Path, inbox: Path | None, *,
+             item: dict | None = None, **options):
+    """Package src (with the handoff in inbox); `item` holds what the
+    worker passes from the item record and the settings."""
     monkeypatch.setattr(pk, "PACKAGES_ROOT", tmp_path / "packages")
     inputs = resolve_inputs(inbox, str(src)) if inbox else None
     manifest = pk.package_item(
         ITEM, str(src), "movie", title="clip", inputs=inputs,
         options=pk.PackageOptions(**{"preferred_languages": ("en",), **options}),
+        **(item or {}),
     )
     return manifest, tmp_path / "packages" / "movies" / ITEM[:2] / ITEM
 
@@ -215,6 +219,53 @@ def test_every_audio_group_has_exactly_one_default(tmp_path: Path, monkeypatch, 
     r = manifest["renditions"]
     assert [a["default"] for a in r["audio"]] == [False, True]
     assert [a["default"] for a in r["audioSurround"]] == [True]
+
+def test_the_catalogs_track_languages_reach_the_manifest_and_the_master(
+    tmp_path: Path, monkeypatch, handoff,
+) -> None:
+    # The catalog knows better than two of the file's tags: the second
+    # audio track is French, not German, and the third subtitle Spanish.
+    src, inbox = handoff
+    manifest, root = _package(
+        tmp_path, monkeypatch, src, inbox, hls_subtitles=True, surround_codec="off",
+        item={"track_languages": [
+            {"kind": "audio", "ordinal": 1, "language": "fre"},
+            {"kind": "subtitle", "ordinal": 2, "language": "spa"},
+            {"kind": "audio", "ordinal": 7, "language": "ita"},  # no such track
+        ]})
+    assert [(a["language"], a["name"]) for a in manifest["renditions"]["audio"]] == [
+        ("eng", "English"), ("fre", "French")]
+    assert [s["language"] for s in manifest["subtitles"]] == ["eng", "eng", "spa"]
+    media = [a for tag, a, _ in _master(root) if tag == "#EXT-X-MEDIA"]
+    assert [(a["LANGUAGE"], a["NAME"]) for a in media if a["TYPE"] == "AUDIO"] == [
+        ("en", "English"), ("fr", "French")]
+    assert [(a["LANGUAGE"], a["NAME"]) for a in media if a["TYPE"] == "SUBTITLES"] == [
+        ("en", "English"), ("en", "English (forced)"), ("es", "Spanish")]
+
+
+@pytest.mark.parametrize(("override", "language", "name"), [
+    (None, "und", "Unknown"),             # the file's tag: none
+    ("zxx", "zxx", "No dialogue"),        # what the catalog knows
+])
+def test_a_film_without_dialogue(tmp_path: Path, monkeypatch, override, language, name) -> None:
+    # One untagged track, as most short films' MP4s have; a whitelist that
+    # names neither und nor zxx, and no one-language fallback.
+    src = tmp_path / "film.mp4"
+    _ff("-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=4",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4",
+        "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(src))
+    tracks = [{"kind": "audio", "ordinal": 0, "language": override}] if override else []
+    manifest, root = _package(
+        tmp_path, monkeypatch, src, None, surround_codec="off",
+        item={"language_whitelist": ["en", "de"], "keep_original_if_single": False,
+              "track_languages": tracks})
+    [audio] = manifest["renditions"]["audio"]
+    assert (audio["language"], audio["name"], audio["visible"], audio["default"]) == (
+        language, name, True, True)
+    [media] = [a for tag, a, _ in _master(root) if tag == "#EXT-X-MEDIA"]
+    assert (media.get("LANGUAGE"), media["NAME"], media["DEFAULT"]) == (
+        override, name, "YES")
+
 
 def test_subtitle_group_off_by_default(tmp_path: Path, monkeypatch, handoff) -> None:
     src, inbox = handoff

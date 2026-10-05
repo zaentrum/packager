@@ -47,7 +47,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -252,6 +252,7 @@ def package_item(
     tmdb_id: str | None = None,
     inputs: PackageInputs | None = None,
     options: PackageOptions | None = None,
+    track_languages: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Package one item synchronously. Returns the written manifest.
 
@@ -266,9 +267,19 @@ def package_item(
     item_type is katalog's classification (movie/episode/album/…) and
     decides which top-level category directory the package lands under.
 
+    `source_path` is the item's source file, as the catalog has it.
     `inputs` is the resolved transcoder handoff (packager.renditions);
     None packages `source_path` as the single rendition, as before.
-    `inputs.primary` (v0) carries the audio and subtitle tracks.
+    `inputs.primary` (v0) carries the audio and subtitle tracks: the
+    source itself, or the transcoder's encode of it.
+
+    track_languages is the item record's trackLanguages: per-track
+    language overrides, [{"kind": "audio" | "subtitle", "ordinal": N,
+    "language": "eng"}], N the track's place among the source's tracks
+    of that kind in ffprobe order. A track's language is its override,
+    else its tag, else und, everywhere: the remux, the manifest, the
+    playlists, the whitelist and the DEFAULT pick. Malformed entries are
+    ignored (_track_overrides).
 
     language_whitelist is a list of lowercased ISO 639-1/2 codes
     (`en`, `de`, `zh`, …). Tracks (audio + subtitle) whose language
@@ -306,6 +317,11 @@ def package_item(
                 f"video codec {probe.video.get('codec_name')!r} not supported "
                 "(passthrough only; HEVC and H.264 are the allowed input codecs)"
             )
+        # The catalog's language for a track wins over the file's tag.
+        overrides = _track_overrides(track_languages)
+        if overrides:
+            probe = _with_track_languages(
+                probe, overrides, _probe_of_source(src, Path(source_path)))
 
         # Resolve client-visibility windows for audio + subtitle
         # tracks from the language whitelist. Tracks ALWAYS get
@@ -333,6 +349,7 @@ def package_item(
             default_surround=default_surround,
             sub_total=len(probe.subtitles),
             sub_visible=len(sub_visible),
+            track_languages=len(overrides) or None,
             video_renditions=len(inputs.video),
             inputs=inputs.kind,
         )
@@ -804,13 +821,119 @@ def _lang_key(tag: str | None) -> str:
 
 
 def _track_language(stream: dict[str, Any]) -> str:
-    """Pull the lowercased language tag off a probed audio/subtitle
-    stream. Falls back to 'und' (the IETF undefined tag) for tracks
-    without an explicit tag — those are *always* kept regardless of
-    the whitelist so a missing/wrong tag doesn't silently drop the
-    only track on a clean source rip."""
+    """The track's language: the lowercased language tag of a probed
+    audio/subtitle stream, which is its trackLanguages override once
+    _with_track_languages has run. Falls back to 'und' (the IETF
+    undefined tag) for tracks without an explicit tag — those are
+    *always* kept regardless of the whitelist so a missing/wrong tag
+    doesn't silently drop the only track on a clean source rip."""
     tags = stream.get("tags") or {}
     return (tags.get("language") or "und").lower()
+
+
+# The kinds of track a trackLanguages entry names.
+_TRACK_KINDS = ("audio", "subtitle")
+_LANGUAGE_CODE = re.compile(r"^[a-z]{3}$")
+
+
+def _language_code(value: Any) -> str | None:
+    """A language as the item record spells it: an ISO 639-2 code, B or T
+    form ('ger', 'deu'), zxx and und included, lowercased. None for
+    anything else."""
+    if not isinstance(value, str):
+        return None
+    code = value.strip().lower()
+    return code if _LANGUAGE_CODE.match(code) else None
+
+
+def _track_overrides(entries: list[Any] | None) -> dict[tuple[str, int], str]:
+    """The item record's trackLanguages as {(kind, ordinal): language}. An
+    entry counts when its kind is "audio" or "subtitle", its ordinal an
+    int >= 0 (the track's place among the source's tracks of that kind,
+    in ffprobe order) and its language a code (_language_code); any other
+    is ignored, logged. A track named twice takes the last entry."""
+    out: dict[tuple[str, int], str] = {}
+    for entry in entries or []:
+        ok = isinstance(entry, dict)
+        kind = entry.get("kind") if ok else None
+        ordinal = entry.get("ordinal") if ok else None
+        language = _language_code(entry.get("language")) if ok else None
+        if (kind not in _TRACK_KINDS or not isinstance(ordinal, int)
+                or isinstance(ordinal, bool) or ordinal < 0 or language is None):
+            log.warning("packager.track_language.ignored", entry=str(entry)[:200])
+            continue
+        out[(kind, ordinal)] = language
+    return out
+
+
+def _source_ordinals(
+    packaged: list[dict[str, Any]], source: list[dict[str, Any]] | None,
+) -> list[int]:
+    """Each packaged track's ordinal among the source's tracks of its kind.
+    The packaged file (v0) is the source itself or the transcoder's encode
+    of it, which carries every audio track and the subtitle tracks
+    Matroska can stream-copy, in the source's order: each of its tracks is
+    the source's next one of the same codec. Without the source's tracks,
+    or when they don't line up, the packaged order is the source's."""
+    same = list(range(len(packaged)))
+    if source is None:
+        return same
+    out: list[int] = []
+    j = 0
+    for stream in packaged:
+        codec = stream.get("codec_name")
+        while j < len(source) and source[j].get("codec_name") != codec:
+            j += 1
+        if j == len(source):
+            return same
+        out.append(j)
+        j += 1
+    return out
+
+
+def _with_track_languages(
+    probe: _Probe, overrides: dict[tuple[str, int], str], source: _Probe | None,
+) -> _Probe:
+    """The probe with each audio and subtitle track's language tag replaced
+    by its override, found by the track's ordinal in the source
+    (_source_ordinals; `source` is the source's probe when v0 is an encode
+    of it). A track without an override keeps its tag; an override that
+    names no packaged track is ignored, logged."""
+    applied: list[str] = []
+    used: set[tuple[str, int]] = set()
+
+    def apply(kind: str, streams: list[dict[str, Any]],
+              in_source: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for stream, ordinal in zip(streams, _source_ordinals(streams, in_source), strict=True):
+            language = overrides.get((kind, ordinal))
+            if language is None:
+                out.append(stream)
+                continue
+            used.add((kind, ordinal))
+            applied.append(f"{kind} {ordinal}: {_track_language(stream)} -> {language}")
+            out.append({**stream, "tags": {**(stream.get("tags") or {}), "language": language}})
+        return out
+
+    audio = apply("audio", probe.audio, source.audio if source else None)
+    subtitles = apply("subtitle", probe.subtitles, source.subtitles if source else None)
+    log.info("packager.track_languages", applied=applied or None,
+             unmatched=[f"{k} {o}" for k, o in sorted(set(overrides) - used)] or None)
+    return replace(probe, audio=audio, subtitles=subtitles)
+
+
+def _probe_of_source(packaged: Path, source: Path) -> _Probe | None:
+    """The source's own probe when the packaged file (v0) is the
+    transcoder's encode of it, for _source_ordinals: the trackLanguages
+    ordinals count the source's tracks. None when v0 is the source, or the
+    source can't be probed (gone, unreadable)."""
+    if packaged == source or not source.exists():
+        return None
+    try:
+        return _ffprobe(source)
+    except (OSError, ValueError, subprocess.CalledProcessError) as e:
+        log.warning("packager.source_probe_failed", path=str(source), error=str(e)[:200])
+        return None
 
 
 # Tags no language whitelist hides: undetermined, and no linguistic
@@ -1091,7 +1214,7 @@ def _prepare_source(
         surround_meta.append({
             "idx": s.source_index,
             "codec": s.hls_codec,
-            "language": tags.get("language") or "und",
+            "language": _track_language(stream),
             "title": tags.get("title") or "",
             "channels": int(stream.get("channels") or 6) if s.mode == "copy" else 6,
             "default": s.source_index == surround_default,
@@ -1383,7 +1506,7 @@ def _audio_meta_from_stream(
     return {
         "idx": idx,
         "codec": "aac" if transcoded else stream.get("codec_name", "aac"),
-        "language": tags.get("language") or "und",
+        "language": _track_language(stream),
         "title": tags.get("title") or "",
         # Output channels: always 2 after the stereo downmix in
         # _prepare_source. Falls back to the source channel count only
@@ -1427,7 +1550,7 @@ def _extract_subtitles(
         disp = s.get("disposition") or {}
         common = {
             "id": f"sub{i}",
-            "language": tags.get("language") or "und",
+            "language": _track_language(s),
             "title": tags.get("title") or "",
             "default": bool(disp.get("default")),
             "forced": bool(disp.get("forced")),
