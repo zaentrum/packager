@@ -263,6 +263,7 @@ def package_item(
     options: PackageOptions | None = None,
     track_languages: list[Any] | None = None,
     subtitle_files: list[Any] | None = None,
+    trickplay: bool = True,
 ) -> dict[str, Any]:
     """Package one item synchronously. Returns the written manifest.
 
@@ -311,7 +312,11 @@ def package_item(
     match. The whitelist order is also the language preference for the
     DEFAULT=YES audio track unless options.preferred_languages is set.
     Loaded from the Settings entity by the worker on each item so an
-    operator edit takes effect on the next item."""
+    operator edit takes effect on the next item.
+
+    trickplay False leaves the scrub-preview sprites out: no trickplay/
+    folder, no `trickplay` in the manifest. An extra of a title (a
+    trailer) is packaged so: the clients play it without scrub previews."""
     options = options or PackageOptions()
     if inputs is None:
         inputs = PackageInputs(video=[VideoInput("v0", Path(source_path))], kind="original")
@@ -422,7 +427,8 @@ def package_item(
         # per TRICKPLAY_INTERVAL_SEC, so HEVC decode cost is small
         # (~30 s on a 90 min movie) and we don't need the
         # transmuxed intermediate to still exist.
-        trickplay_meta = _generate_trickplay(src, probe, stage / "trickplay")
+        trickplay_meta = (_generate_trickplay(src, probe, stage / "trickplay")
+                          if trickplay else None)
 
         # v2 manifest: self-describing catalog metadata at the top
         # level, no `source` block. If the catalog DB is ever lost,

@@ -1,10 +1,13 @@
 """The extras of a title (trailers, teasers, featurettes), without
-binaries: where an extra's package goes, and what the startup sweep
-clears there. The real packaging runs of extras are in
-test_package_real.py."""
+binaries: where an extra's package goes, what the startup sweep clears
+there, and how package_item packages one: no trickplay. package_item
+runs for real but for its binaries (ffprobe, the remux, shaka-packager,
+the trickplay sprites), which stand-ins replace. The real packaging
+runs of extras are in test_package_real.py."""
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from datetime import UTC, datetime, timedelta
@@ -94,3 +97,85 @@ def test_a_titles_category_is_as_it_was(item_type, tmp_path: Path, monkeypatch) 
     monkeypatch.setattr(pk, "PACKAGES_ROOT", tmp_path)
     category = {"movie": "movies", "episode": "shows", None: "other"}[item_type]
     assert pk._item_root(PARENT, item_type) == tmp_path / category / "c0" / PARENT
+
+
+# ------------------------------------------------- package_item, no binaries
+
+class Binaries:
+    """Stand-ins for what package_item runs: the probe of a 33 s 720p
+    H.264 clip with one English AAC track, a remux that writes nothing, a
+    shaka run that writes a small whole HLS tree, and a trickplay run
+    that writes one sprite. `trickplay` lists the folders it ran for."""
+
+    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.root = tmp_path / "packages"
+        self.trickplay: list[Path] = []
+        self.source = tmp_path / "extras" / "clip" / "trailer.mp4"
+        self.source.parent.mkdir(parents=True)
+        self.source.write_bytes(b"x")
+        monkeypatch.setattr(pk, "PACKAGES_ROOT", self.root)
+        monkeypatch.setattr(pk, "_packager_version", lambda: "packager-test")
+        monkeypatch.setattr(pk, "_ffprobe", lambda _path: pk._Probe(
+            container="mov,mp4,m4a,3gp,3g2,mj2", duration_ms=33_000,
+            video={"index": 0, "codec_name": "h264", "width": 1280, "height": 720},
+            audio=[{"index": 1, "codec_name": "aac", "channels": 2,
+                    "tags": {"language": "eng"}, "disposition": {"default": 1}}],
+            subtitles=[], video_index=0))
+        monkeypatch.setattr(pk, "_prepare_source", self._prepare)
+        monkeypatch.setattr(pk, "_run_shaka_packager", self._shaka)
+        monkeypatch.setattr(pk, "_generate_trickplay", self._sprites)
+
+    @staticmethod
+    def _prepare(_src, _probe, tmpdir: Path, **_kw):
+        audio = [{"idx": 0, "codec": "aac", "language": "eng", "title": "", "channels": 2,
+                  "default": True, "visible": True}]
+        return tmpdir / "transmux.mp4", audio, []
+
+    @staticmethod
+    def _shaka(_primary, _videos, audio_meta, surround_meta, out_root: Path, **_kw):
+        _write_hls(out_root, "new")
+        video = [{"id": "v0", "dir": "hls/v0", "codec": "avc1.64001f", "width": 1280,
+                  "height": 720, "label": "720p", "encoder": "copy"}]
+        audio = [{**audio_meta[0], "id": "a0", "dir": "hls/a0", "codec": "mp4a.40.2",
+                  "group": "audio", "name": "English"}]
+        return video, audio, surround_meta
+
+    def _sprites(self, _src, _probe, out_dir: Path):
+        self.trickplay.append(out_dir)
+        out_dir.mkdir(parents=True)
+        (out_dir / "thumbnails.vtt").write_text(
+            "WEBVTT\n\n00:00:00.000 --> 00:00:10.000\nsprite-0000.jpg#xywh=0,0,320,180\n")
+        (out_dir / "sprite-0000.jpg").write_text("x")
+        return {"vttPath": "trickplay/thumbnails.vtt", "spritePattern": "trickplay/sprite-%04d.jpg",
+                "intervalSec": 10, "thumbWidth": 320, "thumbHeight": 180,
+                "gridCols": 10, "gridRows": 10}
+
+
+@pytest.fixture
+def binaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Binaries:
+    return Binaries(tmp_path, monkeypatch)
+
+
+def _on_disk(root: Path) -> dict:
+    return json.loads((root / pk.MANIFEST_FILE).read_text())
+
+
+def test_an_extra_is_packaged_without_trickplay(binaries: Binaries) -> None:
+    manifest = pk.package_item(EXTRA, str(binaries.source), "extra", title="Trailer",
+                               trickplay=False)
+    root = binaries.root / "extras" / "1b" / EXTRA
+    assert binaries.trickplay == []
+    assert "trickplay" not in manifest
+    assert _on_disk(root) == manifest
+    assert sorted(p.name for p in root.iterdir()) == [".complete", "hls", pk.MANIFEST_FILE]
+
+
+def test_a_title_has_its_trickplay_as_before(binaries: Binaries) -> None:
+    # The default: the sprites, run against the source, into the staging
+    # folder, and swapped in with the package.
+    manifest = pk.package_item(PARENT, str(binaries.source), "movie", title="Clip")
+    root = binaries.root / "movies" / "c0" / PARENT
+    assert binaries.trickplay == [root / pk.STAGING_DIR / "trickplay"]
+    assert manifest["trickplay"]["vttPath"] == "trickplay/thumbnails.vtt"
+    assert (root / "trickplay" / "sprite-0000.jpg").exists()
+    assert _on_disk(root) == manifest
