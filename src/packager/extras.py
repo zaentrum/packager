@@ -40,9 +40,8 @@ Per message, as the item loop does it (worker.run_worker):
   5. `POST /api/extras/{id}/packaging-complete` with the manifest and the
      source block. Only once the catalog has taken it is the step `done`
      and the handoff removed. When it hasn't, the step fails, unlike an
-     item's: an item's package the catalog missed can be repaired from
-     its folder, an extra's can't, and the catalog's retry runs the
-     chain again.
+     item's, which is done regardless: only the catalog's word makes an
+     extra playable, so its retry runs the chain again.
 """
 
 from __future__ import annotations
@@ -200,9 +199,10 @@ def _process_extra(
     answer = client.extra_packaging_complete(
         extra.id, {**manifest, "source": source} if source else manifest)
     if answer is None:
-        # The package is on disk, swapped in, but the catalog doesn't know
-        # it: nothing would play it, and nothing would repair it. The
-        # handoff stays, as after any failure.
+        # The package is on disk, swapped in, but the catalog didn't take
+        # it, and only the catalog's word makes an extra playable: fail
+        # the step, so its retry runs the chain again. The handoff stays,
+        # as after any failure.
         client.upsert_extra_step(
             extra.id, "failed", error="packaging-complete: the catalog did not take the package")
         return

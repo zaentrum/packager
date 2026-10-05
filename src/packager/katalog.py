@@ -392,9 +392,9 @@ class KatalogClient:
         package size) and makes the extra playable, and answers {extraId,
         itemId, packaged, durationMs}. Returns that answer ({} when it has
         no JSON object), or None when the catalog didn't take the package
-        (an HTTP error, no answer): an extra has no repair path for a
-        package the catalog doesn't know, so the extras loop then fails
-        the step and the catalog's retry runs the chain again."""
+        (an HTTP error, no answer): only the catalog's word makes an extra
+        playable, so the extras loop then fails the step and the
+        catalog's retry runs the chain again."""
         try:
             resp = self._request(
                 "POST",
