@@ -200,6 +200,7 @@ def test_module_layout_importable() -> None:
     import packager
     import packager.config
     import packager.events
+    import packager.extras
     import packager.katalog
     import packager.packager
     import packager.worker

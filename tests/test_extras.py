@@ -1,21 +1,29 @@
 """The extras of a title (trailers, teasers, featurettes), without
 binaries: where an extra's package goes, what the startup sweep clears
-there, and how package_item packages one: no trickplay. package_item
-runs for real but for its binaries (ffprobe, the remux, shaka-packager,
-the trickplay sprites), which stand-ins replace. The real packaging
-runs of extras are in test_package_real.py."""
+there, and how package_item packages one (no trickplay, a manifest
+naming its title and kind), with stand-ins for its binaries (ffprobe,
+the remux, shaka-packager, the trickplay sprites); the extras' topic,
+envelope and catalog calls; and the extras loop against a fake broker
+and the real KatalogClient talking to a fake catalog through an httpx
+mock transport, so the guards read the extra's record exactly as in
+production, with package_item replaced by a recorder. The real
+packaging runs of extras are in test_package_real.py."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
+from packager import extras, worker
 from packager import packager as pk
 from packager.config import Config
 from packager.events import is_retry, parse_envelope, parse_extra_id, parse_item_id
@@ -419,3 +427,418 @@ def test_an_extras_packaging_complete_without_a_catalog() -> None:
         raise httpx.ConnectError("no route")
 
     assert _client(down).extra_packaging_complete(EXTRA, {}) is None
+
+
+# ----------------------------------------------------------------- the loop
+
+TOPIC = "stube.catalog.extra.transcoded"
+STEP = f"/api/analyze/extras/{EXTRA}/steps/package"
+COMPLETE = f"/api/extras/{EXTRA}/packaging-complete"
+SOURCE = {"codec": "h264", "width": 1280, "height": 720, "durationMs": 33_000,
+          "bitRate": 2_400_000}
+MANIFEST = {"version": 2, "itemId": EXTRA, "type": "extra", "parentId": PARENT,
+            "extraKind": "trailer", "title": "Trailer", "durationMs": 33_000,
+            "renditions": {"video": [{"id": "v0", "codec": "avc1.64001f"},
+                                     {"id": "v1", "codec": "avc1.64001e"}],
+                           "audio": [{"id": "a0"}], "audioSurround": []},
+            "subtitles": []}
+
+
+class Message:
+    """A consumed record, as confluent-kafka hands it to the loop."""
+
+    def __init__(self, value: dict, offset: int) -> None:
+        self._value = json.dumps(value).encode()
+        self._offset = offset
+
+    def value(self) -> bytes:
+        return self._value
+
+    def error(self) -> None:
+        return None
+
+    def offset(self) -> int:
+        return self._offset
+
+
+class Broker:
+    """One partition for the consumer. Sets `stop` once every message has
+    been polled, which ends the loop."""
+
+    def __init__(self, events: list[dict], stop: threading.Event) -> None:
+        self.pending = [Message(e, i) for i, e in enumerate(events)]
+        self.stop = stop
+        self.built: dict = {}
+        self.topics: list[str] = []
+        self.committed: list[int] = []
+
+    def subscribe(self, topics: list[str]) -> None:
+        self.topics = topics
+
+    def poll(self, _timeout: float) -> Message | None:
+        if not self.pending:
+            self.stop.set()
+            return None
+        return self.pending.pop(0)
+
+    def commit(self, message: Message) -> None:
+        self.committed.append(message.offset())
+
+    def close(self) -> None:
+        pass
+
+
+class Catalog:
+    """The catalog's extras worker protocol: the record, the settings, the
+    step and packaging-complete. `state` None: the catalog answers 404."""
+
+    def __init__(self, state: str | None, *, complete: int = 200, **fields: object) -> None:
+        self.record = None if state is None else record(state, **fields)
+        self.complete = complete
+        self.fail_reads = False
+        self.reads: list[str] = []
+        self.writes: list[tuple[str, str, object]] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET":
+            self.reads.append(path)
+            if path == "/api/settings":
+                return httpx.Response(200, json={
+                    "packager.language_whitelist": {"valueText": "en,de"}})
+            if self.fail_reads:
+                return httpx.Response(503)
+            if path == f"/api/analyze/extras/{EXTRA}" and self.record is not None:
+                return httpx.Response(200, json=self.record)
+            return httpx.Response(404)
+        self.writes.append((request.method, path, json.loads(request.content or b"null")))
+        if path == COMPLETE:
+            return httpx.Response(self.complete, json={
+                "extraId": EXTRA, "itemId": PARENT, "packaged": True, "durationMs": 33_000})
+        return httpx.Response(200, json={})
+
+
+def retry(**fields: object) -> dict:
+    """The event as the catalog's retry chain sends it again."""
+    return transcoded(status="retry", source="retry", **fields)
+
+
+@pytest.fixture
+def extra_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    """The extra's source, outside the media root, and the transcoder's
+    handoff for it: v0 the source as it is ("file": null), v1 a 480p
+    encode."""
+    source = tmp_path / "extras" / "clip" / "trailer.mov"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"x")
+    inbox = tmp_path / "_inbox" / f"extra-{EXTRA}"
+    inbox.mkdir(parents=True)
+    (inbox / "v1.mkv").write_bytes(b"x")
+    (inbox / "renditions.json").write_text(json.dumps({
+        "version": 1, "itemId": EXTRA, "segmentSeconds": 6, "keyframes": "source",
+        "timestampOffset": 0.0, "source": SOURCE,
+        "video": [{"id": "v0", "label": "720p", "file": None, "mode": "copy"},
+                  {"id": "v1", "label": "480p", "file": "v1.mkv", "mode": "encode",
+                   "encoder": "libx264"}],
+    }))
+    monkeypatch.setattr(extras, "_INBOX_ROOT", tmp_path / "_inbox")
+    # The handoff says all the source block needs; nothing is probed.
+    monkeypatch.setattr(worker, "probe_source", lambda _path: pytest.fail("probed"))
+    return source, inbox
+
+
+def run(monkeypatch: pytest.MonkeyPatch, events: list[dict], catalog: Catalog,
+        package=None) -> tuple[Broker, list[tuple[tuple, dict]]]:
+    stop = threading.Event()
+    broker = Broker(events, stop)
+    calls: list[tuple[tuple, dict]] = []
+
+    def build_consumer(**kw: object) -> Broker:
+        broker.built = kw
+        return broker
+
+    def package_item(*args, **kwargs) -> dict:
+        calls.append((args, kwargs))
+        return package(*args, **kwargs) if package else MANIFEST
+
+    monkeypatch.setattr(extras, "build_consumer", build_consumer)
+    monkeypatch.setattr(extras, "package_item", package_item)
+    options = pk.PackageOptions(segment_seconds=4)
+    extras.run_extras_worker(_client(catalog), "broker.test:9092", "packager-extras", TOPIC,
+                             "PLAINTEXT", 0.0, stop, options)
+    for _args, kwargs in calls:
+        assert kwargs["options"] is options
+    return broker, calls
+
+
+def test_an_extra_is_packaged_and_handed_to_the_catalog(
+    monkeypatch: pytest.MonkeyPatch, extra_files,
+) -> None:
+    source, inbox = extra_files
+    catalog = Catalog("transcoded", path=str(source))
+    broker, calls = run(monkeypatch, [transcoded()], catalog)
+    assert broker.built == {"brokers": "broker.test:9092", "group_id": "packager-extras",
+                            "security_protocol": "PLAINTEXT"}
+    assert broker.topics == [TOPIC]
+
+    [(args, kwargs)] = calls
+    assert args == (EXTRA, str(source))
+    assert {k: kwargs[k] for k in ("item_type", "title", "trickplay", "manifest_extra",
+                                   "language_whitelist", "keep_original_if_single")} == {
+        "item_type": "extra", "title": "Trailer", "trickplay": False,
+        "manifest_extra": {"parentId": PARENT, "extraKind": "trailer"},
+        "language_whitelist": ["en", "de"], "keep_original_if_single": True,
+    }
+    assert [(v.id, v.path) for v in kwargs["inputs"].video] == [
+        ("v0", source), ("v1", inbox / "v1.mkv")]
+
+    # The extra's endpoints only, never an item's; the step is done only
+    # once the catalog has the package.
+    assert catalog.reads == [f"/api/analyze/extras/{EXTRA}", "/api/settings"]
+    assert [(method, path) for method, path, _body in catalog.writes] == [
+        ("PUT", STEP), ("POST", COMPLETE), ("PUT", STEP)]
+    assert catalog.writes[0][2] == {"status": "in_progress"}
+    assert catalog.writes[1][2] == {**MANIFEST, "source": SOURCE}
+    done = catalog.writes[2][2]
+    assert done["status"] == "done"
+    assert re.fullmatch(r"v=avc1\.64001f a=1 subs=0 dur_s=[0-9.]+ vr=2", done["details"])
+    assert not inbox.exists()  # the handoff goes once the catalog has the package
+    assert broker.committed == [0]
+
+
+def test_an_extra_the_transcoder_left_as_it_was_is_packaged_from_its_file(
+    monkeypatch: pytest.MonkeyPatch, extra_files,
+) -> None:
+    # A small H.264 trailer: the transcoder's step was not_applicable and
+    # it left no handoff. Its file is packaged as it is.
+    source, inbox = extra_files
+    for f in inbox.iterdir():
+        f.unlink()
+    inbox.rmdir()
+    monkeypatch.setattr(worker, "probe_source", lambda _path: SOURCE)
+    catalog = Catalog("transcoded", path=str(source))
+    _broker, [(_args, kwargs)] = run(monkeypatch, [transcoded()], catalog)
+    assert (kwargs["inputs"].kind, kwargs["inputs"].primary.path) == ("original", source)
+    assert catalog.writes[1] == ("POST", COMPLETE, {**MANIFEST, "source": SOURCE})
+    assert catalog.writes[-1][2]["status"] == "done"
+
+
+@pytest.mark.parametrize("state", ["transcoded", "packaging", "pending", "queued",
+                                   "transcoding", "failed"])
+@pytest.mark.parametrize("make", [transcoded, retry])
+def test_an_extra_not_ready_is_packaged(
+    monkeypatch: pytest.MonkeyPatch, extra_files, state: str, make,
+) -> None:
+    # As for an unfinished item: packaging is a run that died (its events
+    # share a partition, so no other run is at work), a retry is what a
+    # retry is for.
+    source, _inbox = extra_files
+    catalog = Catalog(state, path=str(source))
+    broker, calls = run(monkeypatch, [make()], catalog)
+    assert len(calls) == 1
+    assert [(path, body["status"]) for _m, path, body in catalog.writes if path == STEP] == [
+        (STEP, "in_progress"), (STEP, "done")]
+    assert broker.committed == [0]
+
+
+@pytest.mark.parametrize(("make", "event"), [
+    (transcoded, "packager.extra.already_done"),
+    (retry, "packager.extra.retry.already_finished"),
+])
+def test_a_ready_extra_is_not_packaged_again(
+    monkeypatch: pytest.MonkeyPatch, extra_files, make, event: str,
+) -> None:
+    # The transcoder sends transcoded again for an extra past its
+    # transcode whenever a trigger reaches it again: a duplicate. The
+    # package plays; nothing runs, nothing is written.
+    source, inbox = extra_files
+    catalog = Catalog("ready", path=str(source))
+    with capture_logs() as logs:
+        broker, calls = run(monkeypatch, [make()], catalog)
+    assert calls == [] and catalog.writes == []
+    assert broker.committed == [0]
+    assert [(e["event"], e["state"]) for e in logs if e.get("extra_id") == EXTRA] == [
+        (event, "ready")]
+    assert inbox.exists()
+
+
+@pytest.mark.parametrize(("state", "fields", "event"), [
+    (None, {}, "packager.extra.unresolved"),           # 404: unknown, or removed
+    ("transcoded", {"removedAt": "2026-10-05T08:00:00Z"}, "packager.extra.removed_skip"),
+    ("missing", {}, "packager.extra.missing_skip"),   # its file is gone
+])
+@pytest.mark.parametrize("make", [transcoded, retry])
+def test_an_extra_that_is_gone_is_skipped(
+    monkeypatch: pytest.MonkeyPatch, extra_files, state: str | None, fields: dict,
+    event: str, make,
+) -> None:
+    source, inbox = extra_files
+    catalog = Catalog(state, path=str(source), **fields)
+    with capture_logs() as logs:
+        broker, calls = run(monkeypatch, [make()], catalog)
+    assert calls == [] and catalog.writes == []
+    assert catalog.reads == [f"/api/analyze/extras/{EXTRA}"]
+    assert broker.committed == [0]
+    assert event in [e["event"] for e in logs if e.get("extra_id") == EXTRA]
+    assert inbox.exists()
+
+
+def test_a_malformed_event_is_committed_and_skipped(
+    monkeypatch: pytest.MonkeyPatch, extra_files,
+) -> None:
+    source, _inbox = extra_files
+    catalog = Catalog("transcoded", path=str(source))
+    item_event = {"eventId": "e1", "itemId": PARENT, "type": "movie", "step": "package",
+                  "status": "done", "source": "transcoder"}
+    broker, calls = run(monkeypatch, [item_event, transcoded(extraId=EXTRA.upper()),
+                                      transcoded(extraId=None)], catalog)
+    assert calls == [] and catalog.reads == [] and catalog.writes == []
+    assert broker.committed == [0, 1, 2]
+
+
+def test_a_run_that_fails_fails_the_step_and_keeps_the_handoff(
+    monkeypatch: pytest.MonkeyPatch, extra_files,
+) -> None:
+    source, inbox = extra_files
+    catalog = Catalog("transcoded", path=str(source))
+
+    def fails(*_args, **_kwargs) -> dict:
+        raise pk.PackageError("shaka-packager (media) exited 1: No space left on device")
+
+    broker, _calls = run(monkeypatch, [transcoded()], catalog, package=fails)
+    assert catalog.writes == [
+        ("PUT", STEP, {"status": "in_progress"}),
+        ("PUT", STEP, {"status": "failed",
+                       "error": "shaka-packager (media) exited 1: No space left on device"}),
+    ]
+    assert inbox.exists()
+    assert broker.committed == [0]
+
+
+@pytest.mark.parametrize("status", [500, 404])
+def test_a_package_the_catalog_did_not_take_fails_the_step(
+    monkeypatch: pytest.MonkeyPatch, extra_files, status: int,
+) -> None:
+    # On disk, but unknown to the catalog: nothing would play it, nothing
+    # would repair it. Failed, so the catalog's retry runs the chain again.
+    source, inbox = extra_files
+    catalog = Catalog("transcoded", path=str(source), complete=status)
+    run(monkeypatch, [transcoded()], catalog)
+    assert [(m, p, b.get("status")) for m, p, b in catalog.writes] == [
+        ("PUT", STEP, "in_progress"), ("POST", COMPLETE, None), ("PUT", STEP, "failed")]
+    assert "packaging-complete" in catalog.writes[-1][2]["error"]
+    assert inbox.exists()
+
+
+@pytest.mark.parametrize(("handoff", "error"), [
+    # The handoff's v0 is the extra's file ("file": null), which is gone.
+    (True, "transcoder handoff: top rendition missing: "),
+    # No handoff: the file itself is what is packaged.
+    (False, "source file missing: "),
+])
+def test_an_extra_whose_file_is_gone_fails_without_a_run(
+    monkeypatch: pytest.MonkeyPatch, extra_files, handoff: bool, error: str,
+) -> None:
+    _source, inbox = extra_files
+    if not handoff:
+        for f in inbox.iterdir():
+            f.unlink()
+        inbox.rmdir()
+    gone = "/var/lib/katalog/extras/gone/trailer.mov"
+    catalog = Catalog("transcoded", path=gone)
+    _broker, calls = run(monkeypatch, [transcoded()], catalog)
+    assert calls == []
+    assert catalog.writes == [("PUT", STEP, {"status": "failed", "error": error + gone})]
+
+
+def test_a_handoff_that_cannot_be_read_fails_without_a_run(
+    monkeypatch: pytest.MonkeyPatch, extra_files,
+) -> None:
+    source, inbox = extra_files
+    (inbox / "renditions.json").write_text(json.dumps({"version": 9, "video": []}))
+    catalog = Catalog("transcoded", path=str(source))
+    _broker, calls = run(monkeypatch, [transcoded()], catalog)
+    assert calls == []
+    [(_m, _p, body)] = catalog.writes
+    assert body["status"] == "failed" and body["error"].startswith("transcoder handoff: ")
+
+
+@pytest.mark.parametrize(("fields", "event", "manifest_extra", "error"), [
+    # The record names the title and the kind; the event's are the fallback.
+    ({"parentId": None, "kind": None}, {}, {"parentId": PARENT, "extraKind": "trailer"}, None),
+    ({"kind": "teaser"}, {}, {"parentId": PARENT, "extraKind": "teaser"}, None),
+    ({"parentId": None}, {"parentId": None}, None, "the extra's record has no parentId"),
+    ({"path": None}, {}, None, "the extra's record has no path"),
+])
+def test_what_an_extras_manifest_names_it_after(
+    monkeypatch: pytest.MonkeyPatch, extra_files, fields: dict, event: dict,
+    manifest_extra: dict | None, error: str | None,
+) -> None:
+    source, _inbox = extra_files
+    catalog = Catalog("transcoded", **{"path": str(source), **fields})
+    _broker, calls = run(monkeypatch, [transcoded(**event)], catalog)
+    if error is None:
+        [(_args, kwargs)] = calls
+        assert kwargs["manifest_extra"] == manifest_extra
+    else:
+        assert calls == []
+        assert catalog.writes == [("PUT", STEP, {"status": "failed", "error": error})]
+
+
+def test_a_catalog_that_does_not_answer_fails_the_step_and_commits(
+    monkeypatch: pytest.MonkeyPatch, extra_files,
+) -> None:
+    source, _inbox = extra_files
+    catalog = Catalog("transcoded", path=str(source))
+    catalog.fail_reads = True
+    broker, calls = run(monkeypatch, [transcoded()], catalog)
+    assert calls == []
+    [(_m, path, body)] = catalog.writes
+    assert path == STEP and body["status"] == "failed"
+    assert body["error"].startswith("worker bug: ")
+    assert broker.committed == [0]
+
+
+# --------------------------------------------------------------------- main
+
+def test_main_runs_the_extras_loop_beside_the_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    from packager import main
+
+    _env(monkeypatch, KAFKA_TOPIC_PREFIX="zaentrum-demo.",
+         CONSUME_TOPIC="zaentrum-demo.catalog.item.transcoded")
+    loops: dict[str, dict] = {}
+
+    def loop(name: str):
+        def run(**kw: object) -> None:
+            loops[name] = kw
+            kw["stop"].wait(5)  # type: ignore[attr-defined]
+        return run
+
+    ready: list[dict] = []
+
+    def serve(app, **_kw: object) -> None:
+        # Both loops at work: the probe says so.
+        deadline = time.monotonic() + 5
+        while len(loops) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        [readyz] = [r.endpoint for r in app.routes if getattr(r, "path", "") == "/readyz"]
+        ready.append(readyz())
+
+    monkeypatch.setattr(main, "_configure_logging", lambda: None)
+    monkeypatch.setattr(main.signal, "signal", lambda *_a: None)
+    monkeypatch.setattr(main, "sweep_leftovers", lambda *_a, **_kw: 0)
+    monkeypatch.setattr(main, "run_worker", loop("items"))
+    monkeypatch.setattr(main, "run_extras_worker", loop("extras"))
+    monkeypatch.setattr(main.uvicorn, "run", serve)
+    assert main.main() == 0
+
+    assert ready == [{"ok": True, "extras": True}]
+    items, extra = loops["items"], loops["extras"]
+    assert (items["group_id"], items["consume_topic"]) == (
+        "packager-workers", "zaentrum-demo.catalog.item.transcoded")
+    assert (extra["group_id"], extra["consume_topic"]) == (
+        "packager-extras", "zaentrum-demo.catalog.extra.transcoded")
+    # A client of its own, the same broker, the same packaging options.
+    assert extra["client"] is not items["client"]
+    assert (extra["brokers"], extra["options"]) == (items["brokers"], items["options"])
+    assert extra["stop"] is items["stop"] and extra["stop"].is_set()

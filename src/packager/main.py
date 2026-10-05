@@ -1,5 +1,7 @@
 """Entry point. One process runs:
   - the worker loop (thread)
+  - the extras loop (a second thread: trailers and other bonus material,
+    extras.py)
   - at startup, a sweep of what runs that ended uncleanly left in the
     item folders (thread)
   - a tiny FastAPI server for /healthz and /readyz, so kubelet probes work.
@@ -20,6 +22,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from .config import Config
+from .extras import run_extras_worker
 from .katalog import KatalogClient
 from .packager import sweep_leftovers
 from .worker import run_worker
@@ -62,6 +65,8 @@ def main() -> int:
         brokers=cfg.kafka_brokers,
         group_id=cfg.kafka_group_id,
         consume_topic=cfg.consume_topic,
+        extras_group_id=cfg.extras_group_id,
+        extras_consume_topic=cfg.extras_consume_topic,
         segment_seconds=cfg.segment_seconds,
         surround_audio=cfg.surround_audio,
         surround_bitrate=cfg.surround_bitrate,
@@ -70,12 +75,18 @@ def main() -> int:
         old_package_grace_seconds=cfg.old_package_grace_seconds,
     )
 
-    client = KatalogClient(
-        base_url=cfg.katalog_api_url,
-        token_url=cfg.oidc_token_url,
-        client_id=cfg.oidc_client_id,
-        client_secret=cfg.oidc_client_secret,
-    )
+    def katalog_client() -> KatalogClient:
+        return KatalogClient(
+            base_url=cfg.katalog_api_url,
+            token_url=cfg.oidc_token_url,
+            client_id=cfg.oidc_client_id,
+            client_secret=cfg.oidc_client_secret,
+        )
+
+    # One client per loop: a client keeps one token and one connection
+    # pool, and was written for one thread.
+    client = katalog_client()
+    extras_client = katalog_client()
 
     stop = threading.Event()
 
@@ -106,6 +117,26 @@ def main() -> int:
     )
     worker_thread.start()
 
+    # The extras' consumer, on its own thread and in its own group, so a
+    # long film's run never holds a trailer up: at most one item run and
+    # one extra run at a time per pod.
+    extras_thread = threading.Thread(
+        target=run_extras_worker,
+        kwargs={
+            "client": extras_client,
+            "brokers": cfg.kafka_brokers,
+            "group_id": cfg.extras_group_id,
+            "consume_topic": cfg.extras_consume_topic,
+            "security_protocol": cfg.kafka_security_protocol,
+            "error_sleep": cfg.error_sleep_seconds,
+            "stop": stop,
+            "options": cfg.package_options(),
+        },
+        daemon=True,
+        name="packager-extras",
+    )
+    extras_thread.start()
+
     app = FastAPI()
 
     @app.get("/healthz")
@@ -114,12 +145,15 @@ def main() -> int:
 
     @app.get("/readyz")
     def readyz() -> dict:
-        return {"ok": worker_thread.is_alive()}
+        return {"ok": worker_thread.is_alive() and extras_thread.is_alive(),
+                "extras": extras_thread.is_alive()}
 
     uvicorn.run(app, host="0.0.0.0", port=8080, log_config=None)
     stop.set()
     client.close()
+    extras_client.close()
     worker_thread.join(timeout=10)
+    extras_thread.join(timeout=10)
     return 0
 
 
