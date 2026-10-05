@@ -22,7 +22,9 @@ Design rules:
   group its companion, else the 5.1 rendition of its language, else that
   of the first preferred language with one, else the first.
 * Subtitles are extracted to sidecar files (WebVTT for text, native
-  bitmap formats for PGS/VobSub/DVB) exactly as before. WebVTT tracks are
+  bitmap formats for PGS/VobSub/DVB) exactly as before; the subtitle
+  files next to the source (the item record's subtitleFiles) are
+  converted to WebVTT and join them. WebVTT tracks are
   additionally packaged as HLS subtitle renditions (hls/sN/); the master
   references them (TYPE=SUBTITLES, FORCED=YES where flagged) only when
   HLS_SUBTITLES is on, so clients that draw their own sidecar subtitles
@@ -38,6 +40,7 @@ Design rules:
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import posixpath
@@ -254,6 +257,7 @@ def package_item(
     inputs: PackageInputs | None = None,
     options: PackageOptions | None = None,
     track_languages: list[Any] | None = None,
+    subtitle_files: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Package one item synchronously. Returns the written manifest.
 
@@ -281,6 +285,12 @@ def package_item(
     else its tag, else und, everywhere: the remux, the manifest, the
     playlists, the whitelist and the DEFAULT pick. Malformed entries are
     ignored (_track_overrides).
+
+    subtitle_files is the item record's subtitleFiles: subtitle files
+    next to the source, [{"path": "/abs/movie.en.srt", "language": "eng",
+    "label": "English", "forced": false}] (.srt, .vtt, .ass, .ssa). Each
+    is converted to WebVTT and packaged after the source's own subtitle
+    tracks, as one of them (_subtitle_files, _convert_subtitle_files).
 
     language_whitelist is a list of lowercased ISO 639-1/2 codes
     (`en`, `de`, `zh`, …). Tracks (audio + subtitle) whose language
@@ -324,6 +334,10 @@ def package_item(
             probe = _with_track_languages(
                 probe, overrides, _probe_of_source(src, Path(source_path)))
 
+        # The subtitle files next to the source come after its own
+        # subtitle tracks, as tracks like them.
+        sub_files = _subtitle_files(subtitle_files, Path(source_path))
+
         # Resolve client-visibility windows for audio + subtitle
         # tracks from the language whitelist. Tracks ALWAYS get
         # packaged — `visible` is just a hint for the player UI.
@@ -332,7 +346,8 @@ def package_item(
             keep_original_if_single=keep_original_if_single,
         )
         sub_visible = _visible_indices(
-            probe.subtitles, language_whitelist,
+            [*probe.subtitles, *({"tags": {"language": f.language}} for f in sub_files)],
+            language_whitelist,
             keep_original_if_single=keep_original_if_single,
         )
         preferred = list(options.preferred_languages) or list(language_whitelist or [])
@@ -349,6 +364,7 @@ def package_item(
             surround=[s.source_index for s in surround] or None,
             default_surround=default_surround,
             sub_total=len(probe.subtitles),
+            subtitle_files=len(sub_files) or None,
             sub_visible=len(sub_visible),
             track_languages=len(overrides) or None,
             video_renditions=len(inputs.video),
@@ -377,6 +393,10 @@ def package_item(
             subtitle_meta = _extract_subtitles(
                 src, probe, stage / "subs",
                 visible_indices=sub_visible,
+            )
+            subtitle_meta += _convert_subtitle_files(
+                sub_files, stage / "subs", tmpdir,
+                first=len(probe.subtitles), visible_indices=sub_visible,
             )
             audio_language = (_track_language(probe.audio[default_audio])
                               if default_audio is not None else None)
@@ -1684,6 +1704,150 @@ def _extract_subtitles(
         # can opt back in without re-packaging.
         out.append({**common, "path": f"subs/{i}.vtt", "format": "webvtt"})
     return out
+
+
+# The subtitle files next to a source the packager takes, by extension;
+# ffmpeg then reads each by its content. A file is read whole, so one far
+# larger than any subtitle file (a video by a wrong name) is refused.
+_SUBTITLE_FILE_SUFFIXES = frozenset({".srt", ".vtt", ".ass", ".ssa"})
+_SUBTITLE_FILE_MAX_BYTES = 50 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _SubtitleFile:
+    """A subtitle file next to the source (the item record's subtitleFiles)."""
+    path: Path
+    language: str  # an ISO 639-2 code, und when the record names none
+    label: str     # the catalog's label: the manifest entry's `title`
+    forced: bool
+
+
+def _subtitle_files(entries: list[Any] | None, source: Path) -> list[_SubtitleFile]:
+    """The item record's subtitleFiles the packager takes: an absolute
+    `path` to a .srt, .vtt, .ass or .ssa file in the source's folder or
+    below it; its `language` when that is a code (_language_code), else
+    und; its `label`; `forced` only when true. Any other entry is
+    ignored, logged."""
+    folder = Path(os.path.normpath(source.parent))
+    out: list[_SubtitleFile] = []
+    for entry in entries or []:
+        raw = entry.get("path") if isinstance(entry, dict) else None
+        path = Path(os.path.normpath(raw)) if isinstance(raw, str) and raw.strip() else None
+        if (path is None or not path.is_absolute() or not path.is_relative_to(folder)
+                or path.suffix.lower() not in _SUBTITLE_FILE_SUFFIXES):
+            log.warning("packager.subtitle_file.ignored", entry=str(entry)[:300])
+            continue
+        label = entry.get("label")
+        out.append(_SubtitleFile(
+            path=path,
+            language=_language_code(entry.get("language")) or "und",
+            label=label.strip() if isinstance(label, str) else "",
+            forced=entry.get("forced") is True,
+        ))
+    return out
+
+
+def _convert_subtitle_files(
+    files: list[_SubtitleFile], subs_dir: Path, tmpdir: Path,
+    *,
+    first: int,
+    visible_indices: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Convert each subtitle file next to the source to WebVTT at
+    subs_dir/N.vtt, N counting on from the source's own subtitle tracks
+    (`first` of them), and return their manifest entries: those of an
+    embedded WebVTT track, with the catalog's label for `title`, and
+    `external`. They are segmented into HLS renditions like the embedded
+    ones. A file that can't be read or converted is left out, logged;
+    the package goes on without it."""
+    if files:
+        subs_dir.mkdir(parents=True, exist_ok=True)
+    out: list[dict[str, Any]] = []
+    for k, f in enumerate(files):
+        n = first + k
+        target = subs_dir / f"{n}.vtt"
+        try:
+            _convert_subtitle_file(f, target, tmpdir / f"subtitle-file-{n}{f.path.suffix.lower()}")
+        except (OSError, PackageError) as e:
+            log.warning("packager.subs.file_failed", idx=n, path=str(f.path), error=str(e)[:300])
+            target.unlink(missing_ok=True)
+            continue
+        log.info("packager.subs.file", idx=n, path=str(f.path), language=f.language)
+        out.append({
+            "id": f"sub{n}",
+            "language": f.language,
+            "title": f.label,
+            "default": False,
+            "forced": f.forced,
+            "visible": visible_indices is None or n in visible_indices,
+            "path": f"subs/{n}.vtt",
+            "format": "webvtt",
+            "external": True,
+        })
+    return out
+
+
+def _convert_subtitle_file(f: _SubtitleFile, target: Path, utf8: Path) -> None:
+    """One subtitle file as WebVTT at target: its text decoded
+    (_subtitle_text) and written to `utf8` as UTF-8, then through ffmpeg's
+    WebVTT encoder, as the source's own text tracks are. ffmpeg reads SRT,
+    ASS/SSA and WebVTT by their content, and fails on a file that is none
+    of them. Raises OSError or PackageError."""
+    size = f.path.stat().st_size
+    if size > _SUBTITLE_FILE_MAX_BYTES:
+        raise PackageError(f"{size} bytes: no subtitle file is that large")
+    utf8.write_text(_subtitle_text(f.path.read_bytes(), f.language), encoding="utf-8")
+    _run_ffmpeg_capturing(f"subtitle file {f.path.name}", [
+        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
+        "-i", str(utf8), "-map", "0:s:0", "-c:s", "webvtt", "-f", "webvtt", str(target),
+    ])
+
+
+# The legacy code page a subtitle file that isn't UTF-8 is most likely in,
+# by its language; Windows-1252 (Western European) for the others.
+_LEGACY_ENCODINGS = {
+    **dict.fromkeys(("bos", "ces", "cze", "hrv", "hun", "pol", "ron", "rum", "slk", "slo",
+                     "slv"), "cp1250"),
+    **dict.fromkeys(("bel", "bul", "mac", "mkd", "rus", "srp", "ukr"), "cp1251"),
+    **dict.fromkeys(("ell", "gre"), "cp1253"),
+    "tur": "cp1254",
+    "heb": "cp1255",
+    **dict.fromkeys(("ara", "fas", "per", "urd"), "cp1256"),
+    **dict.fromkeys(("est", "lav", "lit"), "cp1257"),
+    "vie": "cp1258",
+    "tha": "cp874",
+    "jpn": "cp932",
+    "kor": "cp949",
+    **dict.fromkeys(("chi", "zho"), "gb18030"),
+}
+
+_BOMS = (
+    # UTF-32 first: its little-endian mark starts with UTF-16's.
+    (codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
+    (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16"),
+)
+
+
+def _subtitle_text(raw: bytes, language: str = "und") -> str:
+    """A subtitle file's text, decoded by its byte order mark (UTF-8,
+    UTF-16, UTF-32), else as UTF-8, else in the legacy code page of its
+    language (_LEGACY_ENCODINGS), else as Windows-1252, else as Latin-1,
+    which reads any bytes. Without the mark, with \\n line ends."""
+    for bom, codec in _BOMS:
+        if raw.startswith(bom):
+            text = raw.decode(codec, errors="replace")
+            break
+    else:
+        for codec in ("utf-8", _LEGACY_ENCODINGS.get(language, "cp1252"), "cp1252"):
+            try:
+                text = raw.decode(codec)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            text = raw.decode("latin-1")
+    return text.lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _generate_trickplay(src: Path, probe: _Probe, out_dir: Path) -> dict[str, Any] | None:

@@ -179,6 +179,7 @@ def _process_one(
             language_whitelist=language_whitelist,
             keep_original_if_single=keep_original,
             track_languages=item.track_languages,
+            subtitle_files=item.subtitle_files,
             # Catalog identity passed through to the manifest so the
             # package self-describes even if the DB is later lost.
             # See ClaimedItem.tmdb_id for the movie-vs-episode rule.

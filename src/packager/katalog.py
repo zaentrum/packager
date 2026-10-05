@@ -65,6 +65,10 @@ class ClaimedItem:
     # kind in ffprobe order. Passed on as sent; package_item checks every
     # entry. Empty when the record has none.
     track_languages: list[dict[str, Any]] = field(default_factory=list)
+    # Subtitle files next to the source: [{"path": "/abs/movie.en.srt",
+    # "language": "eng", "label": "English", "forced": false}]. Passed on
+    # as sent, like track_languages.
+    subtitle_files: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def tmdb_id(self) -> str | None:
@@ -89,6 +93,7 @@ class ClaimedItem:
             series_tmdb_id=body.get("seriesTmdbId"),
             movie_tmdb_id=body.get("movieTmdbId"),
             track_languages=_objects(body.get("trackLanguages")),
+            subtitle_files=_objects(body.get("subtitleFiles")),
         )
 
 
@@ -178,7 +183,7 @@ class KatalogClient:
         {id,type,title,year,durationMs,path,seasonNumber,episodeNumber,
         seriesTitle,seriesTmdbId,movieTmdbId} — everything the packager
         writes into a self-describing manifest — and, optionally,
-        trackLanguages. Returns None on 404 (the
+        trackLanguages and subtitleFiles. Returns None on 404 (the
         item was deleted between the transcoder producing the event and
         us consuming it) so the caller can commit + skip the message."""
         resp = self._request("GET", f"/api/analyze/items/{item_id}")

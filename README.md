@@ -71,6 +71,13 @@ stream-copy, an ordinal finds its track through a probe of the source.
 Malformed entries, and ordinals no packaged track has, are ignored and
 logged.
 
+It may also carry `subtitleFiles`, the subtitle files next to the
+source: `[{"path": "/abs/Movie.en.srt", "language": "eng", "label":
+"English", "forced": false}]`. A file is taken when its path is
+absolute, in the source's folder or below it, and ends in `.srt`,
+`.vtt`, `.ass` or `.ssa`; its language is `und` unless it is a code as
+above. Other entries are ignored and logged.
+
 ## Output
 
 ```
@@ -78,7 +85,7 @@ hls/master.m3u8                         assembled here (below)
 hls/v0/ v1/ …   init.mp4 seg-NNNNN.m4s playlist.m3u8 iframes.m3u8
 hls/a0/ a1/ …   init.mp4 seg-NNNNN.m4s playlist.m3u8
 hls/s0/ s2/ …   seg-NNNNN.vtt playlist.m3u8   (WebVTT tracks only)
-subs/N.vtt|.sup|.idx|.dvb                sidecars, as before
+subs/N.vtt|.sup|.idx|.dvb                sidecars: the source's tracks, then its subtitle files
 trickplay/  manifest.json  .complete
 .next/                                  a run's staging folder, same layout
 hls.old-<stamp>/ subs.old-<stamp>/ …    replaced, until its grace period ends
@@ -134,7 +141,15 @@ with exactly one `default`), so readers that count or list `audio` see
 the same tracks as before.
 
 **Subtitles.** Sidecars are extracted exactly as before; PGS / VobSub /
-DVB stay sidecar-only because HLS can't carry them. Every visible WebVTT
+DVB stay sidecar-only because HLS can't carry them. The subtitle files
+next to the source (`subtitleFiles`) follow the source's own tracks:
+each is decoded (by its byte order mark, else as UTF-8, else in the
+legacy code page of its language, e.g. Windows-1251 for Russian, else
+Windows-1252), converted to WebVTT by ffmpeg as the source's text
+tracks are, and written as `subs/N.vtt`, N counting on from the
+source's tracks, with the catalog's label as its `title` and
+`external: true`; from there on it is a subtitle track like the
+others. A file ffmpeg can't read is left out, logged. Every visible WebVTT
 track is also segmented into an HLS rendition `hls/sN/` (N = the sidecar
 index; `subtitles[].hls` in the manifest). Their segments carry no
 `X-TIMESTAMP-MAP`, which HLS reads as cue time = media time: shaka's

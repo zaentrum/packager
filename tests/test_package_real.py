@@ -300,6 +300,65 @@ def test_a_film_without_dialogue(tmp_path: Path, monkeypatch, override, language
         override, name, "YES")
 
 
+def test_subtitle_files_next_to_the_source(tmp_path: Path, monkeypatch, handoff) -> None:
+    # The handoff's source with four files next to it: French in
+    # Windows-1252, English forced with a byte order mark, German as ASS
+    # (hidden by an en,fr whitelist), and one that isn't a subtitle file.
+    src, inbox = handoff
+    folder = tmp_path / "Movie (2010)"
+    folder.mkdir()
+    source = folder / "Movie.mkv"
+    shutil.copy(src, source)
+    files = {
+        "Movie.fr.srt": "1\n00:00:01,000 --> 00:00:03,500\nÇa va, « Café » ?\n".encode("cp1252"),
+        "Movie.en.forced.srt": b"\xef\xbb\xbf1\r\n00:00:02,000 --> 00:00:04,000\r\n[Signs]\r\n",
+        "Movie.de.ass": (b"[Script Info]\nScriptType: v4.00+\n\n[Events]\nFormat: Layer, Start, "
+                         b"End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                         b"Dialogue: 0,0:00:05.00,0:00:07.00,Default,,0,0,0,,Hallo\n"),
+        "Movie.xx.srt": b"not a subtitle file\n",
+    }
+    for name, body in files.items():
+        (folder / name).write_bytes(body)
+    shutil.copytree(inbox, tmp_path / "inbox")
+    manifest, root = _package(
+        tmp_path, monkeypatch, source, tmp_path / "inbox", hls_subtitles=True,
+        surround_codec="off",
+        item={"language_whitelist": ["en", "fr"], "subtitle_files": [
+            {"path": str(folder / "Movie.fr.srt"), "language": "fre", "label": "Français"},
+            {"path": str(folder / "Movie.en.forced.srt"), "language": "eng", "forced": True},
+            {"path": str(folder / "Movie.de.ass"), "language": "ger"},
+            {"path": str(folder / "Movie.xx.srt"), "language": "eng"},
+            {"path": str(tmp_path / "elsewhere.srt"), "language": "eng"},  # not next to it
+        ]})
+    subs = manifest["subtitles"]
+    # The source's three tracks, then the files that converted.
+    assert [(s["id"], s["language"], s.get("external", False), s["forced"], s["default"],
+             s["visible"], s.get("hls")) for s in subs] == [
+        ("sub0", "eng", False, False, False, True, "hls/s0"),
+        ("sub1", "eng", False, True, True, True, "hls/s1"),
+        ("sub2", "ger", False, False, False, False, None),
+        ("sub3", "fre", True, False, False, True, "hls/s3"),
+        ("sub4", "eng", True, True, False, True, "hls/s4"),
+        ("sub5", "ger", True, False, False, False, None),
+    ]
+    assert subs[3]["title"] == "Français"
+    vtt = (root / subs[3]["path"]).read_text(encoding="utf-8")
+    assert "00:01.000 --> 00:03.500\nÇa va, « Café » ?" in vtt
+    assert "00:05.000 --> 00:07.000\nHallo" in (root / subs[5]["path"]).read_text()
+    media = [a for tag, a, _ in _master(root) if tag == "#EXT-X-MEDIA" and a["TYPE"] == "SUBTITLES"]
+    assert [(a["URI"], a["LANGUAGE"], a["NAME"], a.get("FORCED")) for a in media] == [
+        ("s0/playlist.m3u8", "en", "English", None),
+        ("s1/playlist.m3u8", "en", "English (forced)", "YES"),
+        ("s3/playlist.m3u8", "fr", "French", None),
+        ("s4/playlist.m3u8", "en", "English (forced) (2)", "YES"),
+    ]
+    # ... and the rendition's cue is at its time (shaka adds cue settings).
+    assert [line.split()[:3] for line in
+            (root / "hls" / "s3" / "seg-00001.vtt").read_text().splitlines() if "-->" in line] == [
+        ["00:00:01.000", "-->", "00:00:03.500"]]
+    assert (root / ".complete").exists()
+
+
 def test_subtitle_group_off_by_default(tmp_path: Path, monkeypatch, handoff) -> None:
     src, inbox = handoff
     manifest, root = _package(tmp_path, monkeypatch, src, inbox)

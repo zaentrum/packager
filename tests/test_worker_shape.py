@@ -122,27 +122,32 @@ def test_claimed_item_from_json_handles_null_year() -> None:
     assert item.year is None
     assert item.duration_ms is None
     assert item.title == ""   # None → "" so log fields stay strings
-    assert item.track_languages == []  # a record without them, as before
+    # A record without them, as before.
+    assert item.track_languages == [] and item.subtitle_files == []
 
 
 @pytest.mark.parametrize("value", [None, "eng", {"kind": "audio"}, 3])
-def test_claimed_item_track_languages_that_are_no_list_are_none(value) -> None:
+def test_claimed_item_lists_that_are_no_list_are_none(value) -> None:
     item = ClaimedItem.from_json({"id": "x", "type": "movie", "path": "/m.mkv",
-                                  "trackLanguages": value})
-    assert item.track_languages == []
+                                  "trackLanguages": value, "subtitleFiles": value})
+    assert item.track_languages == [] and item.subtitle_files == []
 
 
-def test_claimed_item_track_languages() -> None:
+def test_claimed_item_track_languages_and_subtitle_files() -> None:
     # Passed on as the catalog sent them, but for what isn't an object;
     # package_item checks each entry's fields.
-    entries = [{"kind": "audio", "ordinal": 0, "language": "zxx"},
-               {"kind": "subtitle", "ordinal": 9, "language": "nope"}]
+    tracks = [{"kind": "audio", "ordinal": 0, "language": "zxx"},
+              {"kind": "subtitle", "ordinal": 9, "language": "nope"}]
+    files = [{"path": "/media/Movie/Movie.en.srt", "language": "eng", "label": "English",
+              "forced": False}]
     item = ClaimedItem.from_json({"id": "x", "type": "movie", "path": "/m.mkv",
-                                  "trackLanguages": [*entries, "audio 1 eng", None, 7]})
-    assert item.track_languages == entries
+                                  "trackLanguages": [*tracks, "audio 1 eng", None, 7],
+                                  "subtitleFiles": [*files, "/media/Movie/Movie.de.srt"]})
+    assert item.track_languages == tracks
+    assert item.subtitle_files == files
 
 
-def test_worker_hands_the_packager_the_source_and_its_track_languages(
+def test_worker_hands_the_packager_the_source_and_its_tracks(
     tmp_path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # v0 is the transcoder's encode; the catalog's ordinals count the
@@ -177,13 +182,15 @@ def test_worker_hands_the_packager_the_source_and_its_track_languages(
             pass
 
     overrides = [{"kind": "audio", "ordinal": 0, "language": "zxx"}]
+    files = [{"path": str(source.parent / "movie.en.srt"), "language": "eng"}]
     item = ClaimedItem(id=item_id, type="movie", title="Clip", year=None, duration_ms=None,
-                       path=str(source), track_languages=overrides)
+                       path=str(source), track_languages=overrides, subtitle_files=files)
     worker._process_one(item, Client())  # type: ignore[arg-type]
     [(args, kwargs)] = calls
     assert args == (item_id, str(source))
     assert kwargs["inputs"].primary.path == inbox / item_id / "prepared.mkv"
     assert kwargs["track_languages"] == overrides
+    assert kwargs["subtitle_files"] == files
 
 
 def test_module_layout_importable() -> None:
