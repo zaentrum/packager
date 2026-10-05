@@ -8,7 +8,10 @@ the 5.1 companion, DEFAULT/FORCED flags, aligned segments, the manifest.
 A clip with cues at known times checks that the WebVTT renditions put
 every cue on its frame. Packaging a title again leaves its package as it
 was until the new one is complete, then swaps the new one in; the
-startup sweep clears what runs that died left.
+startup sweep clears what runs that died left. An extra of the title (a
+trailer, with the transcoder's handoff on the extras' ladder, and one it
+left as it was) goes through the extras handler into a folder of its
+own, which the title's packaging again leaves alone.
 """
 
 from __future__ import annotations
@@ -24,9 +27,10 @@ from pathlib import Path
 
 import pytest
 
-from packager import hls, worker
+from packager import extras, hls, worker
 from packager import packager as pk
 from packager.hls import parse_attributes
+from packager.katalog import ClaimedExtra
 from packager.renditions import resolve_inputs
 
 
@@ -709,3 +713,171 @@ def test_a_startup_sweep_clears_what_dead_runs_left(tmp_path: Path, monkeypatch,
     assert not (root / pk.STAGING_DIR).exists()
     assert _live(root) == live
     assert (busy / pk.SENTINEL).exists()
+
+
+# ------------------------------------------------------------------ extras
+
+EXTRA = "1b5c2a8e-0000-4000-8000-0000000000e1"
+
+
+@pytest.fixture(scope="module")
+def extra_handoff(tmp_path_factory) -> tuple[Path, Path]:
+    """A 720p H.264 trailer of the title, outside the media root, and what
+    the transcoder hands over for it on the extras' default ladder
+    (720p:h264,480p:h264): v0 the trailer as it is ("file": null), v1 a
+    480p encode on its keyframes."""
+    d = tmp_path_factory.mktemp("extra")
+    trailer = d / "extras" / "clip" / "trailer.mp4"
+    trailer.parent.mkdir(parents=True)
+    _ff("-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=24:duration=8",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=8",
+        "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-c:a", "aac", "-ac", "2",
+        str(trailer))
+    inbox = d / "_inbox" / f"extra-{EXTRA}"
+    inbox.mkdir(parents=True)
+    _ff("-i", str(trailer), "-vf", "scale=854:480,setsar=1,format=yuv420p",
+        "-c:v", "libx264", "-preset", "ultrafast", "-force_key_frames", "source",
+        "-forced-idr", "1", "-sc_threshold", "0", "-g", "1439", "-enc_time_base:v", "demux",
+        "-an", "-sn", "-dn", "-f", "matroska", str(inbox / "v1.mkv"))
+    (inbox / "renditions.json").write_text(json.dumps({
+        "version": 1, "itemId": EXTRA, "segmentSeconds": 6, "keyframes": "source",
+        "timestampOffset": -_start_time(trailer),
+        "video": [
+            {"id": "v0", "label": "720p", "file": None, "mode": "copy", "encoder": "copy"},
+            {"id": "v1", "label": "480p", "file": "v1.mkv", "mode": "encode",
+             "encoder": "libx264"},
+        ],
+    }))
+    return trailer, inbox
+
+
+class _ExtrasCatalog:
+    """The catalog's side of one extra: its record, the settings, and what
+    the packager writes back."""
+
+    def __init__(self, extra: ClaimedExtra) -> None:
+        self.extra = extra
+        self.steps: list[tuple[str, dict]] = []
+        self.packages: list[dict] = []
+
+    def get_extra(self, extra_id: str) -> ClaimedExtra | None:
+        return self.extra if extra_id == self.extra.id else None
+
+    def settings(self) -> dict:
+        return {}
+
+    def upsert_extra_step(self, _id: str, status: str, **kw: object) -> None:
+        self.steps.append((status, kw))
+
+    def extra_packaging_complete(self, _id: str, manifest: dict) -> dict:
+        self.packages.append(manifest)
+        return {"extraId": _id, "itemId": self.extra.parent_id, "packaged": True,
+                "durationMs": manifest["durationMs"]}
+
+
+def _package_extra(catalog: _ExtrasCatalog) -> Path:
+    """One catalog.extra.transcoded through the extras handler; the
+    extra's package folder."""
+    extra = catalog.extra
+    envelope = {"eventId": "9f2b", "extraId": extra.id, "parentId": extra.parent_id,
+                "type": "extra", "kind": extra.kind, "step": "package", "status": "queued",
+                "occurredAt": "2026-10-06T08:00:00Z", "source": "transcoder"}
+    extras._handle_extra(extra.id, envelope, catalog,  # type: ignore[arg-type]
+                         pk.PackageOptions(surround_codec="off"))
+    return pk.PACKAGES_ROOT / "extras" / extra.id[:2] / extra.id
+
+
+def test_an_extra_is_packaged_in_a_folder_of_its_own(
+    tmp_path: Path, monkeypatch, handoff, extra_handoff,
+) -> None:
+    # The title, then its trailer, then the title again with its ladder
+    # (a re-encode).
+    src, inbox = handoff
+    trailer, extra_inbox = extra_handoff
+    _first, title_root = _package(tmp_path, monkeypatch, src, None, surround_codec="off")
+    title_before = _tree(title_root)
+    work = tmp_path / "packages" / "_inbox"
+    shutil.copytree(extra_inbox, work / extra_inbox.name)
+    monkeypatch.setattr(extras, "_INBOX_ROOT", work)
+    catalog = _ExtrasCatalog(ClaimedExtra(
+        id=EXTRA, parent_id=ITEM, kind="trailer", title="Trailer", path=str(trailer),
+        state="transcoded", parent_title="clip"))
+    root = _package_extra(catalog)
+
+    assert [status for status, _ in catalog.steps] == ["in_progress", "done"]
+    assert "vr=2" in str(catalog.steps[-1][1]["details"])
+    assert root == tmp_path / "packages" / "extras" / "1b" / EXTRA
+    assert sorted(p.name for p in root.iterdir()) == [".complete", "hls", pk.MANIFEST_FILE]
+    manifest = json.loads((root / pk.MANIFEST_FILE).read_text())
+    assert {k: manifest[k] for k in ("itemId", "type", "parentId", "extraKind", "title",
+                                     "year", "tmdbId")} == {
+        "itemId": EXTRA, "type": "extra", "parentId": ITEM, "extraKind": "trailer",
+        "title": "Trailer", "year": None, "tmdbId": None}
+    assert "trickplay" not in manifest
+    r = manifest["renditions"]
+    assert [(v["id"], v["width"], v["height"], v["label"]) for v in r["video"]] == [
+        ("v0", 1280, 720, "720p"), ("v1", 854, 480, "480p")]
+    assert [(a["id"], a["language"], a["name"], a["default"]) for a in r["audio"]] == [
+        ("a0", "und", "Unknown", True)]
+    assert r["audioSurround"] == [] and manifest["subtitles"] == []
+
+    # Two H.264 variants, cut at the same instants.
+    variants = [(a, uri) for tag, a, uri in _master(root) if tag == "#EXT-X-STREAM-INF"]
+    assert [uri for _, uri in variants] == ["v0/playlist.m3u8", "v1/playlist.m3u8"]
+    assert [a["RESOLUTION"] for a, _ in variants] == ["1280x720", "854x480"]
+    assert all(a["CODECS"].startswith("avc1.") and a["CODECS"].endswith(",mp4a.40.2")
+               for a, _ in variants)
+    starts = [_segment_starts(root / "hls" / f"v{i}") for i in range(2)]
+    assert len(starts[0]) == 2
+    assert starts[1] == pytest.approx(starts[0], abs=0.002)
+
+    # The catalog got the package as it is on disk, with the source block,
+    # and the handoff went.
+    [sent] = catalog.packages
+    assert {k: v for k, v in sent.items() if k != "source"} == manifest
+    assert {k: sent["source"][k] for k in ("codec", "width", "height")} == {
+        "codec": "h264", "width": 1280, "height": 720}
+    assert not (work / extra_inbox.name).exists()
+
+    # The title's folder is as it was, and holds nothing of its trailer.
+    assert _tree(title_root) == title_before
+    # The title packaged again: its swap retires what its new manifest
+    # doesn't name, in its own folder only. The trailer's package stays
+    # byte for byte.
+    extra_before = _tree(root)
+    _package(tmp_path, monkeypatch, src, inbox)
+    assert sorted(_replaced(title_root)) == ["hls", "subs", "trickplay"]
+    assert _tree(root) == extra_before
+
+
+def test_an_extra_the_transcoder_left_as_it_was_is_packaged_from_its_file(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    # A small H.264 teaser: nothing to encode, no handoff (the transcoder's
+    # step was not_applicable). Its file is packaged as it is.
+    teaser = tmp_path / "extras" / "clip" / "teaser.mp4"
+    teaser.parent.mkdir(parents=True)
+    _ff("-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=4",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4",
+        "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
+        "-metadata:s:a:0", "language=eng", str(teaser))
+    monkeypatch.setattr(pk, "PACKAGES_ROOT", tmp_path / "packages")
+    monkeypatch.setattr(extras, "_INBOX_ROOT", tmp_path / "packages" / "_inbox")
+    catalog = _ExtrasCatalog(ClaimedExtra(
+        id=EXTRA, parent_id=ITEM, kind="teaser", title="Teaser", path=str(teaser),
+        state="transcoded"))
+    root = _package_extra(catalog)
+
+    assert [status for status, _ in catalog.steps] == ["in_progress", "done"]
+    manifest = json.loads((root / pk.MANIFEST_FILE).read_text())
+    assert (manifest["type"], manifest["extraKind"], manifest["title"]) == (
+        "extra", "teaser", "Teaser")
+    assert [(v["width"], v["height"]) for v in manifest["renditions"]["video"]] == [(640, 360)]
+    assert [(a["language"], a["name"]) for a in manifest["renditions"]["audio"]] == [
+        ("eng", "English")]
+    assert [uri for tag, _a, uri in _master(root) if tag == "#EXT-X-STREAM-INF"] == [
+        "v0/playlist.m3u8"]
+    # No handoff, so the source block is a probe of the file.
+    assert {k: catalog.packages[0]["source"][k] for k in ("codec", "width", "height")} == {
+        "codec": "h264", "width": 640, "height": 360}
+    assert (root / ".complete").exists() and not (root / "trickplay").exists()
