@@ -6,7 +6,10 @@ The packager is a PURE Kafka event consumer: it subscribes to the
 `stube.catalog.item.transcoded` topic and packages whatever item the
 transcoder just finished. It is the TERMINAL stage of the pipeline —
 it produces no downstream event. Scale up via replicas (the Kafka
-consumer group rebalances partitions across them), not batch size."""
+consumer group rebalances partitions across them), not batch size.
+The extras of a title (trailers and other bonus material, README
+"Extras") are the one exception to one run at a time: a consumer of
+their own, so a long film's run never holds a trailer up behind it."""
 
 from __future__ import annotations
 
@@ -14,6 +17,8 @@ import os
 from dataclasses import dataclass
 
 from .packager import PackageOptions
+
+DEFAULT_TOPIC_PREFIX = "stube."
 
 
 @dataclass(frozen=True)
@@ -61,6 +66,16 @@ class Config:
     # stays on disk for the requests that started on it. Keep it well
     # above the NFS mounts' attribute cache time (acdirmax).
     old_package_grace_seconds: float = 600.0
+    # --- extras -----------------------------------------------------------
+    # The extras mode (extras.py). Its topic is the tenant's, named as
+    # katalog-manager and the transcoder name it:
+    # <KAFKA_TOPIC_PREFIX>catalog.extra.transcoded.
+    topic_prefix: str = DEFAULT_TOPIC_PREFIX
+    extras_group_id: str = "packager-extras"
+
+    @property
+    def extras_consume_topic(self) -> str:
+        return f"{self.topic_prefix}catalog.extra.transcoded"
 
     @classmethod
     def from_env(cls) -> Config:
@@ -90,6 +105,8 @@ class Config:
             in ("1", "true", "yes"),
             preferred_languages=os.environ.get("PREFERRED_LANGUAGES", ""),
             old_package_grace_seconds=float(os.environ.get("OLD_PACKAGE_GRACE_SECONDS", "600")),
+            topic_prefix=normalize_topic_prefix(os.environ.get("KAFKA_TOPIC_PREFIX")),
+            extras_group_id=os.environ.get("EXTRAS_GROUP_ID", "").strip() or "packager-extras",
         )
 
     def package_options(self) -> PackageOptions:
@@ -103,6 +120,13 @@ class Config:
             ),
             old_package_grace_seconds=self.old_package_grace_seconds,
         )
+
+
+def normalize_topic_prefix(raw: str | None) -> str:
+    """KAFKA_TOPIC_PREFIX as katalog-manager reads it: blank is "stube.",
+    and a missing trailing dot is added ("tenant" -> "tenant.")."""
+    prefix = (raw or "").strip() or DEFAULT_TOPIC_PREFIX
+    return prefix if prefix.endswith(".") else prefix + "."
 
 
 def _require(key: str) -> str:

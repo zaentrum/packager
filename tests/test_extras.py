@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from packager import packager as pk
+from packager.config import Config
 
 EXTRA = "1b5c2a8e-0000-4000-8000-0000000000e1"
 PARENT = "c0ffee00-0000-4000-8000-000000000007"
@@ -241,3 +242,37 @@ def test_a_title_packaged_again_leaves_its_extras_alone(binaries: Binaries) -> N
     assert sorted(p.relative_to(binaries.root).as_posix()
                   for p in binaries.root.glob("*/*/*")) == [
         f"extras/1b/{EXTRA}", f"movies/c0/{PARENT}"]
+
+
+# ------------------------------------------------------------------- config
+
+def _env(monkeypatch: pytest.MonkeyPatch, **env: str) -> Config:
+    for key, value in {"KATALOG_API_URL": "http://katalog-app",
+                       "OIDC_TOKEN_URL": "https://sso.example/token",
+                       "OIDC_CLIENT_ID": "katalog", "OIDC_CLIENT_SECRET": "x", **env}.items():
+        monkeypatch.setenv(key, value)
+    return Config.from_env()
+
+
+def test_the_extras_consumer_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KAFKA_TOPIC_PREFIX", raising=False)
+    monkeypatch.delenv("EXTRAS_GROUP_ID", raising=False)
+    cfg = _env(monkeypatch)
+    assert cfg.extras_consume_topic == "stube.catalog.extra.transcoded"
+    assert cfg.extras_group_id == "packager-extras"
+    # The item consumer is as it was.
+    assert (cfg.consume_topic, cfg.kafka_group_id) == (
+        "stube.catalog.item.transcoded", "packager-workers")
+
+
+@pytest.mark.parametrize(("prefix", "topic"), [
+    ("zaentrum-demo.", "zaentrum-demo.catalog.extra.transcoded"),
+    ("tenant", "tenant.catalog.extra.transcoded"),       # the dot added, as the catalog does
+    ("  ", "stube.catalog.extra.transcoded"),             # blank: the default
+])
+def test_the_extras_topic_is_the_tenants(
+    monkeypatch: pytest.MonkeyPatch, prefix: str, topic: str,
+) -> None:
+    cfg = _env(monkeypatch, KAFKA_TOPIC_PREFIX=prefix, EXTRAS_GROUP_ID="packager-extras-b")
+    assert cfg.extras_consume_topic == topic
+    assert cfg.extras_group_id == "packager-extras-b"
