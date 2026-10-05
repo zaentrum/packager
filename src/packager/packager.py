@@ -855,7 +855,7 @@ def _track_language(stream: dict[str, Any]) -> str:
     _with_track_languages has run. Falls back to 'und' (the IETF
     undefined tag) for tracks without an explicit tag — those are
     *always* kept regardless of the whitelist so a missing/wrong tag
-    doesn't silently drop the only track on a clean source rip."""
+    doesn't silently hide a source's only track."""
     tags = stream.get("tags") or {}
     return (tags.get("language") or "und").lower()
 
@@ -1661,8 +1661,8 @@ def _extract_subtitles(
             out.append({**common, "path": f"subs/{i}.idx", "format": "vobsub"})
             continue
         if codec == "dvb_subtitle":
-            # DVB bitmap subs — rare for ripped content but possible
-            # for broadcast captures. Stream-copy to a raw .dvb file
+            # DVB bitmap subs — rare outside broadcast recordings, but
+            # possible. Stream-copy to a raw .dvb file
             # for the same renderer-on-the-client story as PGS.
             target = subs_dir / f"{i}.dvb"
             try:
