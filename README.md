@@ -261,7 +261,11 @@ Per event:
    `"file": null` rung, like no handoff at all (the transcoder's step
    `not_applicable`), is the extra's file as it is. It is packaged as an
    item is, with the same options and language settings, but as type
-   `extra`, without trickplay, into `extras/<aa>/<extraId>/`.
+   `extra`, without trickplay, into `extras/<aa>/<extraId>/`. The
+   record's `language` (BCP 47 or ISO 639-2: `en`, `zxx`), when it names
+   one, is the language of the extra's first audio track, over the file's
+   own tag, as a title's track languages are: a trailer's file often says
+   `und`, and one registered as `zxx` has no dialogue.
 4. `POST /api/extras/{id}/packaging-complete` with the manifest and the
    source block. Only once the catalog has taken it is the step `done`
    and the handoff removed. When the catalog refuses it, the step fails,

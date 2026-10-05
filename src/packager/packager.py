@@ -872,6 +872,23 @@ def _lang_key(tag: str | None) -> str:
     return _ISO639_1.get(t, t) or "und"
 
 
+# ISO 639-1 -> ISO 639-2: _ISO639_1 turned round, the terminology code
+# where a language has two ('de' -> 'deu'), as the table lists it first.
+_ISO639_2 = {two: three for three, two in reversed(_ISO639_1.items())}
+
+
+def iso639_2(tag: str | None) -> str | None:
+    """A language as BCP 47 or ISO 639-2 names it ('en', 'pt-BR', 'eng',
+    'zxx') as the ISO 639-2 code a trackLanguages override takes: its
+    primary subtag, a two-letter one by _ISO639_2, a three-letter one as
+    it is. None for und, a two-letter code the table doesn't know, and
+    anything else."""
+    t = (tag or "").strip().lower().replace("_", "-").split("-")[0]
+    if len(t) == 2:
+        return _ISO639_2.get(t)
+    return t if _LANGUAGE_CODE.match(t) and t != "und" else None
+
+
 def _track_language(stream: dict[str, Any]) -> str:
     """The track's language: the lowercased language tag of a probed
     audio/subtitle stream, which is its trackLanguages override once

@@ -57,7 +57,7 @@ import structlog
 
 from .events import build_consumer, is_retry, parse_envelope, parse_extra_id
 from .katalog import ClaimedExtra, KatalogClient
-from .packager import PACKAGES_ROOT, PackageOptions, package_item
+from .packager import PACKAGES_ROOT, PackageOptions, iso639_2, package_item
 from .renditions import ContractError, resolve_inputs
 from .worker import _parse_settings, _source_block
 
@@ -174,6 +174,12 @@ def _process_extra(
     # The language settings at claim time, as for an item: the DEFAULT=YES
     # pick and the visibility of a trailer's tracks follow the operator's.
     language_whitelist, keep_original = _parse_settings(client.settings())
+    # What the extra speaks, when the catalog names it, names its first
+    # audio track over the file's own tag, as a title's track languages
+    # do: a trailer is one picture with one sound, and the file's tag is
+    # often und, or wrong (one registered as zxx has no dialogue).
+    language = iso639_2(extra.language)
+    track_languages = [{"kind": "audio", "ordinal": 0, "language": language}] if language else None
 
     t0 = time.monotonic()
     try:
@@ -184,6 +190,7 @@ def _process_extra(
             title=extra.title,
             inputs=inputs,
             options=options,
+            track_languages=track_languages,
             trickplay=False,
             manifest_extra={"parentId": parent_id, "extraKind": kind},
         )

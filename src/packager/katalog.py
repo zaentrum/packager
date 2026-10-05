@@ -126,6 +126,9 @@ class ClaimedExtra:
     path: str
     state: str
     parent_title: str = ""
+    # What the extra speaks, as the catalog names it (BCP 47 or ISO
+    # 639-2, "en", "zxx"); empty when it names none.
+    language: str = ""
     # The catalog answers 404 for a removed extra; a record that says it
     # was removed all the same is treated as gone.
     removed: bool = False
@@ -142,6 +145,7 @@ class ClaimedExtra:
             path=str(body.get("path") or ""),
             state=str(body.get("state") or "").lower(),
             parent_title=str(body.get("parentTitle") or ""),
+            language=str(body.get("language") or ""),
             removed=bool(body.get("removedAt") or body.get("removed")),
         )
 

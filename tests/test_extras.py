@@ -363,7 +363,7 @@ def test_an_extras_record() -> None:
     # The id the request named, whatever the body says: it names folders.
     assert extra == ClaimedExtra(id=EXTRA, parent_id=PARENT, kind="trailer", title="Trailer",
                                  path="/var/lib/katalog/extras/clip/trailer.mov", state="ready",
-                                 parent_title="Clip", removed=False)
+                                 parent_title="Clip", language="en", removed=False)
 
 
 def test_an_extra_that_is_unknown_or_removed() -> None:
@@ -620,6 +620,33 @@ def test_an_extra_the_transcoder_left_as_it_was_is_packaged_from_its_file(
     _broker, [(_args, kwargs)] = run(monkeypatch, [transcoded()], catalog)
     assert (kwargs["inputs"].kind, kwargs["inputs"].primary.path) == ("original", source)
     assert catalog.writes[1] == ("POST", COMPLETE, {**MANIFEST, "source": SOURCE})
+    assert catalog.writes[-1][2]["status"] == "done"
+
+
+@pytest.mark.parametrize(("language", "code"), [
+    ("en", "eng"), ("de", "deu"), ("pt-BR", "por"), ("zh_Hans", "zho"), ("eng", "eng"),
+    ("ger", "ger"), ("zxx", "zxx"), ("gsw", "gsw"), ("EN", "eng"),
+    ("und", None), ("", None), (None, None), ("xx", None), ("english", None),
+])
+def test_a_language_as_an_iso_639_2_code(language, code) -> None:
+    assert pk.iso639_2(language) == code
+
+
+@pytest.mark.parametrize(("language", "track_languages"), [
+    # Sintel's trailer: its file says und, the catalog says English.
+    ("en", [{"kind": "audio", "ordinal": 0, "language": "eng"}]),
+    # One registered without dialogue, whatever its file says.
+    ("zxx", [{"kind": "audio", "ordinal": 0, "language": "zxx"}]),
+    # None named: the file's own tags, as before.
+    (None, None), ("", None), ("und", None),
+])
+def test_an_extras_language_names_its_first_audio_track(
+    monkeypatch: pytest.MonkeyPatch, extra_files, language, track_languages,
+) -> None:
+    source, _inbox = extra_files
+    catalog = Catalog("transcoded", path=str(source), language=language)
+    _broker, [(_args, kwargs)] = run(monkeypatch, [transcoded()], catalog)
+    assert kwargs["track_languages"] == track_languages
     assert catalog.writes[-1][2]["status"] == "done"
 
 

@@ -850,6 +850,29 @@ def test_an_extra_is_packaged_in_a_folder_of_its_own(
     assert _tree(root) == extra_before
 
 
+def test_an_extras_language_names_its_sound(
+    tmp_path: Path, monkeypatch, extra_handoff,
+) -> None:
+    # The trailer's file says nothing of its language (und); the catalog
+    # says English. Its sound is English in the manifest and the master.
+    trailer, extra_inbox = extra_handoff
+    monkeypatch.setattr(pk, "PACKAGES_ROOT", tmp_path / "packages")
+    work = tmp_path / "packages" / "_inbox"
+    shutil.copytree(extra_inbox, work / extra_inbox.name)
+    monkeypatch.setattr(extras, "_INBOX_ROOT", work)
+    catalog = _ExtrasCatalog(ClaimedExtra(
+        id=EXTRA, parent_id=ITEM, kind="trailer", title="Trailer", path=str(trailer),
+        state="transcoded", parent_title="clip", language="en"))
+    root = _package_extra(catalog)
+
+    assert [status for status, _ in catalog.steps] == ["in_progress", "done"]
+    manifest = json.loads((root / pk.MANIFEST_FILE).read_text())
+    assert [(a["id"], a["name"], a["default"]) for a in manifest["renditions"]["audio"]] == [
+        ("a0", "English", True)]
+    [audio] = [a for tag, a, _uri in _master(root) if tag == "#EXT-X-MEDIA"]
+    assert (audio["LANGUAGE"], audio["NAME"]) == ("en", "English")
+
+
 def test_an_extra_the_transcoder_left_as_it_was_is_packaged_from_its_file(
     tmp_path: Path, monkeypatch,
 ) -> None:
