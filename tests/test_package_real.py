@@ -182,8 +182,9 @@ def test_ladder_package(tmp_path: Path, monkeypatch, handoff) -> None:
         ("en", "English", "YES", "2"), ("de", "German", "NO", "2")]
     assert [(a["LANGUAGE"], a["NAME"], a["DEFAULT"], a["CHANNELS"]) for a in surround] == [
         ("en", "English 5.1", "YES", "6")]
+    # The forced track's title, "Forced", says what it is.
     assert [(a["NAME"], a["DEFAULT"], a.get("FORCED")) for a in subs] == [
-        ("English", "NO", None), ("English (forced)", "NO", "YES"), ("German", "NO", None)]
+        ("English", "NO", None), ("English · Forced", "NO", "YES"), ("German", "NO", None)]
 
     # Every rung is cut at the same instants (the source's keyframes in
     # each 6 s window: 0, 8.342 for a 100-frame GOP).
@@ -273,7 +274,7 @@ def test_the_catalogs_track_languages_reach_the_manifest_and_the_master(
     assert [(a["LANGUAGE"], a["NAME"]) for a in media if a["TYPE"] == "AUDIO"] == [
         ("en", "English"), ("fr", "French")]
     assert [(a["LANGUAGE"], a["NAME"]) for a in media if a["TYPE"] == "SUBTITLES"] == [
-        ("en", "English"), ("en", "English (forced)"), ("es", "Spanish")]
+        ("en", "English"), ("en", "English · Forced"), ("es", "Spanish")]
 
 
 @pytest.mark.parametrize(("override", "language", "name"), [
@@ -348,9 +349,9 @@ def test_subtitle_files_next_to_the_source(tmp_path: Path, monkeypatch, handoff)
     media = [a for tag, a, _ in _master(root) if tag == "#EXT-X-MEDIA" and a["TYPE"] == "SUBTITLES"]
     assert [(a["URI"], a["LANGUAGE"], a["NAME"], a.get("FORCED")) for a in media] == [
         ("s0/playlist.m3u8", "en", "English", None),
-        ("s1/playlist.m3u8", "en", "English (forced)", "YES"),
-        ("s3/playlist.m3u8", "fr", "French", None),
-        ("s4/playlist.m3u8", "en", "English (forced) (2)", "YES"),
+        ("s1/playlist.m3u8", "en", "English · Forced", "YES"),
+        ("s3/playlist.m3u8", "fr", "French", None),          # its label: "Français"
+        ("s4/playlist.m3u8", "en", "English (forced)", "YES"),
     ]
     # ... and the rendition's cue is at its time (shaka adds cue settings).
     assert [line.split()[:3] for line in

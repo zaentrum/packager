@@ -1526,10 +1526,29 @@ def _parse_language_table(table: str) -> dict[str, str]:
 
 _LANGUAGE_NAMES = {
     **_parse_language_table(_LANGUAGE_TABLE),
-    # The two codes that name no language: no linguistic content (a film
-    # without dialogue) and undetermined (no tag, or one nobody checked).
+    # The codes that name no language: no linguistic content (a film
+    # without dialogue), undetermined (no tag, or one nobody checked) and
+    # one without a code of its own (named as the clients name it).
     "zxx": "No dialogue",
     "und": "Unknown",
+    "mis": "Other language",
+}
+
+# What a track's language is called in that language, where a source's
+# title is likely to say it so ("Deutsch" on a German track).
+_ENDONYMS = {
+    "Arabic": "العربية", "Bulgarian": "Български", "Catalan": "Català",
+    "Chinese": "中文", "Croatian": "Hrvatski", "Czech": "Čeština", "Danish": "Dansk",
+    "Dutch": "Nederlands", "Estonian": "Eesti", "Finnish": "Suomi", "French": "Français",
+    "German": "Deutsch", "Greek": "Ελληνικά", "Hebrew": "עברית", "Hindi": "हिन्दी",
+    "Hungarian": "Magyar", "Icelandic": "Íslenska", "Indonesian": "Bahasa Indonesia",
+    "Italian": "Italiano", "Japanese": "日本語", "Korean": "한국어", "Latvian": "Latviešu",
+    "Lithuanian": "Lietuvių", "Norwegian": "Norsk", "Norwegian Bokmål": "Norsk bokmål",
+    "Norwegian Nynorsk": "Norsk nynorsk", "Persian": "فارسی", "Polish": "Polski",
+    "Portuguese": "Português", "Romanian": "Română", "Russian": "Русский",
+    "Serbian": "Српски", "Slovak": "Slovenčina", "Slovenian": "Slovenščina",
+    "Spanish": "Español", "Swedish": "Svenska", "Thai": "ไทย", "Turkish": "Türkçe",
+    "Ukrainian": "Українська", "Vietnamese": "Tiếng Việt",
 }
 
 
@@ -1542,13 +1561,102 @@ def _language_name(tag: str | None) -> str:
     return _LANGUAGE_NAMES.get(primary) or code
 
 
-def _audio_display_name(meta: dict[str, Any]) -> str:
-    """The NAME of an audio rendition: the name of its language
-    ("English", "No dialogue", "Unknown"). Never the source's title — a
-    free text, often a codec descriptor ("AC3 5.1 @ 640 Kbps") that is
-    wrong anyway once the track is AAC stereo. The 5.1 group adds " 5.1";
-    a second track of a language is told apart by hls.unique_names."""
-    return _language_name(meta.get("language"))
+# What a source's title says of a track besides its language, by the rule
+# the clients label tracks with (chino-web's lib/languages.ts, ported to
+# the TV and mobile apps), so a NAME reads as their menus do. A title that
+# names the source's audio format (a codec, a bit rate, a sample rate or
+# depth: "AC3 5.1 @ 640 Kbps", "DTS-HD MA 5.1") says nothing of the track,
+# which is AAC whatever the file had.
+_FORMAT_WORDS = re.compile(
+    r"(^|[^A-Za-z0-9])(dts(-hd)?|truehd|atmos|dolby|e?-?ac-?3|ddp?\+?|aac|flac|l?pcm|opus|mp3"
+    r"|vorbis|lossless|master audio|\d+ ?k?hz|\d* ?[km]bps|kb/s|\d+[- ]?bit)(?![A-Za-z0-9])",
+    re.IGNORECASE)
+# A channel layout goes from a title that says more ("Commentary 5.1").
+_LAYOUT_WORDS = re.compile(
+    r"(^|[^A-Za-z0-9.])(mono|stereo|surround|[1-9]\.[0-2]|\d{1,2} ?ch(annels?)?)(?![A-Za-z0-9.])",
+    re.IGNORECASE)
+# A title that only numbers the track ("Track 2", "Audio Track 1", "#2").
+_NUMBERED = re.compile(r"^(audio|sound|track|stream|[\s#])*\d*$", re.IGNORECASE)
+_CODE_LIKE = re.compile(r"^[a-z]{2,3}([-_][a-z0-9]+)*$", re.IGNORECASE)
+_EMPTY_BRACKETS = re.compile(r"\(\s*\)|\[\s*\]")
+# The separators around a title's words: \u2013 and \u2014 are the en and em dash,
+# \u00b7 the middle dot.
+_EDGE_SEPARATORS = re.compile(r"^[\s\-\u2013\u2014:\u00b7,|/]+|[\s\-\u2013\u2014:\u00b7,|/]+$")
+_LEADING_SEPARATORS = re.compile(r"^[\s\-\u2013\u2014:\u00b7,|]+")
+_QUALIFIER_START = re.compile(r"^([\s\-\u2013\u2014:\u00b7,|(\[]|$)")
+# The codes that name no one language to follow.
+_NO_LANGUAGE_CODES = frozenset({"und", "zxx", "mul", "mis"})
+# How long what a title adds to a NAME may be.
+_TITLE_WORDS_MAX = 40
+
+
+def _title_words(title: str | None, language: str | None) -> str:
+    """What a track's source title says besides its language: "Commentary",
+    "Director's commentary", "SDH", "Audio description", "Signs & Songs",
+    "Forced" ("English (SDH)" on an English track: "SDH"); '' when it says
+    nothing: no title, a format ("AC3 5.1 @ 640 Kbps", "DTS-HD MA", "AAC
+    2.0"), a number ("Track 0", "#2"), the track's language by its name or
+    code ("English", "Deutsch", "eng") or a code that names no language.
+    A layout goes from it ("Commentary 5.1"); more than _TITLE_WORDS_MAX
+    characters are cut at a word."""
+    raw = (title or "").strip()
+    if not raw or _FORMAT_WORDS.search(raw):
+        return ""
+    words = _LAYOUT_WORDS.sub(r"\1", raw)
+    words = _EDGE_SEPARATORS.sub("", " ".join(_EMPTY_BRACKETS.sub("", words).split()))
+    if not words or _NUMBERED.match(words) or _is_language_code(words, language):
+        return ""
+    if _lang_key(language) != "und":
+        name = _language_name(language)
+        for said in (name, _ENDONYMS.get(name, "")):
+            head, rest = words[:len(said)], words[len(said):]
+            if said and head.casefold() == said.casefold() and _QUALIFIER_START.match(rest):
+                words = _LEADING_SEPARATORS.sub("", rest).strip()
+                if words[:1] + words[-1:] in ("()", "[]"):
+                    words = words[1:-1].strip()
+                break
+    if not words or _NUMBERED.match(words):
+        return ""
+    if len(words) > _TITLE_WORDS_MAX:
+        # At a word, unless that leaves less than half; with the ellipsis.
+        room = _TITLE_WORDS_MAX - 1
+        cut = words[:room + 1].rsplit(" ", 1)[0]
+        if not room // 2 <= len(cut) <= room:
+            cut = words[:room]
+        words = _EDGE_SEPARATORS.sub("", cut) + "…"
+    return words
+
+
+def _is_language_code(title: str, language: str | None) -> bool:
+    """A title that is only a language code: its track's own ('eng' or 'en'
+    on an English track) or one that names no language ('und')."""
+    if not _CODE_LIKE.match(title):
+        return False
+    primary = title.lower().replace("_", "-").split("-")[0]
+    return primary in _NO_LANGUAGE_CODES or _language_name(title) == _language_name(language)
+
+
+def _track_display_name(language: str | None, title: str | None, *, layout: str = "") -> str:
+    """A rendition's NAME: the name of its language, its layout (" 5.1"),
+    then what its source title says besides ("English · Commentary"). A
+    track of no known language is called what its title says, else
+    "Unknown"; one without dialogue "No dialogue"."""
+    words = _title_words(title, language)
+    if _lang_key(language) == "und" and words:
+        return words + layout
+    name = _language_name(language) + layout
+    return f"{name} · {words}" if words else name
+
+
+def _audio_display_name(meta: dict[str, Any], *, surround: bool = False) -> str:
+    """The NAME of an audio rendition: the name of its language ("English",
+    "No dialogue", "Unknown"), " 5.1" in the 5.1 group, then what the
+    source's title says besides ("English · Commentary"). Not a title that
+    only names a format ("AC3 5.1 @ 640 Kbps"): the track is AAC stereo
+    whatever the file had. A second track that reads the same is told
+    apart by hls.unique_names."""
+    return _track_display_name(meta.get("language"), meta.get("title"),
+                               layout=" 5.1" if surround else "")
 
 
 def _audio_meta_from_stream(
@@ -2073,10 +2181,8 @@ def _run_shaka_packager(
         (SURROUND_GROUP, m) for m in surround_meta
     ]
     for n, (group, meta) in enumerate(audio_entries):
-        # Named by its language, never by the source's title.
-        name = _audio_display_name(meta)
-        if group == SURROUND_GROUP:
-            name = f"{name} 5.1"
+        # Named by its language first.
+        name = _audio_display_name(meta, surround=group == SURROUND_GROUP)
         meta["_name"] = name
         descriptors.append(",".join([
             f"in={primary}",
@@ -2256,12 +2362,15 @@ def _package_text_tracks(
 
 
 def _subtitle_display_name(entry: dict[str, Any]) -> str:
-    """The NAME of a subtitle rendition: the name of its language, and
-    "(forced)" for a forced track ("English (forced)"). Never the
-    source's title; a second track of a language is told apart by
-    hls.unique_names."""
-    name = _language_name(entry.get("language"))
-    return f"{name} (forced)" if entry.get("forced") else name
+    """The NAME of a subtitle rendition: the name of its language, then
+    what its title says besides ("English · SDH"), and "(forced)" for a
+    forced track whose name doesn't say so ("English (forced)"; "English ·
+    Forced" when its title did). A second track that reads the same is
+    told apart by hls.unique_names."""
+    name = _track_display_name(entry.get("language"), entry.get("title"))
+    if entry.get("forced") and "forced" not in name.casefold():
+        name = f"{name} (forced)"
+    return name
 
 
 def _codec_string_for_video(stream: dict[str, Any]) -> str:

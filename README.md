@@ -110,9 +110,14 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   auto-picked.
 - A rendition's NAME is the English name of its language: "English",
   "German", "No dialogue" for `zxx`, "Unknown" for `und`; " 5.1" in the
-  5.1 group, "(forced)" on a forced subtitle. Never the source's title,
-  a free text that is often a codec descriptor ("AC3 5.1 @ 640 Kbps").
-  NAMEs are unique within a group: a second English track is
+  5.1 group; then what the source's title says besides, by the rule the
+  clients label tracks with: "English · Commentary", "English · SDH",
+  "German · Kommentar", at most 40 characters. A title that names a
+  format ("AC3 5.1 @ 640 Kbps", "DTS-HD MA"), numbers the track
+  ("Track 0") or repeats the language ("English", "Deutsch", "eng")
+  adds nothing; a track of unknown language is called what its title
+  says, else "Unknown". A forced subtitle whose name doesn't say so gets
+  "(forced)". NAMEs are unique within a group: a second "English" is
   "English (2)".
 
 **Languages.** Every track is packaged. One in a language outside the

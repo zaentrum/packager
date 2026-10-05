@@ -175,27 +175,66 @@ def test_language_name(tag, name) -> None:
     assert pk._language_name(tag) == name
 
 
-@pytest.mark.parametrize(("meta", "name"), [
-    ({"language": "eng", "title": ""}, "English"),
-    # Sintel's one track: a codec descriptor for a title.
-    ({"language": "eng", "title": "AC3 5.1 @ 640 Kbps"}, "English"),
-    ({"language": "ger", "title": "Director's Commentary"}, "German"),
-    ({"language": "zxx", "title": ""}, "No dialogue"),
-    ({"language": "und", "title": ""}, "Unknown"),          # was "Track 0"
-    ({"language": "und", "title": "Original"}, "Unknown"),
+@pytest.mark.parametrize(("lang", "title", "name"), [
+    # A title that says what the track is stays, after its language.
+    ("eng", "Commentary", "English · Commentary"),
+    ("eng", "Director's commentary", "English · Director's commentary"),
+    ("eng", "Audio description", "English · Audio description"),
+    ("eng", "English - Commentary", "English · Commentary"),
+    ("eng", f"English {chr(0x2013)} Commentary", "English · Commentary"),  # an en dash
+    ("eng", "Commentary 5.1", "English · Commentary"),      # the layout goes
+    ("ger", "Deutsch (Kommentar)", "German · Kommentar"),
+    ("zxx", "Music & Effects", "No dialogue · Music & Effects"),
+    # Noise goes: Sintel's codec descriptor, formats, numbers, the language.
+    ("eng", "AC3 5.1 @ 640 Kbps", "English"),
+    ("eng", "DTS-HD MA", "English"),
+    ("eng", "AAC 2.0", "English"),
+    ("eng", "Commentary (AC3)", "English"),                  # as the clients have it
+    ("eng", "Stereo", "English"),
+    ("eng", "Track 0", "English"),
+    ("eng", "#2", "English"),
+    ("eng", "English", "English"),
+    ("eng", "eng", "English"),
+    ("ger", "Deutsch", "German"),
+    ("zxx", "No dialogue", "No dialogue"),
+    ("eng", "", "English"),
+    # No known language: what the title says, else "Unknown" (was "Track 0").
+    ("und", "", "Unknown"),
+    ("und", "und", "Unknown"),
+    ("und", "Commentary", "Commentary"),
+    ("und", "English", "English"),
+    ("zxx", "", "No dialogue"),
 ])
-def test_audio_display_name_is_the_language_never_the_title(meta, name) -> None:
-    assert pk._audio_display_name(meta) == name
+def test_audio_display_name(lang, title, name) -> None:
+    assert pk._audio_display_name({"language": lang, "title": title}) == name
+
+
+def test_audio_display_name_in_the_51_group_and_a_long_title() -> None:
+    assert pk._audio_display_name({"language": "eng", "title": "Original"},
+                                  surround=True) == "English 5.1 · Original"
+    assert pk._audio_display_name({"language": "eng", "title": "AC3 5.1 @ 640 Kbps"},
+                                  surround=True) == "English 5.1"
+    # What a title adds is cut at a word, ellipsis included, at 40.
+    long = "Commentary by the director and the writer, recorded in 2011"
+    name = pk._audio_display_name({"language": "eng", "title": long})
+    assert name == "English · Commentary by the director and the…"
+    assert len(name.removeprefix("English · ")) <= 40
+    word = pk._audio_display_name({"language": "eng", "title": "x" * 60})
+    assert word == "English · " + "x" * 39 + "…"
 
 
 @pytest.mark.parametrize(("entry", "name"), [
     ({"language": "eng", "title": "", "forced": False}, "English"),
-    ({"language": "eng", "title": "Forced", "forced": True}, "English (forced)"),
+    ({"language": "eng", "title": "SDH", "forced": False}, "English · SDH"),
+    ({"language": "eng", "title": "English (SDH)", "forced": False}, "English · SDH"),
+    ({"language": "eng", "title": "Signs & Songs", "forced": False}, "English · Signs & Songs"),
+    ({"language": "eng", "title": "Forced", "forced": True}, "English · Forced"),
+    ({"language": "eng", "title": "English (Forced)", "forced": True}, "English · Forced"),
     ({"language": "ger", "title": "", "forced": True}, "German (forced)"),
-    ({"language": "eng", "title": "SDH", "forced": False}, "English"),
-    ({"language": "eng", "title": "Director's Commentary", "forced": False}, "English"),
-    ({"language": "fre", "title": "", "forced": False}, "French"),
+    ({"language": "eng", "title": "Track 3", "forced": True}, "English (forced)"),
+    ({"language": "fre", "title": "Français", "forced": False}, "French"),
     ({"language": "zxx", "title": "", "forced": False}, "No dialogue"),
+    ({"language": "und", "title": "Signs & Songs", "forced": False}, "Signs & Songs"),
     ({"language": "und", "title": "", "forced": False}, "Unknown"),  # was "Subtitles 4"
 ])
 def test_subtitle_display_name(entry, name) -> None:
