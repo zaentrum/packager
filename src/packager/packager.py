@@ -73,9 +73,9 @@ PACKAGES_ROOT = Path("/var/lib/katalog/packages")
 # slow once a directory holds thousands of entries. Layout:
 #   /var/lib/katalog/packages/{category}/{shard}/{itemId}/...
 # where category is movies/shows/music (derived from katalog's item
-# type) and shard is the first two hex chars of the item uuid. The
-# stream service probes categories on read to find the package — it
-# only knows the item id, not the type.
+# type) or extras, and shard is the first two hex chars of the item
+# uuid. The stream service probes categories on read to find the
+# package — it only knows the item id, not the type.
 _CATEGORY_BY_TYPE = {
     "movie": "movies",
     "episode": "shows",
@@ -84,6 +84,11 @@ _CATEGORY_BY_TYPE = {
     "album": "music",
     "track": "music",
     "song": "music",
+    # An extra of a title (a trailer, a featurette: extras.py) has a
+    # category of its own, so its package is never inside its title's
+    # folder: a title packaged again retires everything in its folder that
+    # its new manifest doesn't name (_swap_in).
+    "extra": "extras",
 }
 
 
@@ -2426,8 +2431,8 @@ def package_status(item_id: str) -> dict[str, Any]:
       - "packaging": a run's .next/.packaging sentinel present
       - "failed": .failed sentinel present
 
-    Probes all category dirs (movies/shows/music/other) so the caller
-    doesn't have to know item.type. Cheap — at most 4 stat calls.
+    Probes all category dirs (movies/shows/music/extras/other) so the
+    caller doesn't have to know item.type. Cheap — at most 5 stat calls.
     """
     out_root = _find_existing_root(item_id)
     if out_root is None:
