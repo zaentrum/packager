@@ -13,14 +13,17 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 
 from packager import packager as pk
 from packager.config import Config
 from packager.events import is_retry, parse_envelope, parse_extra_id, parse_item_id
+from packager.katalog import ClaimedExtra, KatalogClient
 
 EXTRA = "1b5c2a8e-0000-4000-8000-0000000000e1"
 PARENT = "c0ffee00-0000-4000-8000-000000000007"
+BASE = "http://catalog.test"
 
 MASTER = (
     "#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n"
@@ -317,3 +320,102 @@ def test_the_item_loop_skips_an_extras_event() -> None:
 def test_an_extras_retry_is_marked() -> None:
     assert is_retry(parse_envelope(json.dumps(transcoded(status="retry", source="retry"))))
     assert not is_retry(parse_envelope(json.dumps(transcoded())))
+
+
+# ------------------------------------------------------------ catalog client
+
+def record(state: str = "transcoded", **fields: object) -> dict:
+    """An extra's worker record, as GET /api/analyze/extras/{id} answers."""
+    return {"id": EXTRA, "type": "extra", "parentId": PARENT, "parentType": "movie",
+            "parentTitle": "Clip", "kind": "trailer", "title": "Trailer", "language": "en",
+            "seasonNumber": None, "path": "/var/lib/katalog/extras/clip/trailer.mov",
+            "state": state, **fields}
+
+
+def _client(handler) -> KatalogClient:
+    def with_token(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 300})
+        return handler(request)
+
+    client = KatalogClient(BASE, f"{BASE}/token", "worker", "not-a-secret")
+    client._http = httpx.Client(transport=httpx.MockTransport(with_token))
+    return client
+
+
+def test_an_extras_record() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        return httpx.Response(200, json=record("READY", id="someone-else"))
+
+    extra = _client(handler).get_extra(EXTRA)
+    assert seen == [f"GET /api/analyze/extras/{EXTRA}"]
+    # The id the request named, whatever the body says: it names folders.
+    assert extra == ClaimedExtra(id=EXTRA, parent_id=PARENT, kind="trailer", title="Trailer",
+                                 path="/var/lib/katalog/extras/clip/trailer.mov", state="ready",
+                                 parent_title="Clip", removed=False)
+
+
+def test_an_extra_that_is_unknown_or_removed() -> None:
+    assert _client(lambda _r: httpx.Response(404)).get_extra(EXTRA) is None
+    removed = _client(lambda _r: httpx.Response(
+        200, json=record(removedAt="2026-10-05T08:00:00Z"))).get_extra(EXTRA)
+    assert removed is not None and removed.removed
+    with pytest.raises(httpx.HTTPStatusError):
+        _client(lambda _r: httpx.Response(503)).get_extra(EXTRA)
+
+
+def test_an_extras_package_step() -> None:
+    writes: list[tuple[str, str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        writes.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(500 if len(writes) == 2 else 200, json={})
+
+    client = _client(handler)
+    client.upsert_extra_step(EXTRA, "in_progress")
+    client.upsert_extra_step(EXTRA, "failed", error="x" * 600)   # a 500, swallowed
+    client.upsert_extra_step(EXTRA, "done", details="v=avc1.64001f a=1 subs=0 dur_s=1.2")
+    step = f"/api/analyze/extras/{EXTRA}/steps/package"
+    assert writes == [
+        ("PUT", step, {"status": "in_progress"}),
+        ("PUT", step, {"status": "failed", "error": "x" * 500}),
+        ("PUT", step, {"status": "done", "details": "v=avc1.64001f a=1 subs=0 dur_s=1.2"}),
+    ]
+
+    def down(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route")
+
+    _client(down).upsert_extra_step(EXTRA, "done")   # logged, not raised
+
+
+def test_an_extras_packaging_complete() -> None:
+    sent: list[tuple[str, str, object]] = []
+    answer = {"extraId": EXTRA, "itemId": PARENT, "packaged": True, "durationMs": 33_000}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json=answer)
+
+    manifest = {"version": 2, "itemId": EXTRA, "type": "extra", "parentId": PARENT,
+                "source": {"codec": "h264"}}
+    assert _client(handler).extra_packaging_complete(EXTRA, manifest) == answer
+    assert sent == [("POST", f"/api/extras/{EXTRA}/packaging-complete", manifest)]
+
+
+@pytest.mark.parametrize(("respond", "expected"), [
+    (lambda _r: httpx.Response(500, text="boom"), None),
+    (lambda _r: httpx.Response(404), None),           # removed while it packaged
+    (lambda _r: httpx.Response(200, text="ok"), {}),  # taken, without a JSON answer
+])
+def test_an_extras_packaging_complete_the_catalog_did_not_answer(respond, expected) -> None:
+    assert _client(respond).extra_packaging_complete(EXTRA, {}) == expected
+
+
+def test_an_extras_packaging_complete_without_a_catalog() -> None:
+    def down(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route")
+
+    assert _client(down).extra_packaging_complete(EXTRA, {}) is None

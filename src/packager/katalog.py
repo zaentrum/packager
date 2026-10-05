@@ -19,6 +19,17 @@ polls a claim endpoint; the itemId arrives on the
     the worker can't even attribute the error to the package step
     (e.g. the source file vanished from NFS).
 
+The extras mode (extras.py) makes the same kinds of call for an extra
+of a title — a trailer, a featurette — which the catalog keeps and the
+packager packages apart from its title:
+  * `GET  /api/analyze/extras/{id}` — the extra's worker record (its
+    title, parent, kind, source path and state). 404 when the catalog
+    doesn't know it or has removed it.
+  * `PUT  /api/analyze/extras/{id}/steps/package` — the extra's
+    package step, with the body an item's step takes.
+  * `POST /api/extras/{id}/packaging-complete` — the manifest (and the
+    source block) of the extra's package, which makes it playable.
+
 Token refresh on 401 is handled here so the worker loop stays
 straightforward. Pattern is mirrored from katalog-analyzer; the two
 clients are intentionally parallel so anyone reading both sees the same
@@ -101,6 +112,38 @@ def _objects(value: Any) -> list[dict[str, Any]]:
     """The JSON objects of an optional list field; [] when it is absent,
     null or not a list."""
     return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+
+@dataclass
+class ClaimedExtra:
+    """One extra of a title (a trailer, a featurette), as its worker
+    record names it: its own source file, packaged on its own, never
+    inside its title's package."""
+    id: str
+    parent_id: str
+    kind: str
+    title: str
+    path: str
+    state: str
+    parent_title: str = ""
+    # The catalog answers 404 for a removed extra; a record that says it
+    # was removed all the same is treated as gone.
+    removed: bool = False
+
+    @classmethod
+    def from_json(cls, extra_id: str, body: dict[str, Any]) -> ClaimedExtra:
+        """The record of `extra_id`, the id the request named: it names
+        the extra's inbox and package folders."""
+        return cls(
+            id=extra_id,
+            parent_id=str(body.get("parentId") or ""),
+            kind=str(body.get("kind") or ""),
+            title=str(body.get("title") or ""),
+            path=str(body.get("path") or ""),
+            state=str(body.get("state") or "").lower(),
+            parent_title=str(body.get("parentTitle") or ""),
+            removed=bool(body.get("removedAt") or body.get("removed")),
+        )
 
 
 class KatalogClient:
@@ -288,6 +331,89 @@ class KatalogClient:
                 item_id=item_id,
                 error=str(e)[:200],
             )
+
+    # ------------------------------------------------------------- extras
+    def get_extra(self, extra_id: str) -> ClaimedExtra | None:
+        """Fetch one extra's worker record, from the extraId on a consumed
+        `catalog.extra.transcoded` event: {id, type, parentId, parentType,
+        parentTitle, kind, title, language, seasonNumber, path, state}.
+        None when the catalog doesn't know the extra or has removed it
+        (404): the extras loop then logs, commits and skips. Any other
+        error raises, as get_item does."""
+        resp = self._request("GET", f"/api/analyze/extras/{extra_id}")
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return ClaimedExtra.from_json(extra_id, resp.json())
+
+    def upsert_extra_step(
+        self,
+        extra_id: str,
+        status: str,
+        *,
+        error: str | None = None,
+        details: str | None = None,
+    ) -> None:
+        """Move an extra's package step to `status` (in_progress, done or
+        failed), with the body an item's step takes; the catalog moves the
+        extra's state with it. Best-effort, as upsert_step."""
+        body: dict[str, Any] = {"status": status}
+        if error is not None:
+            body["error"] = error[:500]
+        if details is not None:
+            body["details"] = details
+        try:
+            resp = self._request(
+                "PUT",
+                f"/api/analyze/extras/{extra_id}/steps/package",
+                json=body,
+            )
+            if resp.status_code >= 400:
+                log.warning(
+                    "package.extra_step.upsert_failed",
+                    extra_id=extra_id,
+                    status=status,
+                    http=resp.status_code,
+                    body=resp.text[:300],
+                )
+        except Exception as e:
+            log.warning(
+                "package.extra_step.upsert_exception",
+                extra_id=extra_id,
+                status=status,
+                error=str(e)[:200],
+            )
+
+    def extra_packaging_complete(
+        self, extra_id: str, manifest: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Hand the catalog an extra's package: its manifest, with the
+        source block. The catalog records it (codec, size, peak bit rate,
+        package size) and makes the extra playable, and answers {extraId,
+        itemId, packaged, durationMs}. Returns that answer ({} when it has
+        no JSON object), or None when the catalog didn't take the package
+        (an HTTP error, no answer): an extra has no repair path for a
+        package the catalog doesn't know, so the extras loop then fails
+        the step and the catalog's retry runs the chain again."""
+        try:
+            resp = self._request(
+                "POST",
+                f"/api/extras/{extra_id}/packaging-complete",
+                json=manifest,
+            )
+        except Exception as e:
+            log.warning("extra_packaging_complete.exception", extra_id=extra_id,
+                        error=str(e)[:200])
+            return None
+        if resp.status_code >= 400:
+            log.warning("extra_packaging_complete.refused", extra_id=extra_id,
+                        status=resp.status_code, body=resp.text[:300])
+            return None
+        try:
+            answer = resp.json()
+        except ValueError:
+            return {}
+        return answer if isinstance(answer, dict) else {}
 
     def fail(self, item_id: str, reason: str) -> None:
         """Catastrophic-failure fallback (source file missing, etc.).
