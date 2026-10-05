@@ -1,5 +1,6 @@
-"""Language matching, the DEFAULT track, the 5.1 companions and the
-remux command line (no ffmpeg run: the runner is stubbed)."""
+"""Language matching, rendition names, the DEFAULT track, the 5.1
+companions and the remux command line (no ffmpeg run: the runner is
+stubbed)."""
 
 from __future__ import annotations
 
@@ -152,14 +153,39 @@ def test_prepare_source_legacy_timeline_has_no_copyts(monkeypatch, tmp_path: Pat
     assert "-tag:v" not in args  # hvc1 only for HEVC
 
 
+@pytest.mark.parametrize(("tag", "name"), [
+    ("eng", "English"), ("ger", "German"), ("deu", "German"), ("de", "German"),
+    ("de-CH", "German"), ("DUT", "Dutch"), ("nld", "Dutch"), ("pol", "Polish"),
+    ("vie", "Vietnamese"), ("nob", "Norwegian Bokmål"), ("gsw", "Swiss German"),
+    ("zxx", "No dialogue"), ("und", "Unknown"), ("", "Unknown"), (None, "Unknown"),
+    ("qaa", "qaa"),  # a code it doesn't know is named by itself
+])
+def test_language_name(tag, name) -> None:
+    assert pk._language_name(tag) == name
+
+
+@pytest.mark.parametrize(("meta", "name"), [
+    ({"language": "eng", "title": ""}, "English"),
+    # Sintel's one track: a codec descriptor for a title.
+    ({"language": "eng", "title": "AC3 5.1 @ 640 Kbps"}, "English"),
+    ({"language": "ger", "title": "Director's Commentary"}, "German"),
+    ({"language": "zxx", "title": ""}, "No dialogue"),
+    ({"language": "und", "title": ""}, "Unknown"),          # was "Track 0"
+    ({"language": "und", "title": "Original"}, "Unknown"),
+])
+def test_audio_display_name_is_the_language_never_the_title(meta, name) -> None:
+    assert pk._audio_display_name(meta) == name
+
+
 @pytest.mark.parametrize(("entry", "name"), [
     ({"language": "eng", "title": "", "forced": False}, "English"),
-    ({"language": "eng", "title": "Forced", "forced": True}, "English (Forced)"),
+    ({"language": "eng", "title": "Forced", "forced": True}, "English (forced)"),
     ({"language": "ger", "title": "", "forced": True}, "German (forced)"),
-    ({"language": "eng", "title": "SDH", "forced": False}, "English (SDH)"),
-    ({"language": "eng", "title": "Director's Commentary", "forced": False},
-     "Director's Commentary"),
-    ({"language": "und", "title": "", "forced": False}, "Subtitles 4"),
+    ({"language": "eng", "title": "SDH", "forced": False}, "English"),
+    ({"language": "eng", "title": "Director's Commentary", "forced": False}, "English"),
+    ({"language": "fre", "title": "", "forced": False}, "French"),
+    ({"language": "zxx", "title": "", "forced": False}, "No dialogue"),
+    ({"language": "und", "title": "", "forced": False}, "Unknown"),  # was "Subtitles 4"
 ])
 def test_subtitle_display_name(entry, name) -> None:
-    assert pk._subtitle_display_name(entry, "4") == name
+    assert pk._subtitle_display_name(entry) == name

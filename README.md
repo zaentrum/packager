@@ -88,7 +88,13 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   HDR title is labelled as such.
 - Exactly one DEFAULT=YES per audio group. AUTOSELECT goes on the first
   visible rendition of each language, so commentary is never
-  auto-picked. NAMEs are unique within a group.
+  auto-picked.
+- A rendition's NAME is the English name of its language: "English",
+  "German", "No dialogue" for `zxx`, "Unknown" for `und`; " 5.1" in the
+  5.1 group, "(forced)" on a forced subtitle. Never the source's title,
+  a free text that is often a codec descriptor ("AC3 5.1 @ 640 Kbps").
+  NAMEs are unique within a group: a second English track is
+  "English (2)".
 
 **Audio.** Every source track becomes an AAC-LC 48 kHz stereo rendition
 in group `audio`, as before. With `SURROUND_AUDIO` set (it is `off` by

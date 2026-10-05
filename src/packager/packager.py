@@ -1134,51 +1134,238 @@ def _remux_video(rung: VideoInput, tmpdir: Path, ts_offset: float) -> _StagedVid
     return _StagedVideo(rung, target, probe)
 
 
-# Markers that, when present in an audio track's source `title`, tell
-# us the title is really a codec descriptor (e.g.
-# "DTS-HD Master Audio / 5.1 / 48 kHz / 2618 kbps / 24-bit") rather
-# than a human-meaningful track name. Once we downmix to stereo AAC,
-# those descriptors are doubly wrong — they describe the source codec
-# we just stripped. Fall back to a language-derived label instead.
-_CODEC_TITLE_HINTS = (
-    "dts", "atmos", "truehd", "dolby", "ac3", "eac3", "flac", "pcm",
-    "khz", "kbps", "bit", "channel", "master audio", "lossless",
-    "5.1", "7.1", "2.0", "stereo", "mono",
-)
+# The English name of every ISO 639-1 language, by its 639-1 code, its
+# ISO 639-2/T code and, where it differs, its 639-2/B code; then 639-2
+# codes media files carry that have no 639-1 code. Rendition NAMEs are
+# these names.
+_LANGUAGE_TABLE = """\
+aa aar - Afar
+ab abk - Abkhazian
+ae ave - Avestan
+af afr - Afrikaans
+ak aka - Akan
+am amh - Amharic
+an arg - Aragonese
+ar ara - Arabic
+as asm - Assamese
+av ava - Avaric
+ay aym - Aymara
+az aze - Azerbaijani
+ba bak - Bashkir
+be bel - Belarusian
+bg bul - Bulgarian
+bi bis - Bislama
+bm bam - Bambara
+bn ben - Bengali
+bo bod tib Tibetan
+br bre - Breton
+bs bos - Bosnian
+ca cat - Catalan
+ce che - Chechen
+ch cha - Chamorro
+co cos - Corsican
+cr cre - Cree
+cs ces cze Czech
+cu chu - Church Slavic
+cv chv - Chuvash
+cy cym wel Welsh
+da dan - Danish
+de deu ger German
+dv div - Divehi
+dz dzo - Dzongkha
+ee ewe - Ewe
+el ell gre Greek
+en eng - English
+eo epo - Esperanto
+es spa - Spanish
+et est - Estonian
+eu eus baq Basque
+fa fas per Persian
+ff ful - Fula
+fi fin - Finnish
+fj fij - Fijian
+fo fao - Faroese
+fr fra fre French
+fy fry - Western Frisian
+ga gle - Irish
+gd gla - Scottish Gaelic
+gl glg - Galician
+gn grn - Guarani
+gu guj - Gujarati
+gv glv - Manx
+ha hau - Hausa
+he heb - Hebrew
+hi hin - Hindi
+ho hmo - Hiri Motu
+hr hrv - Croatian
+ht hat - Haitian Creole
+hu hun - Hungarian
+hy hye arm Armenian
+hz her - Herero
+ia ina - Interlingua
+id ind - Indonesian
+ie ile - Interlingue
+ig ibo - Igbo
+ii iii - Sichuan Yi
+ik ipk - Inupiaq
+io ido - Ido
+is isl ice Icelandic
+it ita - Italian
+iu iku - Inuktitut
+ja jpn - Japanese
+jv jav - Javanese
+ka kat geo Georgian
+kg kon - Kongo
+ki kik - Kikuyu
+kj kua - Kuanyama
+kk kaz - Kazakh
+kl kal - Kalaallisut
+km khm - Khmer
+kn kan - Kannada
+ko kor - Korean
+kr kau - Kanuri
+ks kas - Kashmiri
+ku kur - Kurdish
+kv kom - Komi
+kw cor - Cornish
+ky kir - Kyrgyz
+la lat - Latin
+lb ltz - Luxembourgish
+lg lug - Ganda
+li lim - Limburgish
+ln lin - Lingala
+lo lao - Lao
+lt lit - Lithuanian
+lu lub - Luba-Katanga
+lv lav - Latvian
+mg mlg - Malagasy
+mh mah - Marshallese
+mi mri mao Maori
+mk mkd mac Macedonian
+ml mal - Malayalam
+mn mon - Mongolian
+mr mar - Marathi
+ms msa may Malay
+mt mlt - Maltese
+my mya bur Burmese
+na nau - Nauru
+nb nob - Norwegian Bokmål
+nd nde - North Ndebele
+ne nep - Nepali
+ng ndo - Ndonga
+nl nld dut Dutch
+nn nno - Norwegian Nynorsk
+no nor - Norwegian
+nr nbl - South Ndebele
+nv nav - Navajo
+ny nya - Nyanja
+oc oci - Occitan
+oj oji - Ojibwa
+om orm - Oromo
+or ori - Odia
+os oss - Ossetic
+pa pan - Punjabi
+pi pli - Pali
+pl pol - Polish
+ps pus - Pashto
+pt por - Portuguese
+qu que - Quechua
+rm roh - Romansh
+rn run - Rundi
+ro ron rum Romanian
+ru rus - Russian
+rw kin - Kinyarwanda
+sa san - Sanskrit
+sc srd - Sardinian
+sd snd - Sindhi
+se sme - Northern Sami
+sg sag - Sango
+si sin - Sinhala
+sk slk slo Slovak
+sl slv - Slovenian
+sm smo - Samoan
+sn sna - Shona
+so som - Somali
+sq sqi alb Albanian
+sr srp - Serbian
+ss ssw - Swati
+st sot - Southern Sotho
+su sun - Sundanese
+sv swe - Swedish
+sw swa - Swahili
+ta tam - Tamil
+te tel - Telugu
+tg tgk - Tajik
+th tha - Thai
+ti tir - Tigrinya
+tk tuk - Turkmen
+tl tgl - Tagalog
+tn tsn - Tswana
+to ton - Tongan
+tr tur - Turkish
+ts tso - Tsonga
+tt tat - Tatar
+tw twi - Twi
+ty tah - Tahitian
+ug uig - Uyghur
+uk ukr - Ukrainian
+ur urd - Urdu
+uz uzb - Uzbek
+ve ven - Venda
+vi vie - Vietnamese
+vo vol - Volapük
+wa wln - Walloon
+wo wol - Wolof
+xh xho - Xhosa
+yi yid - Yiddish
+yo yor - Yoruba
+za zha - Zhuang
+zh zho chi Chinese
+zu zul - Zulu
+- ast - Asturian
+- fil - Filipino
+- gsw - Swiss German
+- haw - Hawaiian
+- nds - Low German
+- sco - Scots
+- yue - Cantonese
+- mul - Multiple languages
+"""
 
 
-def _audio_display_name(meta: dict[str, Any], idx: int) -> str:
-    """Pick a player-friendly NAME for an audio rendition.
-
-    Preference order:
-      1. The source title when it looks like a content description
-         (commentary tracks, "Director's Cut", etc.).
-      2. A language label ("English", "German", …) when the title is
-         missing OR is just a codec descriptor.
-      3. "Track N" as the final fallback for unlabelled tracks in
-         unknown languages.
-    """
-    title = (meta.get("title") or "").strip()
-    if title and not any(h in title.lower() for h in _CODEC_TITLE_HINTS):
-        return title
-    lang = (meta.get("language") or "").lower()
-    if lang and lang != "und":
-        return _LANG_DISPLAY.get(lang, lang)
-    return f"Track {idx}"
+def _parse_language_table(table: str) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for row in table.splitlines():
+        *codes, name = row.split(None, 3)
+        names.update(dict.fromkeys((c for c in codes if c != "-"), name))
+    return names
 
 
-_LANG_DISPLAY = {
-    "eng": "English", "en": "English",
-    "deu": "German", "ger": "German", "de": "German",
-    "fra": "French", "fre": "French", "fr": "French",
-    "spa": "Spanish", "es": "Spanish",
-    "ita": "Italian", "it": "Italian",
-    "jpn": "Japanese", "ja": "Japanese",
-    "zho": "Chinese", "chi": "Chinese", "zh": "Chinese",
-    "por": "Portuguese", "pt": "Portuguese",
-    "rus": "Russian", "ru": "Russian",
-    "nld": "Dutch", "nl": "Dutch",
+_LANGUAGE_NAMES = {
+    **_parse_language_table(_LANGUAGE_TABLE),
+    # The two codes that name no language: no linguistic content (a film
+    # without dialogue) and undetermined (no tag, or one nobody checked).
+    "zxx": "No dialogue",
+    "und": "Unknown",
 }
+
+
+def _language_name(tag: str | None) -> str:
+    """The English name of a track's language: 'eng' -> 'English', 'ger',
+    'deu', 'de' and 'de-CH' -> 'German', 'zxx' -> 'No dialogue', 'und' or
+    no tag -> 'Unknown'. A code it doesn't know is named by itself."""
+    code = (tag or "").strip()
+    primary = code.lower().replace("_", "-").split("-")[0] or "und"
+    return _LANGUAGE_NAMES.get(primary) or code
+
+
+def _audio_display_name(meta: dict[str, Any]) -> str:
+    """The NAME of an audio rendition: the name of its language
+    ("English", "No dialogue", "Unknown"). Never the source's title — a
+    free text, often a codec descriptor ("AC3 5.1 @ 640 Kbps") that is
+    wrong anyway once the track is AAC stereo. The 5.1 group adds " 5.1";
+    a second track of a language is told apart by hls.unique_names."""
+    return _language_name(meta.get("language"))
 
 
 def _audio_meta_from_stream(
@@ -1557,12 +1744,8 @@ def _run_shaka_packager(
         (SURROUND_GROUP, m) for m in surround_meta
     ]
     for n, (group, meta) in enumerate(audio_entries):
-        # Pick a name that describes the track *content*, not the
-        # source codec. Source titles like "DTS-HD Master Audio /
-        # 5.1 / 48 kHz / 2618 kbps / 24-bit" are misleading once we've
-        # transcoded to stereo AAC — they're really codec metadata
-        # masquerading as a title. _audio_display_name strips those.
-        name = _audio_display_name(meta, meta["idx"])
+        # Named by its language, never by the source's title.
+        name = _audio_display_name(meta)
         if group == SURROUND_GROUP:
             name = f"{name} 5.1"
         meta["_name"] = name
@@ -1698,10 +1881,9 @@ def _package_text_tracks(
     for entry in subtitle_meta:
         if entry.get("format") != "webvtt" or not entry.get("visible", True):
             continue
-        idx = entry["id"].removeprefix("sub")
-        rid = f"s{idx}"
+        rid = f"s{entry['id'].removeprefix('sub')}"
         lang = (entry.get("language") or "und").lower()
-        name = _subtitle_display_name(entry, idx)
+        name = _subtitle_display_name(entry)
         fields = [
             f"in={entry['path']}",
             "stream=text",
@@ -1744,28 +1926,13 @@ def _package_text_tracks(
             for r, n in zip(renditions, names, strict=True)]
 
 
-# Subtitle titles that only describe the track's kind; on their own they
-# make a useless menu entry ("Forced"), so they're combined with the
-# language ("English (Forced)").
-_SUBTITLE_KIND_TITLES = {
-    "forced", "full", "sdh", "cc", "hi", "signs", "signs & songs", "songs",
-    "default", "subtitles", "subs",
-}
-
-
-def _subtitle_display_name(entry: dict[str, Any], idx: str) -> str:
-    lang = (entry.get("language") or "und").lower()
-    language = _LANG_DISPLAY.get(lang, lang if lang != "und" else "")
-    title = (entry.get("title") or "").strip()
-    if not title:
-        name = language or f"Subtitles {idx}"
-    elif title.lower() in _SUBTITLE_KIND_TITLES and language:
-        name = f"{language} ({title})"
-    else:
-        name = title
-    if entry.get("forced") and "forced" not in name.lower():
-        name = f"{name} (forced)"
-    return name
+def _subtitle_display_name(entry: dict[str, Any]) -> str:
+    """The NAME of a subtitle rendition: the name of its language, and
+    "(forced)" for a forced track ("English (forced)"). Never the
+    source's title; a second track of a language is told apart by
+    hls.unique_names."""
+    name = _language_name(entry.get("language"))
+    return f"{name} (forced)" if entry.get("forced") else name
 
 
 def _codec_string_for_video(stream: dict[str, Any]) -> str:

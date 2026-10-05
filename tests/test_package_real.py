@@ -179,7 +179,7 @@ def test_ladder_package(tmp_path: Path, monkeypatch, handoff) -> None:
     assert [(a["LANGUAGE"], a["NAME"], a["DEFAULT"], a["CHANNELS"]) for a in surround] == [
         ("en", "English 5.1", "YES", "6")]
     assert [(a["NAME"], a["DEFAULT"], a.get("FORCED")) for a in subs] == [
-        ("English", "NO", None), ("English (Forced)", "NO", "YES"), ("German", "NO", None)]
+        ("English", "NO", None), ("English (forced)", "NO", "YES"), ("German", "NO", None)]
 
     # Every rung is cut at the same instants (the source's keyframes in
     # each 6 s window: 0, 8.342 for a 100-frame GOP).
