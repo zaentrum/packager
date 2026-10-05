@@ -179,3 +179,65 @@ def test_a_title_has_its_trickplay_as_before(binaries: Binaries) -> None:
     assert manifest["trickplay"]["vttPath"] == "trickplay/thumbnails.vtt"
     assert (root / "trickplay" / "sprite-0000.jpg").exists()
     assert _on_disk(root) == manifest
+
+
+def _package_extra(binaries: Binaries, **kw) -> dict:
+    return pk.package_item(
+        EXTRA, str(binaries.source), "extra", title="Trailer", trickplay=False,
+        manifest_extra={"parentId": PARENT, "extraKind": "trailer"}, **kw)
+
+
+def test_an_extras_manifest_names_its_parent_and_its_kind(binaries: Binaries) -> None:
+    manifest = _package_extra(binaries)
+    assert _on_disk(binaries.root / "extras" / "1b" / EXTRA) == manifest
+    assert {k: manifest[k] for k in ("version", "itemId", "type", "parentId", "extraKind",
+                                     "title", "year", "tmdbId", "durationMs")} == {
+        "version": 2, "itemId": EXTRA, "type": "extra", "parentId": PARENT,
+        "extraKind": "trailer", "title": "Trailer", "year": None, "tmdbId": None,
+        "durationMs": 33_000,
+    }
+    # A title's keys, with parentId and extraKind and without trickplay.
+    title = pk.package_item(PARENT, str(binaries.source), "movie", title="Clip")
+    assert set(manifest) == set(title) - {"trickplay"} | {"parentId", "extraKind"}
+    assert manifest["hls"] == {"master": "hls/master.m3u8", "segmentSeconds": 6,
+                               "audioGroups": ["audio"], "subtitleGroup": None}
+    assert [v["id"] for v in manifest["renditions"]["video"]] == ["v0"]
+    assert manifest["renditions"]["audioSurround"] == [] and manifest["subtitles"] == []
+
+
+@pytest.mark.parametrize("key", ["title", "type", "renditions", "hls"])
+def test_manifest_extra_never_replaces_what_the_packager_writes(
+    binaries: Binaries, key: str,
+) -> None:
+    # The run fails as any other does: the live package stays as it was.
+    _package_extra(binaries)
+    root = binaries.root / "extras" / "1b" / EXTRA
+    live = _tree(root)
+    with pytest.raises(pk.PackageError, match=f"manifest_extra would replace {key}"):
+        pk.package_item(EXTRA, str(binaries.source), "extra", trickplay=False,
+                        manifest_extra={"parentId": PARENT, key: "x"})
+    assert {rel: text for rel, text in _tree(root).items() if rel != ".failed"} == live
+    assert "manifest_extra" in json.loads((root / ".failed").read_text())["error"]
+    assert not (root / pk.STAGING_DIR).exists()
+
+
+def test_a_title_packaged_again_leaves_its_extras_alone(binaries: Binaries) -> None:
+    # The title, then its trailer, then the title again (a re-encode): the
+    # swap retires what the title's new manifest doesn't name, in the
+    # title's folder only. The trailer is in none of it.
+    title_root = binaries.root / "movies" / "c0" / PARENT
+    extra_root = binaries.root / "extras" / "1b" / EXTRA
+    pk.package_item(PARENT, str(binaries.source), "movie", title="Clip")
+    title_before = _tree(title_root)
+    _package_extra(binaries)
+    assert _tree(title_root) == title_before
+    extra_before = _tree(extra_root)
+
+    pk.package_item(PARENT, str(binaries.source), "movie", title="Clip",
+                    options=pk.PackageOptions(old_package_grace_seconds=600))
+    assert _tree(extra_root) == extra_before
+    replaced = sorted(p.name.split(".old-")[0] for p in title_root.iterdir() if ".old-" in p.name)
+    assert replaced == ["hls", "trickplay"]
+    assert sorted(p.relative_to(binaries.root).as_posix()
+                  for p in binaries.root.glob("*/*/*")) == [
+        f"extras/1b/{EXTRA}", f"movies/c0/{PARENT}"]

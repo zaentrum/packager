@@ -264,6 +264,7 @@ def package_item(
     track_languages: list[Any] | None = None,
     subtitle_files: list[Any] | None = None,
     trickplay: bool = True,
+    manifest_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Package one item synchronously. Returns the written manifest.
 
@@ -316,7 +317,11 @@ def package_item(
 
     trickplay False leaves the scrub-preview sprites out: no trickplay/
     folder, no `trickplay` in the manifest. An extra of a title (a
-    trailer) is packaged so: the clients play it without scrub previews."""
+    trailer) is packaged so: the clients play it without scrub previews.
+
+    manifest_extra adds keys to the manifest's top level, as they are:
+    an extra's `parentId` and `extraKind`. It never replaces a key the
+    packager writes; one that would fails the run (PackageError)."""
     options = options or PackageOptions()
     if inputs is None:
         inputs = PackageInputs(video=[VideoInput("v0", Path(source_path))], kind="original")
@@ -477,6 +482,13 @@ def package_item(
                 manifest["episodeCode"] = ec
         if trickplay_meta is not None:
             manifest["trickplay"] = trickplay_meta
+        if manifest_extra:
+            # Added, never replacing: the playback service and the catalog
+            # read the packager's keys, and the swap checks what they name.
+            clash = sorted(set(manifest_extra) & set(manifest))
+            if clash:
+                raise PackageError(f"manifest_extra would replace {', '.join(clash)}")
+            manifest.update(manifest_extra)
         _write_atomic(stage / MANIFEST_FILE, json.dumps(manifest, indent=2).encode())
 
         # Only a whole package replaces the live one. The live one is kept
