@@ -813,6 +813,11 @@ def _track_language(stream: dict[str, Any]) -> str:
     return (tags.get("language") or "und").lower()
 
 
+# Tags no language whitelist hides: undetermined, and no linguistic
+# content (a track without dialogue).
+_ALWAYS_VISIBLE = frozenset({"und", "zxx"})
+
+
 def _visible_indices(
     streams: list[dict[str, Any]],
     whitelist: list[str] | None,
@@ -829,7 +834,9 @@ def _visible_indices(
     Rules, in order:
       1. Empty/None whitelist → every track is visible.
       2. Streams tagged 'und' (undefined) are always visible — better
-         to surface a wrongly-tagged track than hide the only one.
+         to surface a wrongly-tagged track than hide the only one — and
+         so are those tagged 'zxx' (no linguistic content): no language
+         to filter by, and often a dialogue-free film's only track.
       3. Streams whose language is in the whitelist are visible, compared
          as ISO 639-1 keys ('ger'/'deu' match 'de').
       4. If the result is empty AND `keep_original_if_single` is True
@@ -842,13 +849,13 @@ def _visible_indices(
     visible: set[int] = set()
     for i, s in enumerate(streams):
         key = _lang_key(_track_language(s))
-        if key == "und" or key in wanted:
+        if key in _ALWAYS_VISIBLE or key in wanted:
             visible.add(i)
     if visible:
         return visible
     if keep_original_if_single:
         distinct = {_lang_key(_track_language(s)) for s in streams}
-        distinct.discard("und")
+        distinct -= _ALWAYS_VISIBLE
         if len(distinct) == 1:
             return set(range(len(streams)))
     return visible

@@ -96,6 +96,13 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   NAMEs are unique within a group: a second English track is
   "English (2)".
 
+**Languages.** Every track is packaged. One in a language outside the
+`packager.language_whitelist` setting is marked `visible: false` in the
+manifest, so the clients leave it out of their menus; when that would
+hide every track of a source in one language,
+`packager.keep_original_if_single` (on by default) shows them all. A
+track tagged `und` (unknown) or `zxx` (no dialogue) is always visible.
+
 **Audio.** Every source track becomes an AAC-LC 48 kHz stereo rendition
 in group `audio`, as before. With `SURROUND_AUDIO` set (it is `off` by
 default until chino-stream filters the master per client), a visible

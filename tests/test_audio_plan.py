@@ -33,6 +33,17 @@ def test_whitelist_matches_bibliographic_codes() -> None:
     assert pk._visible_indices(streams, ["de", "en"], keep_original_if_single=True) == {0, 1, 3}
 
 
+def test_whitelist_never_hides_a_track_without_dialogue() -> None:
+    # zxx, no linguistic content: a dialogue-free film's track. Visible
+    # whatever the whitelist, as und is. With a dubbed track beside it the
+    # one-language fallback didn't apply, and nothing was visible.
+    streams = [_a("zxx"), _a("ger"), _a("jpn")]
+    assert pk._visible_indices(streams, ["en"], keep_original_if_single=True) == {0}
+    assert pk._visible_indices([_a("zxx")], ["en"], keep_original_if_single=False) == {0}
+    assert pk._visible_indices([_a("zxx"), _a("und"), _a("eng"), _a("fre")], ["en"],
+                               keep_original_if_single=False) == {0, 1, 2}
+
+
 def test_default_follows_preference_then_source_flag() -> None:
     streams = [_a("eng", default=True), _a("ger"), _a("ger", title="Kommentar")]
     visible = {0, 1, 2}
