@@ -73,6 +73,11 @@ spec:
               value: "packager-workers"
             - name: CONSUME_TOPIC
               value: "stube.catalog.item.transcoded"
+            # Extras (README "Extras"): trailers and other bonus material,
+            # on a consumer of their own (group packager-extras) reading
+            # <KAFKA_TOPIC_PREFIX>catalog.extra.transcoded.
+            - name: KAFKA_TOPIC_PREFIX
+              value: "stube."
             # 5.1 companion rendition (group audio-surround) for >= 6-channel
             # tracks: eac3 | ac3 | off.
             - name: SURROUND_AUDIO
@@ -87,6 +92,9 @@ spec:
               value: ""
           volumeMounts:
             # Read-only source files. Same NFS export the analyzer reads.
+            # An extra's file can sit outside the media root (wherever the
+            # catalog takes extras from): mount that directory read-only
+            # here too.
             - name: media
               mountPath: /var/lib/katalog/media
               readOnly: true

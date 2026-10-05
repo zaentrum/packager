@@ -4,7 +4,9 @@ Per-item CMAF packager for the zaentrum platform — the **terminal stage**
 of the catalog pipeline. A small Python worker that consumes the Kafka
 topic `stube.catalog.item.transcoded`, runs `ffmpeg` + `shaka-packager`,
 and emits a streaming-friendly CMAF/HLS tree (plus trickplay sprites and
-subtitle sidecars) under the per-item output directory.
+subtitle sidecars) under the per-item output directory. A second
+consumer packages the extras of a title (trailers and other bonus
+material) into folders of their own; see [Extras](#extras).
 
 ## Status
 
@@ -206,14 +208,116 @@ already watching gets the new package's files from the swap on, under
 the same names: seamless where a rendition is unchanged (a copied v0,
 the audio), not where a rung was encoded anew.
 
+## Extras
+
+The extras of a title (trailers, teasers, featurettes, making-ofs) are
+catalog rows of their own, keyed by an extraId, and are packaged on their
+own. A second consumer, on a thread of its own and in a consumer group of
+its own, packages them, so a long film's run never holds a two-minute
+trailer up behind it. One item and one extra can therefore package at
+once per pod.
+
+| | Items | Extras |
+| --- | --- | --- |
+| Consumes | `CONSUME_TOPIC` | `<KAFKA_TOPIC_PREFIX>catalog.extra.transcoded` |
+| Consumer group | `KAFKA_GROUP_ID` (`packager-workers`) | `EXTRAS_GROUP_ID` (`packager-extras`) |
+| Inbox | `_inbox/<itemId>/` | `_inbox/extra-<extraId>/` |
+| Worker record | `GET /api/analyze/items/{id}` | `GET /api/analyze/extras/{id}` |
+| Step | `PUT /api/analyze/items/{id}/steps/package` | `PUT /api/analyze/extras/{id}/steps/package` |
+| Package handed over | `POST /api/items/{id}/packaging-complete` | `POST /api/extras/{id}/packaging-complete` |
+| Package folder | `movies/`, `shows/`, … `<aa>/<itemId>/` | `extras/<aa>/<extraId>/` |
+| Trickplay | yes | no |
+
+`KAFKA_TOPIC_PREFIX` is the tenant's topic prefix, `stube.` by default (a
+missing trailing dot is added), so the topic defaults to
+`stube.catalog.extra.transcoded`. The transcoder sends the event once it
+has encoded the extra, keyed by the extraId:
+
+```json
+{"eventId": "9f2b…", "extraId": "1b5c2a8e-…", "parentId": "ea886f9b-…",
+ "type": "extra", "kind": "trailer", "step": "package", "status": "queued",
+ "occurredAt": "2026-10-06T08:00:00Z", "source": "transcoder"}
+```
+
+It carries no `itemId`, so the item loop would skip one that reached its
+topic. An extraId that is not a lower-case UUID makes the event
+malformed: it is committed and skipped.
+
+Per event:
+
+1. `GET /api/analyze/extras/{id}`. A 404 (unknown or removed), a record
+   with `removedAt`, or an extra in state `missing` (its file is gone)
+   is skipped: nothing is written.
+2. An extra in state `ready` is finished: nothing runs. The transcoder
+   sends `catalog.extra.transcoded` again for an extra past its
+   transcode whenever a trigger reaches it again, so this is a duplicate
+   of a run that finished; a retry (`"status": "retry"`) is acked with
+   one log line (`packager.extra.retry.already_finished`). Every other
+   state packages, as an unfinished item does, `packaging` included: a
+   run that died.
+3. The package step goes `in_progress`, and the handoff in
+   `_inbox/extra-<extraId>/` is read under the unchanged contract
+   ([Inputs](#inputs)): its `itemId` is the extraId, and a
+   `"file": null` rung, like no handoff at all (the transcoder's step
+   `not_applicable`), is the extra's file as it is. It is packaged as an
+   item is, with the same options and language settings, but as type
+   `extra`, without trickplay, into `extras/<aa>/<extraId>/`.
+4. `POST /api/extras/{id}/packaging-complete` with the manifest and the
+   source block. Only once the catalog has taken it is the step `done`
+   and the handoff removed. When the catalog refuses it, the step fails,
+   unlike an item's, which is done regardless: only the catalog's word
+   makes an extra playable, so its retry runs the chain again. A record
+   without a parent or a path, a handoff that can't be read and a file
+   that is gone fail the step without a run.
+
+The manifest has an item's keys, minus `trickplay`, plus the title the
+extra belongs to (`parentId`) and the extra's kind (`extraKind`). Its
+`itemId` is the extraId, its `type` is `extra`, and `year` and `tmdbId`
+are null:
+
+```json
+{"version": 2, "itemId": "1b5c2a8e-…", "type": "extra", "title": "Trailer",
+ "year": null, "tmdbId": null, "durationMs": 33000, "packagedAt": "…", "packager": "…",
+ "renditions": {
+   "video": [{"id": "v0", "dir": "hls/v0", "codec": "avc1.64001f", "width": 1280, "height": 720, "…": "…"},
+             {"id": "v1", "dir": "hls/v1", "codec": "avc1.64001e", "width": 854, "height": 480, "…": "…"}],
+   "audio": [{"id": "a0", "dir": "hls/a0", "codec": "mp4a.40.2", "language": "eng", "default": true, "…": "…"}],
+   "audioSurround": []},
+ "subtitles": [],
+ "hls": {"master": "hls/master.m3u8", "segmentSeconds": 6, "audioGroups": ["audio"],
+         "subtitleGroup": null},
+ "parentId": "ea886f9b-…", "extraKind": "trailer"}
+```
+
+**A folder of its own.** An extra is never written inside its title's
+folder. A title packaged again retires everything in its folder that its
+new manifest doesn't name ("Packaging again" above), and the playback
+service takes every folder with a `.complete` in a title category for a
+title. `extras/` is a category of its own, packaged as the others are: a
+run builds the next package in `.next/` and swaps it in whole, the
+replaced one stays for its grace period, and the startup sweep clears
+what dead runs left there. The playback service serves an extra under
+its title only (`parentId`), and never lists one as a title.
+
+**Mounts.** An extra's file can sit outside the media root (wherever the
+catalog takes extras from). The packager reads it for a rung the
+transcoder left as it was, and when there is no handoff, so mount that
+directory read-only too. The zaentrum platform chart mounts the whole
+volume at `/var/lib/katalog`, which covers it.
+
+**Topic.** The topic has to exist on the broker, unless the broker
+creates topics on first use. Until it does, the extras consumer logs a
+warning now and then, and the item loop is unaffected.
+
 ## Layout
 
 ```
-src/packager/main.py        # entry point: consumer thread + FastAPI /healthz + /readyz
+src/packager/main.py        # entry point: consumer threads + FastAPI /healthz + /readyz
 src/packager/config.py      # env-driven config
 src/packager/events.py      # Kafka consumer factory + envelope parsing
 src/packager/katalog.py     # HTTP client to the katalog API, OIDC auth
 src/packager/worker.py      # consumer loop: one item at a time, serial packaging
+src/packager/extras.py      # the extras' consumer loop: trailers and other bonus material
 src/packager/renditions.py  # reads the transcoder handoff (renditions.json)
 src/packager/packager.py    # ffmpeg remux + shaka-packager + trickplay + subtitles
 src/packager/hls.py         # master playlist assembly + RFC 8216 bit rates
@@ -228,6 +332,8 @@ Dockerfile
 | --- | --- | --- |
 | `KATALOG_API_URL`, `OIDC_*` | (required) | katalog API + client credentials |
 | `KAFKA_BROKERS` | `kafka:9092` | Bootstrap brokers (`KAFKA_SECURITY_PROTOCOL`, `KAFKA_GROUP_ID`, `CONSUME_TOPIC`) |
+| `KAFKA_TOPIC_PREFIX` | `stube.` | Tenant topic prefix of the extras' topic, `<prefix>catalog.extra.transcoded` (see [Extras](#extras)) |
+| `EXTRAS_GROUP_ID` | `packager-extras` | The extras' consumer group |
 | `SEGMENT_SECONDS` | `6` | Segment length when renditions.json doesn't set it |
 | `SURROUND_AUDIO` | `off` | 5.1 companion codec: `eac3`, `ac3` or `off`. Turn on only once chino-stream drops the `audio-surround` group for clients that can't decode it |
 | `SURROUND_BITRATE` | `448k` | Bitrate of an encoded 5.1 companion |
@@ -257,7 +363,9 @@ reference in `k8s/deployment.yaml` for your environment. The deployment
 expects two PVCs (read-only source media, writeable packaged output),
 the `KATALOG_API_URL` / `OIDC_*` env vars wired to your katalog API and
 identity provider, and `KAFKA_BROKERS` (+ optional `KAFKA_SECURITY_PROTOCOL`,
-`KAFKA_GROUP_ID`, `CONSUME_TOPIC`) pointing at your broker.
+`KAFKA_GROUP_ID`, `CONSUME_TOPIC`, `KAFKA_TOPIC_PREFIX`, `EXTRAS_GROUP_ID`)
+pointing at your broker. Mount the directory the catalog takes extras
+from too, when it lies outside the media root ([Extras](#extras)).
 
 ## License
 
