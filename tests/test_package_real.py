@@ -199,6 +199,8 @@ def test_ladder_package(tmp_path: Path, monkeypatch, handoff) -> None:
     assert [(a["id"], a["codec"], a["channels"]) for a in r["audioSurround"]] == [
         ("a2", "ec-3", 6)]
     assert [s.get("hls") for s in manifest["subtitles"]] == ["hls/s0", "hls/s1", "hls/s2"]
+    # The forced English track shows by itself under the English audio.
+    assert [s["default"] for s in manifest["subtitles"]] == [False, True, False]
     assert all((root / s["path"]).exists() for s in manifest["subtitles"])
     assert manifest["hls"] == {"master": "hls/master.m3u8", "segmentSeconds": 6,
                                "audioGroups": ["audio", "audio-surround"],
@@ -219,6 +221,37 @@ def test_every_audio_group_has_exactly_one_default(tmp_path: Path, monkeypatch, 
     r = manifest["renditions"]
     assert [a["default"] for a in r["audio"]] == [False, True]
     assert [a["default"] for a in r["audioSurround"]] == [True]
+    # The forced English subtitle is foreign to the German audio.
+    assert [s["default"] for s in manifest["subtitles"]] == [False, False, False]
+
+
+def test_a_subtitle_the_file_flags_default_does_not_show_by_itself(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    # Sintel's tracks: an English film, its audio titled after its codec,
+    # German subtitles first and flagged default (the transcoder's remux
+    # flags the first one when the file flags none).
+    for name, text in (("de.srt", "Hallo."), ("en.srt", "Hello.")):
+        (tmp_path / name).write_text(f"1\n00:00:01,000 --> 00:00:02,000\n{text}\n")
+    src = tmp_path / "sintel.mkv"
+    _ff("-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=4",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4",
+        "-i", str(tmp_path / "de.srt"), "-i", str(tmp_path / "en.srt"),
+        "-map", "0:v", "-map", "1:a", "-map", "2", "-map", "3",
+        "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-c:s", "srt",
+        "-metadata:s:a:0", "language=eng", "-metadata:s:a:0", "title=AC3 5.1 @ 640 Kbps",
+        "-metadata:s:s:0", "language=ger", "-metadata:s:s:1", "language=eng",
+        "-disposition:s:0", "default", "-disposition:s:1", "0", str(src))
+    manifest, root = _package(tmp_path, monkeypatch, src, None, hls_subtitles=True,
+                              surround_codec="off")
+    assert [(s["language"], s["default"]) for s in manifest["subtitles"]] == [
+        ("ger", False), ("eng", False)]
+    [audio] = manifest["renditions"]["audio"]
+    assert (audio["name"], audio["title"]) == ("English", "AC3 5.1 @ 640 Kbps")
+    media = [a for tag, a, _ in _master(root) if tag == "#EXT-X-MEDIA"]
+    assert [(a["TYPE"], a["LANGUAGE"], a["NAME"], a["DEFAULT"]) for a in media] == [
+        ("AUDIO", "en", "English", "YES"),
+        ("SUBTITLES", "de", "German", "NO"), ("SUBTITLES", "en", "English", "NO")]
 
 def test_the_catalogs_track_languages_reach_the_manifest_and_the_master(
     tmp_path: Path, monkeypatch, handoff,

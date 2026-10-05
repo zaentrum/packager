@@ -26,7 +26,8 @@ Design rules:
   additionally packaged as HLS subtitle renditions (hls/sN/); the master
   references them (TYPE=SUBTITLES, FORCED=YES where flagged) only when
   HLS_SUBTITLES is on, so clients that draw their own sidecar subtitles
-  aren't surprised by in-manifest ones.
+  aren't surprised by in-manifest ones. At most one subtitle is
+  `default` in the manifest: a forced one, not in a foreign language.
 * All state is on disk under the per-item output directory, which is
   never moved or created again. `.complete` says the package in it is
   whole and live. A run builds the next one in `.next/` (its sentinel
@@ -377,6 +378,14 @@ def package_item(
                 src, probe, stage / "subs",
                 visible_indices=sub_visible,
             )
+            audio_language = (_track_language(probe.audio[default_audio])
+                              if default_audio is not None else None)
+            default_subtitle = _pick_default_subtitle(subtitle_meta, audio_language)
+            for i, entry in enumerate(subtitle_meta):
+                entry["default"] = i == default_subtitle
+            log.info("packager.subs.default", audio_language=audio_language,
+                     subtitle=subtitle_meta[default_subtitle]["id"]
+                     if default_subtitle is not None else None)
             video_meta, audio_meta, surround_meta = _run_shaka_packager(
                 packaging_source, videos, audio_meta, surround_meta, stage,
                 segment_seconds=segment_seconds,
@@ -936,9 +945,10 @@ def _probe_of_source(packaged: Path, source: Path) -> _Probe | None:
         return None
 
 
-# Tags no language whitelist hides: undetermined, and no linguistic
-# content (a track without dialogue).
-_ALWAYS_VISIBLE = frozenset({"und", "zxx"})
+# The tags that name no language: undetermined, and no linguistic content
+# (a track without dialogue). No whitelist hides such a track, and no
+# subtitle is foreign to it.
+_NO_LANGUAGE = frozenset({"und", "zxx"})
 
 
 def _visible_indices(
@@ -972,13 +982,13 @@ def _visible_indices(
     visible: set[int] = set()
     for i, s in enumerate(streams):
         key = _lang_key(_track_language(s))
-        if key in _ALWAYS_VISIBLE or key in wanted:
+        if key in _NO_LANGUAGE or key in wanted:
             visible.add(i)
     if visible:
         return visible
     if keep_original_if_single:
         distinct = {_lang_key(_track_language(s)) for s in streams}
-        distinct -= _ALWAYS_VISIBLE
+        distinct -= _NO_LANGUAGE
         if len(distinct) == 1:
             return set(range(len(streams)))
     return visible
@@ -1019,6 +1029,29 @@ def _pick_default_audio(
         if candidates:
             return min(candidates, key=rank)
     return min(range(len(streams)), key=rank)
+
+
+def _pick_default_subtitle(
+    entries: list[dict[str, Any]], audio_language: str | None,
+) -> int | None:
+    """The one subtitle track marked default, if any (the manifest's
+    `default`): a visible forced track (it shows what the audio doesn't
+    say in its language: a line in another one, a sign) that isn't in a
+    foreign language. In the language of the default audio track first,
+    else in no known language; any forced track when the audio's language
+    isn't known (und, zxx, no audio). No other track is default, whatever
+    the source flags: ffmpeg flags the first subtitle default when a file
+    has several and flags none (Sintel's German on an English film, after
+    the transcoder's remux), and full subtitles shown by themselves are the
+    viewer's choice, not the package's."""
+    forced = [i for i, e in enumerate(entries) if e.get("forced") and e.get("visible", True)]
+    audio = _lang_key(audio_language)
+    if audio in _NO_LANGUAGE:
+        return forced[0] if forced else None
+    keys = {i: _lang_key(entries[i].get("language")) for i in forced}
+    same = [i for i in forced if keys[i] == audio]
+    unknown = [i for i in forced if keys[i] in _NO_LANGUAGE]
+    return (same or unknown or [None])[0]
 
 
 @dataclass(frozen=True)
@@ -1539,7 +1572,9 @@ def _extract_subtitles(
     (we don't lose data). `visible_indices` controls only the
     `visible` flag on each manifest entry — the client uses that
     to decide which to surface in the picker menu. None means every
-    extracted track is visible."""
+    extracted track is visible. No entry is `default` here; package_item
+    marks the one there may be (_pick_default_subtitle): the source's
+    default flag doesn't count."""
     if not probe.subtitles:
         return []
     subs_dir.mkdir(parents=True, exist_ok=True)
@@ -1552,7 +1587,7 @@ def _extract_subtitles(
             "id": f"sub{i}",
             "language": _track_language(s),
             "title": tags.get("title") or "",
-            "default": bool(disp.get("default")),
+            "default": False,
             "forced": bool(disp.get("forced")),
             "visible": visible_indices is None or i in visible_indices,
         }

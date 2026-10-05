@@ -145,7 +145,13 @@ at 0. The master references them
 `HLS_SUBTITLES=true`, which is **off by default**. The clients draw the
 sidecars themselves, and the playback API doesn't route `sN/` yet.
 Turning it on changes the master only; the renditions are already on
-disk.
+disk. In the manifest, at most one subtitle is `default`: a visible
+forced track that isn't in a foreign language, in the default audio
+track's language first, else of no known language; any forced one when
+the audio's language isn't known (`und`, `zxx`). The source's default
+flag doesn't count: ffmpeg flags the first subtitle default when a file
+has several and flags none, which showed German subtitles by themselves
+on an English film.
 
 **Compatibility.** Rendition dirs stay `vN` / `aN`, so the existing
 playback routes serve every rung and both audio groups. `renditions.video[0]`
