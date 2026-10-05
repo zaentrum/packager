@@ -23,12 +23,20 @@ Go hub exactly):
          "source": <str>}
     Consumers REQUIRE only `itemId`; every other field is tolerated /
     ignored so the schema can grow without a lock-step deploy.
+
+  * The extras of a title (extras.py) have a chain of their own, on
+    `<prefix>catalog.extra.transcoded`, keyed by extraId. Their envelope
+    carries `extraId`, `parentId` (the title) and `kind` in place of
+    `itemId`, and `"type": "extra"`; the extras consumer REQUIRES only
+    `extraId`. No `itemId`, on purpose: the item loop skips an extras
+    event that reaches its topic.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 import structlog
@@ -48,6 +56,11 @@ log = structlog.get_logger(__name__)
 # a silent run is dead. The price: a rebalance (a replica joining or
 # leaving) waits until every busy replica has finished its item.
 MAX_POLL_INTERVAL_MS = 24 * 60 * 60 * 1000
+
+# An extra's id as the catalog names it: a lower-case RFC 4122 UUID. It
+# names folders (`_inbox/extra-<id>/`, `extras/<aa>/<id>/`) and URL paths,
+# so an event with anything else is malformed.
+_EXTRA_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 def _security_conf(security_protocol: str) -> dict[str, str]:
@@ -129,3 +142,14 @@ def parse_item_id(raw_value: bytes | str | None) -> str | None:
         log.warning("event.missing_item_id", envelope=str(envelope)[:200])
         return None
     return item_id
+
+
+def parse_extra_id(raw_value: bytes | str | None) -> str | None:
+    """The extraId of an extras event (`catalog.extra.transcoded`), or None
+    when the message is malformed: not a JSON object, no extraId, or one
+    that is not a lower-case UUID. The caller logs, commits and skips a
+    None, as the item loop does an event without an itemId."""
+    extra_id = parse_envelope(raw_value).get("extraId")
+    if not isinstance(extra_id, str) or not _EXTRA_ID.fullmatch(extra_id):
+        return None
+    return extra_id

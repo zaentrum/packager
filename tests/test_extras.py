@@ -17,6 +17,7 @@ import pytest
 
 from packager import packager as pk
 from packager.config import Config
+from packager.events import is_retry, parse_envelope, parse_extra_id, parse_item_id
 
 EXTRA = "1b5c2a8e-0000-4000-8000-0000000000e1"
 PARENT = "c0ffee00-0000-4000-8000-000000000007"
@@ -276,3 +277,43 @@ def test_the_extras_topic_is_the_tenants(
     cfg = _env(monkeypatch, KAFKA_TOPIC_PREFIX=prefix, EXTRAS_GROUP_ID="packager-extras-b")
     assert cfg.extras_consume_topic == topic
     assert cfg.extras_group_id == "packager-extras-b"
+
+
+# ----------------------------------------------------------------- envelope
+
+def transcoded(**fields: object) -> dict:
+    """A `catalog.extra.transcoded` envelope as the transcoder sends it."""
+    return {"eventId": "9f2b", "extraId": EXTRA, "parentId": PARENT, "type": "extra",
+            "kind": "trailer", "step": "package", "status": "queued",
+            "occurredAt": "2026-10-06T08:00:00Z", "source": "transcoder", **fields}
+
+
+def test_the_extra_id_is_read_from_the_event() -> None:
+    assert parse_extra_id(json.dumps(transcoded()).encode()) == EXTRA
+    assert parse_extra_id(json.dumps(transcoded())) == EXTRA
+
+
+@pytest.mark.parametrize("raw", [
+    None, b"", b"not json", b"[]", json.dumps({"itemId": PARENT}).encode(),
+    json.dumps(transcoded(extraId=None)).encode(),
+    # It names folders and a URL path: a lower-case UUID, whole, or nothing.
+    json.dumps(transcoded(extraId="../../etc")).encode(),
+    json.dumps(transcoded(extraId=EXTRA.upper())).encode(),
+    json.dumps(transcoded(extraId="{" + EXTRA + "}")).encode(),
+    json.dumps(transcoded(extraId=EXTRA + "/x")).encode(),
+    json.dumps(transcoded(extraId=EXTRA + "\n")).encode(),
+    json.dumps(transcoded(extraId=7)).encode(),
+])
+def test_a_malformed_extras_event_has_no_extra_id(raw) -> None:
+    assert parse_extra_id(raw) is None
+
+
+def test_the_item_loop_skips_an_extras_event() -> None:
+    # No itemId, on purpose: an item consumer pointed at the extras topic
+    # by mistake finds nothing to run.
+    assert parse_item_id(json.dumps(transcoded()).encode()) is None
+
+
+def test_an_extras_retry_is_marked() -> None:
+    assert is_retry(parse_envelope(json.dumps(transcoded(status="retry", source="retry"))))
+    assert not is_retry(parse_envelope(json.dumps(transcoded())))
