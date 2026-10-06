@@ -30,6 +30,11 @@ packager packages apart from its title:
   * `POST /api/extras/{id}/packaging-complete` — the manifest (and the
     source block) of the extra's package, which makes it playable.
 
+When the catalog runs the library v2 layout, both worker records carry a
+`library` block (the title's folders in the library tree, below) and the
+two packaging-complete calls take the v2 payload instead, which the
+catalog must take (a 2xx) before the step is done (library.py).
+
 Token refresh on 401 is handled here so the worker loop stays
 straightforward. Pattern is mirrored from katalog-analyzer; the two
 clients are intentionally parallel so anyone reading both sees the same
@@ -38,6 +43,8 @@ shape.
 
 from __future__ import annotations
 
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -50,6 +57,231 @@ log = structlog.get_logger(__name__)
 # Keycloak default for client_credentials is 300 s; refresh 30 s ahead
 # so we never send a token within seconds of expiry.
 TOKEN_REFRESH_LEAD_SECONDS = 30
+
+# ---------------------------------------------------------- the library block
+#
+# A worker record carries a `library` block when the catalog's setting
+# library.layout is v2 (contract platform-library/1): the folders of the
+# title's record in the library tree, which the packager writes into
+# (library.py), and the version it builds. Without the block the packager
+# works as it always has, into the package store. Every path in it is the
+# catalog's: the packager never works one out itself.
+
+LIBRARY_CONTRACT = 1
+
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_QH1 = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+class LibraryRecordError(ValueError):
+    """A library block the packager can't work from: the step fails with
+    this message. A record that carries a library block is never packaged
+    into the package store instead."""
+
+
+@dataclass(frozen=True)
+class LibrarySource:
+    """library.source: the original this run packages, as the catalog
+    recorded it at its arrival."""
+    source_id: str
+    # Whether sources/<sourceId>/ is in the record already (an earlier
+    # version of the same original wrote it).
+    recorded: bool
+    record_dir: str           # <itemDir>/sources/<sourceId>
+    library_path: str         # relative to the arrivals root
+    size_bytes: int | None
+    qh1: str | None
+
+
+@dataclass(frozen=True)
+class LibraryBuild:
+    """library.build: the version this run builds. Its id stays the same
+    across retries until a package for it is recorded complete."""
+    version_id: str
+    staging_dir: str          # <workRoot>/staging/<versionId>
+    version_dir: str          # <itemDir>/versions/<versionId>
+    created_by: str
+    chapters: list[dict[str, Any]]
+    chapters_from: str | None
+    segments: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ItemLibrary:
+    """An item's library block (GET /api/analyze/items/{id})."""
+    root: str
+    item_dir: str
+    inbox_dir: str            # the transcoder's handoff
+    source: LibrarySource
+    build: LibraryBuild
+    # The item's complete version, {"versionId", "dir"}, or None.
+    current: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ExtraLibrary:
+    """An extra's library block (GET /api/analyze/extras/{id})."""
+    item_dir: str             # its title's folder
+    inbox_dir: str
+    staging_dir: str          # <workRoot>/staging/extra-<extraId>
+    extra_dir: str            # <itemDir>/extras/<extraId>
+    recorded: bool
+    # What extra.json takes from the catalog: kind, title, localizedTitles,
+    # language, seasonNumber, origin, createdAt, createdBy.
+    record: dict[str, Any]
+    # The file the package is made from, {name, sizeBytes, qh1}, as the
+    # catalog took it in; None when the record names none.
+    original: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class Handover:
+    """The catalog's answer to a v2 packaging-complete: `taken` only for a
+    2xx; `status` is None when it didn't answer at all, and `error` says
+    why it wasn't taken."""
+    taken: bool
+    status: int | None
+    answer: dict[str, Any]
+    error: str | None
+
+
+def _block(raw: Any, where: str) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise LibraryRecordError(f"worker record: {where} is not an object")
+    return raw
+
+
+def _contract(lib: dict[str, Any]) -> None:
+    contract = lib.get("contract")
+    if contract != LIBRARY_CONTRACT or isinstance(contract, bool):
+        raise LibraryRecordError(
+            f"worker record: library contract {contract!r} is not supported "
+            f"(this packager writes contract {LIBRARY_CONTRACT})")
+
+
+def _abs_path(obj: dict[str, Any], key: str, where: str) -> str:
+    """An absolute, normalised path: no '..', no '//', no trailing '/'."""
+    value = obj.get(key)
+    if not isinstance(value, str) or not os.path.isabs(value) or os.path.normpath(value) != value:
+        raise LibraryRecordError(f"worker record: {where}.{key} is not an absolute path: {value!r}")
+    return value
+
+
+def _uuid(obj: dict[str, Any], key: str, where: str) -> str:
+    value = obj.get(key)
+    if not isinstance(value, str) or not _UUID.fullmatch(value):
+        raise LibraryRecordError(
+            f"worker record: {where}.{key} is not a lower-case UUID: {value!r}")
+    return value
+
+
+def _size(value: Any, where: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise LibraryRecordError(f"worker record: {where} is not a size: {value!r}")
+    return value
+
+
+def _qh1(value: Any, where: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _QH1.fullmatch(value):
+        raise LibraryRecordError(f"worker record: {where} is not sha256:<hex>: {value!r}")
+    return value
+
+
+def _in(path: str, folder: str, name: str, where: str) -> None:
+    """The record's own rule for a folder (contract section 2.1), checked,
+    never applied: the packager renames into these folders, so one the rule
+    doesn't give is refused rather than written."""
+    want = os.path.join(folder, name)
+    if path != want:
+        raise LibraryRecordError(f"worker record: {where} {path} is not {want}")
+
+
+def _marks(value: Any, where: str) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise LibraryRecordError(f"worker record: {where} is not a list")
+    return [m for m in value if isinstance(m, dict)]
+
+
+def parse_item_library(raw: Any) -> ItemLibrary:
+    """An item record's library block. Raises LibraryRecordError when it
+    can't be worked from — and with the catalog's own words when it says
+    the item can't be recorded yet (`blocked`)."""
+    lib = _block(raw, "library")
+    _contract(lib)
+    blocked = lib.get("blocked")
+    if blocked is not None:
+        if not isinstance(blocked, str) or not blocked.strip():
+            raise LibraryRecordError(f"worker record: library.blocked is not a reason: {blocked!r}")
+        raise LibraryRecordError(blocked.strip())
+    root = _abs_path(lib, "root", "library")
+    item_dir = _abs_path(lib, "itemDir", "library")
+    if not item_dir.startswith(root.rstrip("/") + "/"):
+        raise LibraryRecordError(f"worker record: library.itemDir {item_dir} is not under {root}")
+    src = _block(lib.get("source"), "library.source")
+    source = LibrarySource(
+        source_id=_uuid(src, "sourceId", "library.source"),
+        recorded=src.get("recorded") is True,
+        record_dir=_abs_path(src, "recordDir", "library.source"),
+        library_path=src.get("libraryPath") if isinstance(src.get("libraryPath"), str) else "",
+        size_bytes=_size(src.get("sizeBytes"), "library.source.sizeBytes"),
+        qh1=_qh1(src.get("qh1"), "library.source.qh1"),
+    )
+    _in(source.record_dir, os.path.join(item_dir, "sources"), source.source_id,
+        "library.source.recordDir")
+    b = _block(lib.get("build"), "library.build")
+    chapters_from = b.get("chaptersFrom")
+    build = LibraryBuild(
+        version_id=_uuid(b, "versionId", "library.build"),
+        staging_dir=_abs_path(b, "stagingDir", "library.build"),
+        version_dir=_abs_path(b, "versionDir", "library.build"),
+        created_by=b["createdBy"] if isinstance(b.get("createdBy"), str) else "",
+        chapters=_marks(b.get("chapters"), "library.build.chapters"),
+        chapters_from=chapters_from if isinstance(chapters_from, str) else None,
+        segments=_marks(b.get("segments"), "library.build.segments"),
+    )
+    _in(build.version_dir, os.path.join(item_dir, "versions"), build.version_id,
+        "library.build.versionDir")
+    _in(build.staging_dir, os.path.dirname(build.staging_dir), build.version_id,
+        "library.build.stagingDir")
+    current = lib.get("current")
+    return ItemLibrary(
+        root=root, item_dir=item_dir,
+        inbox_dir=_abs_path(lib, "inboxDir", "library"),
+        source=source, build=build,
+        current=current if isinstance(current, dict) else None,
+    )
+
+
+def parse_extra_library(raw: Any, extra_id: str) -> ExtraLibrary:
+    """An extra record's library block, for the extra `extra_id`. Raises
+    LibraryRecordError when it can't be worked from."""
+    lib = _block(raw, "library")
+    _contract(lib)
+    item_dir = _abs_path(lib, "itemDir", "library")
+    staging_dir = _abs_path(lib, "stagingDir", "library")
+    extra_dir = _abs_path(lib, "extraDir", "library")
+    _in(extra_dir, os.path.join(item_dir, "extras"), extra_id, "library.extraDir")
+    _in(staging_dir, os.path.dirname(staging_dir), f"extra-{extra_id}", "library.stagingDir")
+    original = lib.get("original")
+    if original is not None:
+        original = _block(original, "library.original")
+        _size(original.get("sizeBytes"), "library.original.sizeBytes")
+        _qh1(original.get("qh1"), "library.original.qh1")
+    return ExtraLibrary(
+        item_dir=item_dir,
+        inbox_dir=_abs_path(lib, "inboxDir", "library"),
+        staging_dir=staging_dir,
+        extra_dir=extra_dir,
+        recorded=lib.get("recorded") is True,
+        record=_block(lib.get("record"), "library.record"),
+        original=original,
+    )
 
 
 @dataclass
@@ -77,9 +309,16 @@ class ClaimedItem:
     # entry. Empty when the record has none.
     track_languages: list[dict[str, Any]] = field(default_factory=list)
     # Subtitle files next to the source: [{"path": "/abs/movie.en.srt",
-    # "language": "eng", "label": "English", "forced": false}]. Passed on
-    # as sent, like track_languages.
+    # "language": "eng", "label": "English", "forced": false}], with the
+    # catalog's id of each ("id") in a library v2 record. Passed on as
+    # sent, like track_languages.
     subtitle_files: list[dict[str, Any]] = field(default_factory=list)
+    # The library block (v2): None in a record without one, which packages
+    # into the package store as always. library_error says why a record's
+    # block can't be worked from (or the catalog's `blocked`); the step then
+    # fails with it.
+    library: ItemLibrary | None = None
+    library_error: str | None = None
 
     @property
     def tmdb_id(self) -> str | None:
@@ -91,6 +330,12 @@ class ClaimedItem:
 
     @classmethod
     def from_json(cls, body: dict[str, Any]) -> ClaimedItem:
+        library, library_error = None, None
+        if body.get("library") is not None:
+            try:
+                library = parse_item_library(body["library"])
+            except LibraryRecordError as e:
+                library_error = str(e)
         return cls(
             id=body["id"],
             type=body["type"],
@@ -105,6 +350,8 @@ class ClaimedItem:
             movie_tmdb_id=body.get("movieTmdbId"),
             track_languages=_objects(body.get("trackLanguages")),
             subtitle_files=_objects(body.get("subtitleFiles")),
+            library=library,
+            library_error=library_error,
         )
 
 
@@ -132,11 +379,21 @@ class ClaimedExtra:
     # The catalog answers 404 for a removed extra; a record that says it
     # was removed all the same is treated as gone.
     removed: bool = False
+    # The library block (v2), as an item's: None without one; why one
+    # can't be worked from in library_error.
+    library: ExtraLibrary | None = None
+    library_error: str | None = None
 
     @classmethod
     def from_json(cls, extra_id: str, body: dict[str, Any]) -> ClaimedExtra:
         """The record of `extra_id`, the id the request named: it names
         the extra's inbox and package folders."""
+        library, library_error = None, None
+        if body.get("library") is not None:
+            try:
+                library = parse_extra_library(body["library"], extra_id)
+            except LibraryRecordError as e:
+                library_error = str(e)
         return cls(
             id=extra_id,
             parent_id=str(body.get("parentId") or ""),
@@ -147,6 +404,8 @@ class ClaimedExtra:
             parent_title=str(body.get("parentTitle") or ""),
             language=str(body.get("language") or ""),
             removed=bool(body.get("removedAt") or body.get("removed")),
+            library=library,
+            library_error=library_error,
         )
 
 
@@ -336,6 +595,32 @@ class KatalogClient:
                 error=str(e)[:200],
             )
 
+    def packaging_complete_v2(self, item_id: str, payload: dict[str, Any]) -> Handover:
+        """Hand the catalog a version the packager put in the library tree
+        (contract section 2.5): the step is done only when this is taken,
+        a 2xx. A 409 (a stale version: a re-encode started meanwhile), a
+        422 (a broken chain) or no answer at all is not."""
+        return self._hand_over(f"/api/items/{item_id}/packaging-complete", payload,
+                               item_id=item_id)
+
+    def _hand_over(self, path: str, payload: dict[str, Any], **ids: str) -> Handover:
+        try:
+            resp = self._request("POST", path, json=payload)
+        except Exception as e:
+            log.warning("packaging_complete.exception", **ids, error=str(e)[:200])
+            return Handover(False, None, {}, f"no answer: {str(e)[:200]}")
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        answer = body if isinstance(body, dict) else {}
+        if not 200 <= resp.status_code < 300:
+            log.warning("packaging_complete.refused", **ids, status=resp.status_code,
+                        body=resp.text[:300])
+            return Handover(False, resp.status_code, answer,
+                            f"the catalog answered {resp.status_code}: {resp.text.strip()[:300]}")
+        return Handover(True, resp.status_code, answer, None)
+
     # ------------------------------------------------------------- extras
     def get_extra(self, extra_id: str) -> ClaimedExtra | None:
         """Fetch one extra's worker record, from the extraId on a consumed
@@ -418,6 +703,12 @@ class KatalogClient:
         except ValueError:
             return {}
         return answer if isinstance(answer, dict) else {}
+
+    def extra_packaging_complete_v2(self, extra_id: str, payload: dict[str, Any]) -> Handover:
+        """Hand the catalog an extra the packager put in its title's
+        extras/<extraId>/ (contract section 2.6). Taken only with a 2xx."""
+        return self._hand_over(f"/api/extras/{extra_id}/packaging-complete", payload,
+                               extra_id=extra_id)
 
     def fail(self, item_id: str, reason: str) -> None:
         """Catastrophic-failure fallback (source file missing, etc.).
