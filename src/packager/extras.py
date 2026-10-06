@@ -42,6 +42,13 @@ Per message, as the item loop does it (worker.run_worker):
      and the handoff removed. When it hasn't, the step fails, unlike an
      item's, which is done regardless: only the catalog's word makes an
      extra playable, so its retry runs the chain again.
+
+A record with a library block (library v2) is packaged into its title's
+`extras/<extraId>/` in the library tree instead, built in the record's
+staging folder and renamed into place (library.package_extra), from the
+record's inbox, else from a handoff left in `_inbox/extra-<extraId>/`
+before the layout switched. Its packaging-complete takes the v2 payload;
+the step is done, as always, only once the catalog has taken it.
 """
 
 from __future__ import annotations
@@ -55,11 +62,12 @@ from typing import Any
 
 import structlog
 
+from . import library
 from .events import build_consumer, is_retry, parse_envelope, parse_extra_id
 from .katalog import ClaimedExtra, KatalogClient
 from .packager import PACKAGES_ROOT, PackageOptions, iso639_2, package_item
 from .renditions import ContractError, resolve_inputs
-from .worker import _parse_settings, _source_block
+from .worker import _details, _parse_settings, _source_block
 
 log = structlog.get_logger(__name__)
 
@@ -105,20 +113,6 @@ def _text(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _details(manifest: dict[str, Any], seconds: float) -> str:
-    """The `done` step's details, as an item's read."""
-    renditions = manifest.get("renditions") or {}
-    video = renditions.get("video") or []
-    surround = renditions.get("audioSurround") or []
-    codec = video[0].get("codec") if video else "?"
-    return (
-        f"v={codec} a={len(renditions.get('audio') or [])} "
-        f"subs={len(manifest.get('subtitles') or [])} dur_s={seconds}"
-        + (f" vr={len(video)}" if len(video) > 1 else "")
-        + (f" a51={len(surround)}" if surround else "")
-    )
-
-
 def _process_extra(
     extra: ClaimedExtra,
     envelope: dict[str, Any],
@@ -127,7 +121,17 @@ def _process_extra(
 ) -> None:
     """Package one extra into extras/<aa>/<extraId>/ and hand its package
     to the catalog. Every outcome is written to the extra's package step:
-    in_progress at the start, then done or failed."""
+    in_progress at the start, then done or failed. A record with a library
+    block packages into its title's extras/<extraId>/ in the library v2
+    tree instead (_process_extra_library); one whose block can't be worked
+    from fails the step."""
+    if extra.library_error is not None:
+        log.warning("packager.extra.library_refused", extra_id=extra.id, error=extra.library_error)
+        client.upsert_extra_step(extra.id, "failed", error=extra.library_error[:500])
+        return
+    if extra.library is not None:
+        _process_extra_library(extra, client, options)
+        return
     # The record names the title and the kind; the event's are the fallback.
     parent_id = extra.parent_id or _text(envelope.get("parentId"))
     kind = extra.kind or _text(envelope.get("kind"))
@@ -174,12 +178,7 @@ def _process_extra(
     # The language settings at claim time, as for an item: the DEFAULT=YES
     # pick and the visibility of a trailer's tracks follow the operator's.
     language_whitelist, keep_original = _parse_settings(client.settings())
-    # What the extra speaks, when the catalog names it, names its first
-    # audio track over the file's own tag, as a title's track languages
-    # do: a trailer is one picture with one sound, and the file's tag is
-    # often und, or wrong (one registered as zxx has no dialogue).
-    language = iso639_2(extra.language)
-    track_languages = [{"kind": "audio", "ordinal": 0, "language": language}] if language else None
+    track_languages = _track_languages(extra)
 
     t0 = time.monotonic()
     try:
@@ -224,6 +223,73 @@ def _process_extra(
         details=details,
         packaged=answer.get("packaged"),
     )
+
+
+def _track_languages(extra: ClaimedExtra) -> list[dict[str, Any]] | None:
+    """What the extra speaks, when the catalog names it, names its first
+    audio track over the file's own tag, as a title's track languages do:
+    a trailer is one picture with one sound, and the file's tag is often
+    und, or wrong (one registered as zxx has no dialogue)."""
+    language = iso639_2(extra.language)
+    return [{"kind": "audio", "ordinal": 0, "language": language}] if language else None
+
+
+def _process_extra_library(
+    extra: ClaimedExtra,
+    client: KatalogClient,
+    options: PackageOptions | None = None,
+) -> None:
+    """Package an extra whose record carries a library block into its
+    title's extras/<extraId>/ (library.package_extra) and hand it to the
+    catalog (contract section 2.6). Done only once the catalog has taken
+    it, as for every extra."""
+    lib = extra.library
+    assert lib is not None
+    if not extra.path:
+        log.warning("packager.extra.no_path", extra_id=extra.id)
+        client.upsert_extra_step(extra.id, "failed", error="the extra's record has no path")
+        return
+    try:
+        inputs, inbox = library.handoff(lib.inbox_dir, extra_inbox_dir(extra.id), extra.path)
+    except ContractError as e:
+        log.warning("packager.extra.bad_handoff", extra_id=extra.id, error=str(e))
+        client.upsert_extra_step(extra.id, "failed", error=f"transcoder handoff: {e}"[:500])
+        return
+    effective_path = str(inputs.primary.path)
+    log.info("packager.extra.start", extra_id=extra.id, kind=extra.kind, title=extra.title,
+             path=effective_path, source=inputs.kind, video_renditions=len(inputs.video),
+             layout="v2", extra_dir=lib.extra_dir)
+    if not os.path.exists(effective_path):
+        log.warning("packager.extra.missing_file", extra_id=extra.id, path=effective_path)
+        client.upsert_extra_step(extra.id, "failed", error=f"source file missing: {effective_path}")
+        return
+
+    client.upsert_extra_step(extra.id, "in_progress")
+    language_whitelist, keep_original = _parse_settings(client.settings())
+    t0 = time.monotonic()
+    try:
+        placed = library.package_extra(
+            extra, inputs, options=options or PackageOptions(),
+            language_whitelist=language_whitelist, keep_original_if_single=keep_original,
+            track_languages=_track_languages(extra))
+    except Exception as e:
+        log.exception("packager.extra.failed", extra_id=extra.id, error=str(e)[:300])
+        client.upsert_extra_step(extra.id, "failed", error=str(e)[:500])
+        return
+    seconds = round(time.monotonic() - t0, 2)
+
+    payload = library.extra_payload(extra.id, lib, placed, _source_block(inputs, extra.path))
+    handed = client.extra_packaging_complete_v2(extra.id, payload)
+    if not handed.taken:
+        client.upsert_extra_step(extra.id, "failed",
+                                 error=f"packaging-complete: {handed.error}"[:500])
+        return
+    details = _details(placed.package, seconds)
+    client.upsert_extra_step(extra.id, "done", details=details)
+    library.finish(lib.staging_dir, inbox, Path(lib.inbox_dir))
+    log.info("packager.extra.done", extra_id=extra.id, kind=extra.kind, details=details,
+             package_id=placed.package.get("packageId"),
+             reported_again=placed.reported_again or None)
 
 
 def _handle_extra(

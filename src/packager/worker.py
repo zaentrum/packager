@@ -31,6 +31,14 @@ the original for a stream-copied rung), or just `prepared.mkv` from an
 older transcoder. `packager.renditions.resolve_inputs` reads it. When no
 handoff exists (the transcoder marked the source not_applicable because
 it was already HEVC) we fall through to the original source path.
+
+Library v2: a worker record with a `library` block is packaged into the
+title's record in the library tree instead (library.package_version):
+from the record's inboxDir, else from a handoff left in
+`{PACKAGES_ROOT}/_inbox/{itemId}/` before the layout switched — never
+from the original while the transcode step says done and its handoff is
+gone. Its packaging-complete takes the v2 payload, and the step is done
+only once the catalog has taken it.
 """
 
 from __future__ import annotations
@@ -44,6 +52,7 @@ from typing import Any
 
 import structlog
 
+from . import library
 from .events import build_consumer, is_retry, parse_envelope, parse_item_id
 from .katalog import ClaimedItem, KatalogClient
 from .packager import PACKAGES_ROOT, PackageOptions, package_item, probe_source
@@ -54,6 +63,8 @@ log = structlog.get_logger(__name__)
 # The owning step for this worker. If it's already finished on a
 # redelivered event we skip the (expensive) packaging work.
 PACKAGE_STEP = "package"
+# The transcoder's step: done means it left a handoff.
+TRANSCODE_STEP = "transcode"
 
 # The package step's statuses that need no run: `done` (packaged), and
 # `not_applicable` / `skipped` (final by the catalog's word). The catalog
@@ -124,6 +135,22 @@ def _parse_settings(raw: dict[str, str]) -> tuple[list[str], bool]:
     return whitelist, keep_original
 
 
+def _details(manifest: dict[str, Any], seconds: float) -> str:
+    """The `done` step's details: the top rung's codec, the audio and
+    subtitle counts and the run's seconds, the ladder and the 5.1 group
+    where there are any. Read from a manifest or a package.json alike."""
+    renditions = manifest.get("renditions") or {}
+    video = renditions.get("video") or []
+    surround = renditions.get("audioSurround") or []
+    codec = video[0].get("codec") if video else "?"
+    return (
+        f"v={codec} a={len(renditions.get('audio') or [])} "
+        f"subs={len(manifest.get('subtitles') or [])} dur_s={seconds}"
+        + (f" vr={len(video)}" if len(video) > 1 else "")
+        + (f" a51={len(surround)}" if surround else "")
+    )
+
+
 def _process_one(
     item: ClaimedItem,
     client: KatalogClient,
@@ -132,7 +159,18 @@ def _process_one(
     """Run packaging for one item. Heartbeats the package step at start
     (in_progress) and end (done / failed). The step-status writes here
     are the STATE the Activity monitor reads — they are the source of
-    truth for pipeline progress, not the (now removed) claim state."""
+    truth for pipeline progress, not the (now removed) claim state.
+
+    A record with a library block packages into the library v2 tree
+    (_process_library); one whose block can't be worked from fails the
+    step, and is never packaged into the package store instead."""
+    if item.library_error is not None:
+        log.warning("packager.item.library_refused", item_id=item.id, error=item.library_error)
+        client.upsert_step(item.id, "failed", error=item.library_error[:500])
+        return
+    if item.library is not None:
+        _process_library(item, client, options)
+        return
     try:
         inputs = resolve_inputs(_INBOX_ROOT / item.id, item.path)
     except ContractError as e:
@@ -247,6 +285,72 @@ def _process_one(
         audio_tracks=len(audio_renditions),
         subtitles=len(subtitles),
     )
+
+
+def _process_library(
+    item: ClaimedItem,
+    client: KatalogClient,
+    options: PackageOptions | None = None,
+) -> None:
+    """Package an item whose worker record carries a library block into
+    its version folder (library.package_version) and hand the version to
+    the catalog (contract section 2.5). The step is done only once the
+    catalog has taken it, a 2xx; until then the staging folder and the
+    handoff stay. A version in the record the catalog refused (a stale
+    version, a broken chain) stays as it is, and the step fails."""
+    lib = item.library
+    assert lib is not None
+    legacy_inbox = _INBOX_ROOT / item.id
+    try:
+        inputs, inbox = library.handoff(lib.inbox_dir, legacy_inbox, item.path)
+    except ContractError as e:
+        log.warning("packager.item.bad_handoff", item_id=item.id, error=str(e))
+        client.upsert_step(item.id, "failed", error=f"transcoder handoff: {e}"[:500])
+        return
+    if inbox is None and client.get_steps(item.id).get(TRANSCODE_STEP) == "done":
+        # Its handoff is gone: packaging the original instead would make a
+        # package of another encode than the one the step reported.
+        msg = (f"the transcode step is done, but its handoff is in neither {lib.inbox_dir} nor "
+               f"{legacy_inbox}: transcode the item again")
+        log.warning("packager.item.handoff_missing", item_id=item.id)
+        client.upsert_step(item.id, "failed", error=msg[:500])
+        return
+    effective_path = str(inputs.primary.path)
+    log.info("packager.item.start", item_id=item.id, title=item.title, type=item.type,
+             path=effective_path, source=inputs.kind, video_renditions=len(inputs.video),
+             layout="v2", version_id=lib.build.version_id)
+    if not os.path.exists(effective_path):
+        log.warning("packager.item.missing_file", item_id=item.id, path=effective_path)
+        client.upsert_step(item.id, "failed", error=f"source file missing: {effective_path}")
+        return
+
+    client.upsert_step(item.id, "in_progress")
+    language_whitelist, keep_original = _parse_settings(client.settings())
+    t0 = time.monotonic()
+    try:
+        placed = library.package_version(
+            item, inputs, options=options or PackageOptions(),
+            language_whitelist=language_whitelist, keep_original_if_single=keep_original)
+    except Exception as e:
+        log.exception("packager.item.failed", item_id=item.id, error=str(e)[:300])
+        client.upsert_step(item.id, "failed", error=str(e)[:500])
+        return
+    seconds = round(time.monotonic() - t0, 2)
+
+    payload = library.version_payload(lib, placed, _source_block(inputs, item.path))
+    handed = client.packaging_complete_v2(item.id, payload)
+    if not handed.taken:
+        # In the record, unknown to the catalog: nothing plays it. The
+        # version folder stays as it is; a retry reports it again.
+        client.upsert_step(item.id, "failed", error=f"packaging-complete: {handed.error}"[:500])
+        return
+    details = _details(placed.package, seconds)
+    client.upsert_step(item.id, "done", details=details)
+    library.finish(lib.build.staging_dir, inbox, Path(lib.inbox_dir))
+    log.info("packager.item.done", item_id=item.id, title=item.title, seconds=seconds,
+             version_id=lib.build.version_id, package_id=placed.package.get("packageId"),
+             reported_again=placed.reported_again or None, details=details,
+             superseded=handed.answer.get("superseded"))
 
 
 def _handle_message(
