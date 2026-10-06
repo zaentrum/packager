@@ -17,6 +17,11 @@ an older transcoder. The packager packages every rendition into one HLS
 master (`packager.renditions`, `packager.hls`); without a handoff it
 packages the original source.
 
+When the catalog runs the library v2 layout, the worker record carries a
+`library` block and the packager writes the title's source and version
+folders into the library tree instead, each built in the work tree's
+staging folder and renamed into place in one step (`packager.library`).
+
 Runs in its own pod (katalog-packager) — split out of katalog-analyzer
 so a packager OOM / codec crash doesn't take down the analyzer's
 in-memory TIDB sweep or per-file ML pipelines.

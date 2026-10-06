@@ -313,6 +313,108 @@ volume at `/var/lib/katalog`, which covers it.
 creates topics on first use. Until it does, the extras consumer logs a
 warning now and then, and the item loop is unaffected.
 
+## Library v2
+
+When the catalog runs the library v2 layout (its setting `library.layout`
+is `v2`), both worker records carry a `library` block (contract
+`platform-library/1`): the folders of the title's record in the library
+tree, its work tree's inbox and staging folders, the original's source
+record and the version to build. The packager then writes into the
+title's record instead of the package store. Every path comes from the
+record; the packager never works one out. A record without the block is
+packaged exactly as above. A block the packager can't work from (another
+contract, a path that isn't absolute or doesn't follow the record's own
+rules) fails the step and is never packaged into the package store
+instead; a block whose `blocked` says why the item can't be recorded yet
+fails the step with those words.
+
+```
+<itemDir>/sources/<sourceId>/    source.json  ffprobe.json  <sidecar copies>  checksums.sha256
+<itemDir>/versions/<versionId>/  version.json  hls/  subs/  trickplay/
+                                 checksums.sha256  package.json  .complete
+<itemDir>/extras/<extraId>/      extra.json  hls/  subs/  checksums.sha256  package.json  .complete
+<workRoot>/staging/<versionId>/       .packaging  source/  version/      a run, until its handover
+<workRoot>/staging/extra-<extraId>/   .packaging  extra/
+```
+
+Each folder is written once, built in staging and renamed into place in
+one step, so a reader sees all of it or nothing. A run:
+
+1. removes what an earlier run of the version left in its staging folder
+   and writes the sentinel `.packaging` (`{startedAt, pid, host}`);
+2. builds the package in `version/`, as above (`hls/`, `subs/`,
+   `trickplay/`);
+3. unless the source is recorded already, builds `source/`: the
+   original's verbatim probe (`ffprobe.json`), a copy of every subtitle
+   file the record names and of the original's `<stem>.nfo`, `.jpg`,
+   `.png` and `.txt` (up to 10 MB; a name taken already gets `-1`, `-2`,
+   … before its extension), `source.json`, and `checksums.sha256` last;
+4. writes `version.json`: the catalog's chapters (else the original's
+   own) and detected ranges, the edition the file name claims, the
+   presentation and runtime the probe says, no original kept;
+5. closes the chain: `checksums.sha256` over `version.json` and every
+   package file, `package.json` with the checksums file's hash, then
+   `.complete` with `sha256:<hex of package.json>`; then checks that the
+   package is whole (as above) and that the chain holds;
+6. renames `source/` into `sources/<sourceId>/` (one there with its
+   checksums stays as it is; one there without them fails the run), then
+   `version/` into `versions/<versionId>/`;
+7. hands the version to the catalog (`POST /api/items/{id}/packaging-complete`
+   with `layout: v2`: the version and package ids, `versionDir`, the
+   `.complete` value, `package.json` as written, the source id, the
+   sidecars — each subtitle file's catalog id mapped to the rendition made
+   from it — and the source block). Only a 2xx makes the step `done`;
+   then the staging folder and the handoff go. A refusal (409: a stale
+   version; 422: a broken chain) fails the step and leaves the version
+   where it is.
+
+A run that fails removes its staging folder; one that dies leaves it, and
+the next run of the version starts clean. A run that died between the two
+renames finds the source in place and builds only the version. A version
+folder already in place and whole is the work of a run whose handover was
+lost: the next run hands it over again as it is, without building
+anything. Nothing in the record is ever written over: a version or extra
+folder that is there but not whole fails the run. The original must be
+the file the catalog recorded at its arrival (its size and `qh1`), else
+the run fails.
+
+**The records' contents** are the schemas repository's record logic,
+`src/packager/libv2_records.py`, vendored byte for byte (the migration
+writes its records with the same code, and the deletion gate is computed
+from them); `tests/test_libv2_records.py` pins its hash and compares the
+packager's own records against the golden ones of the same commit. To take
+a new copy, copy `tools/libv2_records.py` and `tools/testdata/libv2_records/`
+from the schemas repository at one commit and update the test's values.
+The packager adds what only it knows: which stream of the original each
+rendition was made from. Every package is `canonical`: no original is
+kept beside it, and the catalog deletes the original once the package is
+recorded. A subtitle made from a file next to the original names its copy
+(`fromSidecar: "sources/<sourceId>/<name>"`). No subtitle is `default` in
+`package.json`, as no subtitle is DEFAULT=YES in the master: the record
+forbids a forced track flagged default, which `manifest.json` uses to say
+"show it by itself".
+
+**HEVC only.** A v2 package's video is HEVC: the original's copied, or
+the transcoder's HEVC encode of it. A v0 in another codec fails the run;
+a lower rung in another is left out.
+
+**Inputs.** The transcoder's handoff in the record's `inboxDir`; else one
+it left in the package store's `_inbox/<itemId>/` (`_inbox/extra-<extraId>/`)
+for a transcode that finished before the layout switched; else the
+original — but never while the item's transcode step says `done`: its
+handoff is gone, and the run fails.
+
+**Extras** go into their title's `extras/<extraId>/` the same way, built
+in `extra/` of their staging folder: `extra.json` (what the catalog took
+the extra in as, the packager's probe of its file, and that file in
+`packagedFrom`; the folder keeps no original), the package (no
+trickplay), the chain over `extra.json` and the package, one rename. Their
+handover is `POST /api/extras/{id}/packaging-complete` with `layout: v2`.
+
+**Startup sweep.** Besides the package store, the sweep at startup walks
+`<WORK_ROOT>/staging/` only — never the library — and removes the entries
+of runs that started more than a day ago.
+
 ## Layout
 
 ```
@@ -325,6 +427,9 @@ src/packager/extras.py      # the extras' consumer loop: trailers and other bonu
 src/packager/renditions.py  # reads the transcoder handoff (renditions.json)
 src/packager/packager.py    # ffmpeg remux + shaka-packager + trickplay + subtitles
 src/packager/hls.py         # master playlist assembly + RFC 8216 bit rates
+src/packager/library.py     # library v2: staging, the chain, the renames into the record
+src/packager/records.py     # library v2: what source.json, version.json, package.json, extra.json say
+src/packager/libv2_records.py  # the schemas repository's record logic, vendored byte for byte
 scripts/                    # one-off backfill / diagnostics helpers
 k8s/                        # Deployment, Service, ServiceAccount, ServiceMonitor, GrafanaDashboard
 Dockerfile
@@ -344,6 +449,7 @@ Dockerfile
 | `HLS_SUBTITLES` | `false` | Reference the WebVTT renditions from the master |
 | `PREFERRED_LANGUAGES` | (empty) | DEFAULT=YES language order, e.g. `de,en`; empty = whitelist order |
 | `OLD_PACKAGE_GRACE_SECONDS` | `600` | How long a package replaced by a new one stays on disk for the requests that started on it (see "Packaging again"); keep it well above the NFS mounts' attribute cache time |
+| `WORK_ROOT` | `/var/lib/katalog/.work` | The library v2 work tree, on the library's share: the startup sweep clears dead runs in its `staging/` (see [Library v2](#library-v2)). A run's own paths come from its worker record |
 
 ## Local development
 
@@ -354,7 +460,14 @@ pytest
 
 Unit tests need nothing installed. `tests/test_package_real.py`
 packages a generated clip end to end when `ffmpeg`, `ffprobe` and
-shaka-packager's `packager` are on `PATH`.
+shaka-packager's `packager` are on `PATH`; `tests/test_library_real.py`
+does so into the library v2 tree (an HEVC clip, so ffmpeg needs
+libx265). It also validates the tree it writes with the schemas
+repository's `validate-library-v2.py --check-checksums` when a checkout
+of it is beside this one (or `ZAENTRUM_SCHEMAS` names one) whose schemas
+know the platform's additive package and extra fields, and a Python with
+`jsonschema` and `referencing` can run it (this one, or
+`LIBRARY_V2_PYTHON`).
 
 ## Build the container
 
