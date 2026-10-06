@@ -160,10 +160,11 @@ def _catalogs_part(item_dir: Path, item_type: str = "movie", title: str = "Clip"
         "titles": {"primary": title}, "images": []}))
 
 
-def _validator() -> tuple[list[str], Path] | None:
+def _validator(extras: bool) -> list[str] | None:
     """The validator and the Python to run it with, when there is a schemas
-    checkout whose package and extra schemas have the platform's additive
-    fields (S1, S2), and a Python with jsonschema and referencing."""
+    checkout whose package schema has the platform's additive fields (S1)
+    — and, for a tree with an extra, whose extra schema has packagedFrom
+    (S2) — and a Python with jsonschema and referencing."""
     root = Path(os.environ.get("ZAENTRUM_SCHEMAS")
                 or Path(__file__).resolve().parents[2] / "schemas")
     tool = root / "tools" / "validate-library-v2.py"
@@ -176,20 +177,20 @@ def _validator() -> tuple[list[str], Path] | None:
     except (OSError, ValueError):
         return None
     if "audioSurround" not in package["properties"]["renditions"]["properties"] \
-            or "packagedFrom" not in extra["properties"]:
+            or (extras and "packagedFrom" not in extra["properties"]):
         return None
     python = os.environ.get("LIBRARY_V2_PYTHON") or sys.executable
     ok = subprocess.run([python, "-c", "import jsonschema, referencing"], capture_output=True)
     if ok.returncode != 0:
         return None
-    return [python, str(tool), "--schemas", str(schemas)], root
+    return [python, str(tool), "--schemas", str(schemas)]
 
 
-def _validate(lib: Path) -> None:
-    found = _validator()
-    if found is None:
-        pytest.skip("no schemas checkout with S1/S2 and no Python with jsonschema to validate with")
-    cmd, _root = found
+def _validate(lib: Path, *, extras: bool = False) -> None:
+    cmd = _validator(extras)
+    if cmd is None:
+        pytest.skip("no schemas checkout with the platform's fields, or no Python with "
+                    "jsonschema, to validate with")
     out = subprocess.run([*cmd, "--check-checksums", str(lib)], capture_output=True, text=True)
     assert out.returncode == 0, out.stdout + out.stderr
     assert out.stdout.rstrip().endswith("OK"), out.stdout
@@ -328,7 +329,7 @@ def test_an_extra_on_an_hevc_ladder_lands_in_its_titles_extras(
     assert catalog.handovers[0]["extraDir"] == str(xdir)
 
     _catalogs_part(title_dir)
-    _validate(lib)
+    _validate(lib, extras=True)
 
 
 def test_a_v2_run_that_meets_its_version_in_place_reports_it_again(
