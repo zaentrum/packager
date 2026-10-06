@@ -35,6 +35,8 @@ where = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Vendored byte for byte from the schemas repository (tests/test_libv2_records.py).
+extend-exclude = ["src/packager/libv2_records.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "RUF"]
