@@ -1,0 +1,320 @@
+{
+  "schema": "zaentrum.library.source/2",
+  "sourceId": "8bca399e-7836-5df6-a6a1-edf538b03074",
+  "takenAt": "2026-10-06T10:00:00Z",
+  "takenBy": "packager",
+  "file": {
+    "name": "Example Film (2024) - 2160p.mkv",
+    "kind": "stream-container",
+    "sizeBytes": 200000,
+    "mtime": "2026-10-06T09:00:00Z",
+    "fixity": {
+      "qh1": "sha256:a09d4d4b2ad43c07b5cde7d04945457fe720122ec870a7e9b119078fedc56a4d"
+    }
+  },
+  "origin": {
+    "libraryPath": "Example Film (2024)/Example Film (2024) - 2160p.mkv",
+    "takenBy": "import",
+    "folder": "Example Film (2024)"
+  },
+  "labels": {
+    "quality": "2160p",
+    "medium": null,
+    "resolution": "2160p",
+    "edition": null,
+    "folderEdition": null
+  },
+  "container": {
+    "format": "matroska,webm",
+    "durationMs": 60000,
+    "bitrate": 2000000,
+    "title": "Example Film",
+    "muxingApp": null,
+    "writingApp": null,
+    "creationTime": null,
+    "tags": {
+      "title": "Example Film",
+      "ENCODER": "libmatroska"
+    }
+  },
+  "fidelity": {
+    "class": "derivative",
+    "fingerprint": "hevc/main 10/10bit/hdr10/3840x1608",
+    "evidence": [
+      {
+        "signal": "encoder-tag",
+        "value": "Lavc61.3.100 libx265",
+        "weight": 0.9
+      }
+    ]
+  },
+  "streams": [
+    {
+      "index": 0,
+      "codec": "hevc",
+      "language": "und",
+      "languageRaw": "und",
+      "title": null,
+      "dispositions": {
+        "default": true,
+        "forced": false,
+        "original": false,
+        "dub": false,
+        "commentary": false,
+        "hearingImpaired": false,
+        "visualImpaired": false
+      },
+      "type": "video",
+      "profile": "Main 10",
+      "level": 153,
+      "bitDepth": 10,
+      "pixelFormat": "yuv420p10le",
+      "width": 3840,
+      "height": 1608,
+      "sampleAspectRatio": "1:1",
+      "displayAspectRatio": "160:67",
+      "frameRate": "24000/1001",
+      "fieldOrder": "progressive",
+      "bitrate": null,
+      "colour": {
+        "primaries": "bt2020",
+        "transfer": "smpte2084",
+        "matrix": "bt2020nc",
+        "range": "tv"
+      },
+      "hdr": {
+        "format": "hdr10",
+        "masteringDisplay": {
+          "red_x": "34000/50000",
+          "red_y": "16000/50000",
+          "max_luminance": "10000000/10000",
+          "min_luminance": "50/10000"
+        },
+        "contentLightLevel": {
+          "max_content": 1000,
+          "max_average": 400
+        },
+        "dolbyVision": null
+      },
+      "stereo3d": null,
+      "closedCaptions": false,
+      "encoder": "Lavc61.3.100 libx265"
+    },
+    {
+      "index": 1,
+      "codec": "eac3",
+      "language": "en",
+      "languageRaw": "eng",
+      "title": "English DD+ 5.1",
+      "dispositions": {
+        "default": true,
+        "forced": false,
+        "original": false,
+        "dub": false,
+        "commentary": false,
+        "hearingImpaired": false,
+        "visualImpaired": false
+      },
+      "type": "audio",
+      "profile": null,
+      "channels": 6,
+      "channelLayout": "5.1(side)",
+      "sampleRate": 48000,
+      "bitDepth": null,
+      "bitrate": 640000,
+      "lossless": false,
+      "objectAudio": "none",
+      "titleClaim": {
+        "codec": "e-ac-3",
+        "channels": "5.1",
+        "contradictsActual": false
+      },
+      "encoder": null,
+      "purpose": "main",
+      "purposeFrom": "assumed",
+      "variant": null
+    },
+    {
+      "index": 2,
+      "codec": "aac",
+      "language": "en",
+      "languageRaw": "eng",
+      "title": "Commentary",
+      "dispositions": {
+        "default": false,
+        "forced": false,
+        "original": false,
+        "dub": false,
+        "commentary": true,
+        "hearingImpaired": false,
+        "visualImpaired": false
+      },
+      "type": "audio",
+      "profile": "LC",
+      "channels": 2,
+      "channelLayout": "stereo",
+      "sampleRate": 48000,
+      "bitDepth": null,
+      "bitrate": null,
+      "lossless": false,
+      "objectAudio": "none",
+      "titleClaim": null,
+      "encoder": null,
+      "purpose": "commentary",
+      "purposeFrom": "disposition",
+      "variant": null
+    },
+    {
+      "index": 3,
+      "codec": "subrip",
+      "language": "en",
+      "languageRaw": "eng",
+      "title": "Forced",
+      "dispositions": {
+        "default": false,
+        "forced": true,
+        "original": false,
+        "dub": false,
+        "commentary": false,
+        "hearingImpaired": false,
+        "visualImpaired": false
+      },
+      "type": "subtitle",
+      "form": "text",
+      "styled": false,
+      "variant": null,
+      "events": 24,
+      "purpose": "forced",
+      "purposeFrom": "disposition"
+    },
+    {
+      "index": 4,
+      "codec": "subrip",
+      "language": "en",
+      "languageRaw": "eng",
+      "title": null,
+      "dispositions": {
+        "default": false,
+        "forced": false,
+        "original": false,
+        "dub": false,
+        "commentary": false,
+        "hearingImpaired": false,
+        "visualImpaired": false
+      },
+      "type": "subtitle",
+      "form": "text",
+      "styled": false,
+      "variant": null,
+      "events": 1210,
+      "purpose": "dialogue",
+      "purposeFrom": "assumed"
+    },
+    {
+      "index": 5,
+      "codec": "hdmv_pgs_subtitle",
+      "language": "de",
+      "languageRaw": "ger",
+      "title": null,
+      "dispositions": {
+        "default": false,
+        "forced": false,
+        "original": false,
+        "dub": false,
+        "commentary": false,
+        "hearingImpaired": false,
+        "visualImpaired": false
+      },
+      "type": "subtitle",
+      "form": "image",
+      "styled": false,
+      "variant": null,
+      "events": 980,
+      "purpose": "dialogue",
+      "purposeFrom": "assumed"
+    },
+    {
+      "index": 6,
+      "codec": "ttf",
+      "language": null,
+      "languageRaw": null,
+      "title": null,
+      "dispositions": {
+        "default": false,
+        "forced": false,
+        "original": false,
+        "dub": false,
+        "commentary": false,
+        "hearingImpaired": false,
+        "visualImpaired": false
+      },
+      "type": "attachment",
+      "filename": "Example Sans.ttf",
+      "mimetype": "application/x-truetype-font",
+      "role": "font"
+    }
+  ],
+  "sidecars": [
+    {
+      "file": "sources/8bca399e-7836-5df6-a6a1-edf538b03074/Example Film (2024) - 2160p.de.srt",
+      "originalName": "Example Film (2024) - 2160p.de.srt",
+      "kind": "subtitle",
+      "format": "srt",
+      "language": "de",
+      "forced": false,
+      "hearingImpaired": false,
+      "purpose": "dialogue",
+      "sizeBytes": 38,
+      "sha256": "sha256:37db83633a86bf79edc5a0ba4efdb07326386e95321030b87df7f37ab284d3b4"
+    },
+    {
+      "file": "sources/8bca399e-7836-5df6-a6a1-edf538b03074/Example Film (2024) - 2160p.nfo",
+      "originalName": "Example Film (2024) - 2160p.nfo",
+      "kind": "nfo",
+      "format": "nfo",
+      "sizeBytes": 43,
+      "sha256": "sha256:52655d552c25b14defa43c81323fafd843ffa3f8f79e29c7c3f73a26713a60fb"
+    }
+  ],
+  "covers": [],
+  "essence": {
+    "maxAudioChannels": 6,
+    "surround": true,
+    "losslessAudio": false,
+    "objectAudio": false,
+    "maxVideoHeight": 1608,
+    "videoBitDepth": 10,
+    "hdr10Metadata": true,
+    "dolbyVision": false,
+    "stereo3d": false,
+    "interlaced": false,
+    "audioLanguages": [
+      "en"
+    ],
+    "subtitleLanguages": [
+      "de",
+      "en"
+    ],
+    "subtitleTracks": 3,
+    "imageSubtitles": true,
+    "styledSubtitles": false,
+    "fonts": true,
+    "chapters": true,
+    "commentaryTracks": 1,
+    "commentarySubtitles": 0,
+    "audioDescriptionTracks": 0,
+    "sdhSubtitleLanguages": [],
+    "forcedSubtitleLanguages": [
+      "en"
+    ],
+    "closedCaptions": false
+  },
+  "probe": {
+    "tool": "ffprobe",
+    "version": "ffprobe version 7.1",
+    "at": "2026-10-06T10:00:00Z",
+    "file": "sources/8bca399e-7836-5df6-a6a1-edf538b03074/ffprobe.json",
+    "sha256": "sha256:c78ce567cbee958d965f5650e7d84b7636214bfa1d30cf3671db080e49e381b7",
+    "note": null
+  }
+}

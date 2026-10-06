@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from packager import library, main
+from packager import libv2_records as rec
 from packager import packager as pk
 from packager.config import Config
 
@@ -110,46 +111,47 @@ def test_main_sweeps_the_package_store_and_the_staging_folder(monkeypatch) -> No
 
 # ---------------------------------------------------------------- the chain
 
-def _version(folder: Path) -> None:
-    """A small version folder: version.json and a package."""
+def _version(folder: Path) -> bytes:
+    """A small version folder: version.json (returned) and a package."""
     folder.mkdir(parents=True)
-    (folder / "version.json").write_bytes(library.json_bytes({"versionId": VERSION}))
+    record = rec.json_bytes({"versionId": VERSION})
+    (folder / "version.json").write_bytes(record)
     for rel, body in {"hls/master.m3u8": "#EXTM3U\n", "hls/v0/playlist.m3u8": MEDIA,
                       "hls/v0/init.mp4": "init", "hls/v0/seg-00001.m4s": "segment",
                       "subs/0.vtt": "WEBVTT\n", "trickplay/sprite-0000.jpg": "jpg"}.items():
         (folder / rel).parent.mkdir(parents=True, exist_ok=True)
         (folder / rel).write_text(body)
+    return record
 
 
-def _close(folder: Path, record: str = "version.json") -> tuple[bytes, list]:
+def _close(folder: Path, record: str = "version.json", record_bytes: bytes | None = None,
+           dirs: tuple[str, ...] = rec.PACKAGE_DIRS) -> tuple[bytes, list]:
     seen: list = []
 
-    def package(checksums: dict, size: int) -> dict:
-        seen.append((checksums, size))
-        return {"packageId": "p", "sizeBytes": size, "checksums": checksums}
+    def package(listed: list) -> dict:
+        seen.append(listed)
+        return {"packageId": "p", "checksums": rec.checksums(listed)[1]}
 
-    return library.close_chain(folder, record, package), seen
+    body = library.close_chain(folder, record, record_bytes or (folder / record).read_bytes(),
+                               dirs, package)
+    return body, seen
 
 
 def test_a_closed_chain(tmp_path: Path) -> None:
     folder = tmp_path / VERSION
     _version(folder)
-    body, [(checksums, size)] = _close(folder)
+    body, [listed] = _close(folder)
     sums = (folder / library.SUMS).read_text().splitlines()
-    listed = [line.split("  ", 1)[1] for line in sums]
-    assert listed == sorted(["version.json", "hls/master.m3u8", "hls/v0/playlist.m3u8",
-                             "hls/v0/init.mp4", "hls/v0/seg-00001.m4s", "subs/0.vtt",
-                             "trickplay/sprite-0000.jpg"])
+    names = [line.split("  ", 1)[1] for line in sums]
+    assert names == sorted(["version.json", "hls/master.m3u8", "hls/v0/playlist.m3u8",
+                            "hls/v0/init.mp4", "hls/v0/seg-00001.m4s", "subs/0.vtt",
+                            "trickplay/sprite-0000.jpg"])
     for line in sums:
         digest, rel = line.split("  ", 1)
         assert digest == hashlib.sha256((folder / rel).read_bytes()).hexdigest()
-    sums_bytes = (folder / library.SUMS).read_bytes()
-    assert checksums == {"file": library.SUMS, "algorithm": "sha256",
-                         "sha256": "sha256:" + hashlib.sha256(sums_bytes).hexdigest(),
-                         "files": 7,
-                         "bytes": sum((folder / rel).stat().st_size for rel in listed)}
-    # The package's size is its files', not the records'.
-    assert size == checksums["bytes"] - (folder / "version.json").stat().st_size
+    # The package record is made of what the checksums list.
+    assert sorted(rel for rel, _digest, _size in listed) == names
+    assert json.loads(body)["checksums"]["sha256"] == rec.sha_file(str(folder / library.SUMS))
     assert (folder / library.PACKAGE_RECORD).read_bytes() == body
     assert body.endswith(b"}\n") and b'\n  "packageId": "p"' in body
     assert (folder / library.COMPLETE).read_text() == (
@@ -161,31 +163,30 @@ def test_an_extras_chain_is_over_its_extra_json(tmp_path: Path) -> None:
     folder = tmp_path / "extra"
     _version(folder)
     (folder / "version.json").rename(folder / "extra.json")
-    _close(folder, "extra.json")
-    assert library.verify_chain(folder, "extra.json") is None
+    _close(folder, "extra.json", dirs=rec.EXTRA_DIRS)
+    assert library.verify_chain(folder, "extra.json", rec.EXTRA_DIRS) is None
     assert "extra.json" in (folder / library.SUMS).read_text()
 
 
 @pytest.mark.parametrize(("change", "says"), [
-    (lambda f: (f / ".complete").unlink(), "no .complete"),
-    (lambda f: (f / "package.json").unlink(), "no package.json"),
-    (lambda f: (f / "checksums.sha256").unlink(), "no checksums.sha256"),
+    (lambda f: (f / ".complete").unlink(), "the package never finished"),
+    (lambda f: (f / "package.json").unlink(), "the package never finished"),
+    (lambda f: (f / "checksums.sha256").unlink(), "checksums.sha256 is missing"),
     (lambda f: (f / ".complete").write_text("2026-10-06T08:00:00+00:00\n"),
      ".complete does not name this package.json"),
     (lambda f: (f / "package.json").write_text('{"checksums": {}}\n'),
      ".complete does not name this package.json"),
     (lambda f: (f / "checksums.sha256").write_text("x\n"),
-     "package.json does not name this checksums.sha256"),
+     "checksums.sha256 is not the one package.json names"),
     (lambda f: (f / "hls" / "v0" / "seg-00002.m4s").write_text("more"),
-     "checksums.sha256 does not list hls/v0/seg-00002.m4s"),
+     "hls/v0/seg-00002.m4s is not listed in checksums.sha256"),
     (lambda f: (f / "subs" / "0.vtt").unlink(),
-     "checksums.sha256 lists subs/0.vtt, which is not there"),
+     "checksums.sha256 lists subs/0.vtt, which is not here"),
     (lambda f: (f / "hls" / "v0" / "seg-00001.m4s").write_text("a longer segment"),
      "the files checksums.sha256 lists total"),
-    (lambda f: (f / "version.json").write_bytes(library.json_bytes({"versionId": "other"})),
-     "the files checksums.sha256 lists total"),
     (lambda f: (f / "version.json").write_bytes(
-        library.json_bytes({"versionId": VERSION[::-1]})), "version.json does not match"),
+        rec.json_bytes({"versionId": VERSION[::-1]})),
+     "version.json does not match the digest checksums.sha256 lists for it"),
 ])
 def test_a_broken_chain_says_what_broke_it(tmp_path: Path, change, says: str) -> None:
     folder = tmp_path / VERSION
@@ -193,14 +194,15 @@ def test_a_broken_chain_says_what_broke_it(tmp_path: Path, change, says: str) ->
     _close(folder)
     change(folder)
     problem = library.verify_chain(folder, "version.json")
-    assert problem is not None and problem.startswith(says), problem
+    assert problem is not None and says in problem, problem
 
 
 def test_a_chain_that_never_closed(tmp_path: Path) -> None:
     folder = tmp_path / VERSION
     _version(folder)
-    assert library.verify_chain(folder, "version.json") == "no .complete"
-    assert library.verify_chain(tmp_path / "nothing", "version.json") == "no .complete"
+    assert "the package never finished" in library.verify_chain(folder, "version.json")
+    assert "the package never finished" in library.verify_chain(tmp_path / "nothing",
+                                                                "version.json")
 
 
 # ---------------------------------------------------------------- placing
@@ -257,36 +259,12 @@ def test_a_copy_is_new_bytes_with_the_writers_mode(tmp_path: Path) -> None:
     os.chmod(src, 0o600)
     old = os.umask(0o002)
     try:
-        size, digest = library.copy_hashed(src, tmp_path / "copy.srt")
+        library.copy_new(src, tmp_path / "copy.srt")
     finally:
         os.umask(old)
     copy = tmp_path / "copy.srt"
     assert copy.read_bytes() == src.read_bytes()
-    assert (size, digest) == (src.stat().st_size, hashlib.sha256(src.read_bytes()).hexdigest())
     assert stat.S_IMODE(copy.stat().st_mode) == 0o664
     assert copy.stat().st_ino != src.stat().st_ino and copy.stat().st_nlink == 1
     with pytest.raises(FileExistsError):
-        library.copy_hashed(src, copy)
-
-
-def test_a_name_another_file_has_gets_a_number() -> None:
-    taken = {"source.json", "ffprobe.json", "checksums.sha256"}
-    assert [library.free_name(n, taken) for n in (
-        "Movie.en.srt", "source.json", "Movie.en.srt", "checksums.sha256", "source.json",
-        "README")] == [
-        "Movie.en.srt", "source-1.json", "Movie.en-1.srt", "checksums-1.sha256",
-        "source-2.json", "README"]
-
-
-def test_qh1_is_the_catalogs(tmp_path: Path) -> None:
-    small, large = tmp_path / "small", tmp_path / "large"
-    small.write_bytes(b"x" * 100)
-    large.write_bytes(bytes(range(256)) * 1024)          # 256 KiB
-    for f in (small, large):
-        data = f.read_bytes()
-        size = len(data)
-        h = hashlib.sha256(data[:65536])
-        if size > 65536:
-            h.update(data[max(size - 65536, 0):][:65536])
-        h.update(size.to_bytes(8, "big"))
-        assert library.qh1(f) == "sha256:" + h.hexdigest()
+        library.copy_new(src, copy)

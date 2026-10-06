@@ -1,0 +1,55 @@
+{
+  "schema": "zaentrum.library.version/2",
+  "versionId": "2a0b37d5-9bd3-5d68-a5f9-f46cec28e8d7",
+  "createdAt": "2026-10-06T10:00:00Z",
+  "createdBy": "katalog-manager",
+  "edition": {
+    "kind": "unknown",
+    "label": null,
+    "decidedBy": "inferred",
+    "decidedAt": "2026-10-06T10:00:00Z",
+    "evidence": []
+  },
+  "presentation": {
+    "colour": "unknown",
+    "dynamicRange": "hdr10",
+    "stereo3d": "none",
+    "aspectRatio": "160:67"
+  },
+  "runtimeMs": 60000,
+  "chapters": [
+    {
+      "startMs": 0,
+      "endMs": 20000,
+      "title": "Opening"
+    },
+    {
+      "startMs": 20000,
+      "endMs": 60000,
+      "title": "The Rest"
+    }
+  ],
+  "chaptersFrom": "original-file",
+  "segments": [
+    {
+      "kind": "credits",
+      "startMs": 50000,
+      "endMs": 60000,
+      "detector": "chapter",
+      "confidence": 0.9,
+      "label": null
+    },
+    {
+      "kind": "other",
+      "startMs": 55000,
+      "endMs": 60000,
+      "detector": "blackframe",
+      "confidence": null,
+      "label": "outro"
+    }
+  ],
+  "sourceIds": [
+    "8bca399e-7836-5df6-a6a1-edf538b03074"
+  ],
+  "originalFiles": []
+}
