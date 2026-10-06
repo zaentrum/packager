@@ -323,12 +323,7 @@ def package_item(
     an extra's `parentId` and `extraKind`. It never replaces a key the
     packager writes; one that would fails the run (PackageError)."""
     options = options or PackageOptions()
-    if inputs is None:
-        inputs = PackageInputs(video=[VideoInput("v0", Path(source_path))], kind="original")
-    src = inputs.primary.path
-    if not src.exists():
-        raise PackageError(f"source not found: {src}")
-    segment_seconds = inputs.segment_seconds or options.segment_seconds
+    inputs = _inputs_of(source_path, inputs)
 
     out_root = _item_root(item_id, item_type)
     # Everything below writes into the staging folder; the live package,
@@ -337,158 +332,15 @@ def package_item(
 
     try:
         _open_staging(out_root, options.old_package_grace_seconds)
-        probe = _ffprobe(src)
-        if probe.video.get("codec_name") not in ("hevc", "h264"):
-            raise PackageError(
-                f"video codec {probe.video.get('codec_name')!r} not supported "
-                "(passthrough only; HEVC and H.264 are the allowed input codecs)"
-            )
-        # The catalog's language for a track wins over the file's tag.
-        overrides = _track_overrides(track_languages)
-        if overrides:
-            probe = _with_track_languages(
-                probe, overrides, _probe_of_source(src, Path(source_path)))
-
-        # The subtitle files next to the source come after its own
-        # subtitle tracks, as tracks like them.
-        sub_files = _subtitle_files(subtitle_files, Path(source_path))
-
-        # Resolve client-visibility windows for audio + subtitle
-        # tracks from the language whitelist. Tracks ALWAYS get
-        # packaged — `visible` is just a hint for the player UI.
-        audio_visible = _visible_indices(
-            probe.audio, language_whitelist,
+        manifest = build_package(
+            item_id, source_path, item_type, stage, inputs=inputs, options=options,
+            language_whitelist=language_whitelist,
             keep_original_if_single=keep_original_if_single,
-        )
-        sub_visible = _visible_indices(
-            [*probe.subtitles, *({"tags": {"language": f.language}} for f in sub_files)],
-            language_whitelist,
-            keep_original_if_single=keep_original_if_single,
-        )
-        preferred = list(options.preferred_languages) or list(language_whitelist or [])
-        default_audio = _pick_default_audio(probe.audio, audio_visible, preferred)
-        surround = _surround_plan(probe.audio, audio_visible, options)
-        default_surround = _pick_default_surround(surround, probe.audio, default_audio, preferred)
-        log.info(
-            "packager.lang_filter",
-            whitelist=language_whitelist or None,
-            preferred=preferred or None,
-            audio_total=len(probe.audio),
-            audio_visible=len(audio_visible),
-            default_audio=default_audio,
-            surround=[s.source_index for s in surround] or None,
-            default_surround=default_surround,
-            sub_total=len(probe.subtitles),
-            subtitle_files=len(sub_files) or None,
-            sub_visible=len(sub_visible),
-            track_languages=len(overrides) or None,
-            video_renditions=len(inputs.video),
-            inputs=inputs.kind,
-        )
-
-        # Stage everything through ffmpeg: shaka-packager doesn't encode
-        # audio — it only packages — and doesn't read MKV for HEVC/H.264.
-        # Subtitles are extracted next to the package.
-        with tempfile.TemporaryDirectory(prefix=f"pkg-{item_id}-") as tmp:
-            tmpdir = Path(tmp)
-            packaging_source, audio_meta, surround_meta = _prepare_source(
-                src, probe, tmpdir,
-                audio_visible_indices=audio_visible,
-                default_index=default_audio,
-                surround=surround,
-                surround_default=default_surround,
-                timeline=inputs.primary.timeline,
-                ts_offset=inputs.timestamp_offset,
-            )
-            videos = [_StagedVideo(inputs.primary, packaging_source, probe)]
-            for rung in inputs.video[1:]:
-                staged = _remux_video(rung, tmpdir, inputs.timestamp_offset)
-                if staged is not None:
-                    videos.append(staged)
-            subtitle_meta = _extract_subtitles(
-                src, probe, stage / "subs",
-                visible_indices=sub_visible,
-            )
-            subtitle_meta += _convert_subtitle_files(
-                sub_files, stage / "subs", tmpdir,
-                first=len(probe.subtitles), visible_indices=sub_visible,
-            )
-            audio_language = (_track_language(probe.audio[default_audio])
-                              if default_audio is not None else None)
-            default_subtitle = _pick_default_subtitle(subtitle_meta, audio_language)
-            for i, entry in enumerate(subtitle_meta):
-                entry["default"] = i == default_subtitle
-            log.info("packager.subs.default", audio_language=audio_language,
-                     subtitle=subtitle_meta[default_subtitle]["id"]
-                     if default_subtitle is not None else None)
-            video_meta, audio_meta, surround_meta = _run_shaka_packager(
-                packaging_source, videos, audio_meta, surround_meta, stage,
-                segment_seconds=segment_seconds,
-                hls_subtitles=options.hls_subtitles,
-                subtitle_meta=subtitle_meta,
-            )
-
-        # Trickplay runs against the original source — only 1 frame
-        # per TRICKPLAY_INTERVAL_SEC, so HEVC decode cost is small
-        # (~30 s on a 90 min movie) and we don't need the
-        # transmuxed intermediate to still exist.
-        trickplay_meta = (_generate_trickplay(src, probe, stage / "trickplay")
-                          if trickplay else None)
-
-        # v2 manifest: self-describing catalog metadata at the top
-        # level, no `source` block. If the catalog DB is ever lost,
-        # the on-disk package alone tells you what the item is
-        # (title, TMDB ID, episode coordinates) and how to reconstruct
-        # the DB row from TMDB.
-        manifest: dict[str, Any] = {
-            "version": MANIFEST_VERSION,
-            "itemId": item_id,
-            "type": item_type or "",
-            "title": title or "",
-            "year": year,
-            "tmdbId": tmdb_id,
-            "durationMs": probe.duration_ms,
-            "packagedAt": datetime.now(UTC).isoformat(),
-            "packager": _packager_version(),
-            "renditions": {
-                "video": video_meta,
-                # Stereo AAC, one per source track: what /info lists.
-                "audio": audio_meta,
-                # 5.1 companions (group audio-surround); a separate key so
-                # readers that count or list `audio` see the same tracks
-                # as before.
-                "audioSurround": surround_meta,
-            },
-            "subtitles": subtitle_meta,
-            "hls": {
-                "master": "hls/master.m3u8",
-                "segmentSeconds": segment_seconds,
-                "audioGroups": ([AUDIO_GROUP] if audio_meta else [])
-                + ([SURROUND_GROUP] if surround_meta else []),
-                "subtitleGroup": SUBTITLE_GROUP if (
-                    options.hls_subtitles and any(s.get("hls") for s in subtitle_meta)
-                ) else None,
-            },
-        }
-        if item_type == "episode":
-            # Episodes need their own coordinates + the parent series
-            # title so the package self-describes as "Ghosts S01E03
-            # Spies" with no DB lookup needed.
-            manifest["seriesTitle"] = series_title or ""
-            manifest["seasonNumber"] = season_number
-            manifest["episodeNumber"] = episode_number
-            ec = _episode_code(season_number, episode_number)
-            if ec is not None:
-                manifest["episodeCode"] = ec
-        if trickplay_meta is not None:
-            manifest["trickplay"] = trickplay_meta
-        if manifest_extra:
-            # Added, never replacing: the playback service and the catalog
-            # read the packager's keys, and the swap checks what they name.
-            clash = sorted(set(manifest_extra) & set(manifest))
-            if clash:
-                raise PackageError(f"manifest_extra would replace {', '.join(clash)}")
-            manifest.update(manifest_extra)
+            title=title, year=year, series_title=series_title,
+            season_number=season_number, episode_number=episode_number, tmdb_id=tmdb_id,
+            track_languages=track_languages, subtitle_files=subtitle_files,
+            trickplay=trickplay, manifest_extra=manifest_extra,
+        ).manifest
         _write_atomic(stage / MANIFEST_FILE, json.dumps(manifest, indent=2).encode())
 
         # Only a whole package replaces the live one. The live one is kept
@@ -508,6 +360,216 @@ def package_item(
         _write_failed(out_root, e)
         log.exception("packager.failed", item_id=item_id, error=str(e))
         raise
+
+
+def _inputs_of(source_path: str, inputs: PackageInputs | None) -> PackageInputs:
+    """The inputs a run packages: the transcoder's handoff, or the source
+    as the single rendition. Raises PackageError when v0 is not there."""
+    if inputs is None:
+        inputs = PackageInputs(video=[VideoInput("v0", Path(source_path))], kind="original")
+    src = inputs.primary.path
+    if not src.exists():
+        raise PackageError(f"source not found: {src}")
+    return inputs
+
+
+@dataclass
+class Built:
+    """What build_package left in its folder: the manifest that describes
+    it (the v2 manifest, written by the caller), the probe of v0 it was
+    made from (with the catalog's track languages), and the subtitle file
+    next to the source each of its subtitles from one was converted from,
+    by subtitle id ("sub3")."""
+    manifest: dict[str, Any]
+    probe: _Probe
+    from_files: dict[str, _SubtitleFile]
+
+
+def build_package(
+    item_id: str,
+    source_path: str,
+    item_type: str | None,
+    stage: Path,
+    *,
+    inputs: PackageInputs,
+    options: PackageOptions,
+    language_whitelist: list[str] | None = None,
+    keep_original_if_single: bool = True,
+    title: str | None = None,
+    year: int | None = None,
+    series_title: str | None = None,
+    season_number: int | None = None,
+    episode_number: int | None = None,
+    tmdb_id: str | None = None,
+    track_languages: list[Any] | None = None,
+    subtitle_files: list[Any] | None = None,
+    trickplay: bool = True,
+    manifest_extra: dict[str, Any] | None = None,
+) -> Built:
+    """Build one package into `stage`, a folder the caller made and owns:
+    hls/ (the media playlists, the master), subs/ and trickplay/. Writes
+    nothing beside them and no manifest; package_item's arguments, as it
+    passes them (see there). Raises on any failure, leaving what it wrote."""
+    src = inputs.primary.path
+    segment_seconds = inputs.segment_seconds or options.segment_seconds
+    probe = _ffprobe(src)
+    if probe.video.get("codec_name") not in ("hevc", "h264"):
+        raise PackageError(
+            f"video codec {probe.video.get('codec_name')!r} not supported "
+            "(passthrough only; HEVC and H.264 are the allowed input codecs)"
+        )
+    # The catalog's language for a track wins over the file's tag.
+    overrides = _track_overrides(track_languages)
+    if overrides:
+        probe = _with_track_languages(
+            probe, overrides, _probe_of_source(src, Path(source_path)))
+
+    # The subtitle files next to the source come after its own
+    # subtitle tracks, as tracks like them.
+    sub_files = _subtitle_files(subtitle_files, Path(source_path))
+
+    # Resolve client-visibility windows for audio + subtitle
+    # tracks from the language whitelist. Tracks ALWAYS get
+    # packaged — `visible` is just a hint for the player UI.
+    audio_visible = _visible_indices(
+        probe.audio, language_whitelist,
+        keep_original_if_single=keep_original_if_single,
+    )
+    sub_visible = _visible_indices(
+        [*probe.subtitles, *({"tags": {"language": f.language}} for f in sub_files)],
+        language_whitelist,
+        keep_original_if_single=keep_original_if_single,
+    )
+    preferred = list(options.preferred_languages) or list(language_whitelist or [])
+    default_audio = _pick_default_audio(probe.audio, audio_visible, preferred)
+    surround = _surround_plan(probe.audio, audio_visible, options)
+    default_surround = _pick_default_surround(surround, probe.audio, default_audio, preferred)
+    log.info(
+        "packager.lang_filter",
+        whitelist=language_whitelist or None,
+        preferred=preferred or None,
+        audio_total=len(probe.audio),
+        audio_visible=len(audio_visible),
+        default_audio=default_audio,
+        surround=[s.source_index for s in surround] or None,
+        default_surround=default_surround,
+        sub_total=len(probe.subtitles),
+        subtitle_files=len(sub_files) or None,
+        sub_visible=len(sub_visible),
+        track_languages=len(overrides) or None,
+        video_renditions=len(inputs.video),
+        inputs=inputs.kind,
+    )
+
+    # Stage everything through ffmpeg: shaka-packager doesn't encode
+    # audio — it only packages — and doesn't read MKV for HEVC/H.264.
+    # Subtitles are extracted next to the package.
+    with tempfile.TemporaryDirectory(prefix=f"pkg-{item_id}-") as tmp:
+        tmpdir = Path(tmp)
+        packaging_source, audio_meta, surround_meta = _prepare_source(
+            src, probe, tmpdir,
+            audio_visible_indices=audio_visible,
+            default_index=default_audio,
+            surround=surround,
+            surround_default=default_surround,
+            timeline=inputs.primary.timeline,
+            ts_offset=inputs.timestamp_offset,
+        )
+        videos = [_StagedVideo(inputs.primary, packaging_source, probe)]
+        for rung in inputs.video[1:]:
+            staged = _remux_video(rung, tmpdir, inputs.timestamp_offset)
+            if staged is not None:
+                videos.append(staged)
+        subtitle_meta = _extract_subtitles(
+            src, probe, stage / "subs",
+            visible_indices=sub_visible,
+        )
+        converted = _convert_subtitle_files(
+            sub_files, stage / "subs", tmpdir,
+            first=len(probe.subtitles), visible_indices=sub_visible,
+        )
+        # subN of a file is numbered on from the source's own tracks, in
+        # the order of the files (a file that failed keeps its number).
+        from_files = {e["id"]: sub_files[int(e["id"].removeprefix("sub")) - len(probe.subtitles)]
+                      for e in converted}
+        subtitle_meta += converted
+        audio_language = (_track_language(probe.audio[default_audio])
+                          if default_audio is not None else None)
+        default_subtitle = _pick_default_subtitle(subtitle_meta, audio_language)
+        for i, entry in enumerate(subtitle_meta):
+            entry["default"] = i == default_subtitle
+        log.info("packager.subs.default", audio_language=audio_language,
+                 subtitle=subtitle_meta[default_subtitle]["id"]
+                 if default_subtitle is not None else None)
+        video_meta, audio_meta, surround_meta = _run_shaka_packager(
+            packaging_source, videos, audio_meta, surround_meta, stage,
+            segment_seconds=segment_seconds,
+            hls_subtitles=options.hls_subtitles,
+            subtitle_meta=subtitle_meta,
+        )
+
+    # Trickplay runs against the original source — only 1 frame
+    # per TRICKPLAY_INTERVAL_SEC, so HEVC decode cost is small
+    # (~30 s on a 90 min movie) and we don't need the
+    # transmuxed intermediate to still exist.
+    trickplay_meta = (_generate_trickplay(src, probe, stage / "trickplay")
+                      if trickplay else None)
+
+    # v2 manifest: self-describing catalog metadata at the top
+    # level, no `source` block. If the catalog DB is ever lost,
+    # the on-disk package alone tells you what the item is
+    # (title, TMDB ID, episode coordinates) and how to reconstruct
+    # the DB row from TMDB.
+    manifest: dict[str, Any] = {
+        "version": MANIFEST_VERSION,
+        "itemId": item_id,
+        "type": item_type or "",
+        "title": title or "",
+        "year": year,
+        "tmdbId": tmdb_id,
+        "durationMs": probe.duration_ms,
+        "packagedAt": datetime.now(UTC).isoformat(),
+        "packager": _packager_version(),
+        "renditions": {
+            "video": video_meta,
+            # Stereo AAC, one per source track: what /info lists.
+            "audio": audio_meta,
+            # 5.1 companions (group audio-surround); a separate key so
+            # readers that count or list `audio` see the same tracks
+            # as before.
+            "audioSurround": surround_meta,
+        },
+        "subtitles": subtitle_meta,
+        "hls": {
+            "master": "hls/master.m3u8",
+            "segmentSeconds": segment_seconds,
+            "audioGroups": ([AUDIO_GROUP] if audio_meta else [])
+            + ([SURROUND_GROUP] if surround_meta else []),
+            "subtitleGroup": SUBTITLE_GROUP if (
+                options.hls_subtitles and any(s.get("hls") for s in subtitle_meta)
+            ) else None,
+        },
+    }
+    if item_type == "episode":
+        # Episodes need their own coordinates + the parent series
+        # title so the package self-describes as "Ghosts S01E03
+        # Spies" with no DB lookup needed.
+        manifest["seriesTitle"] = series_title or ""
+        manifest["seasonNumber"] = season_number
+        manifest["episodeNumber"] = episode_number
+        ec = _episode_code(season_number, episode_number)
+        if ec is not None:
+            manifest["episodeCode"] = ec
+    if trickplay_meta is not None:
+        manifest["trickplay"] = trickplay_meta
+    if manifest_extra:
+        # Added, never replacing: the playback service and the catalog
+        # read the packager's keys, and the swap checks what they name.
+        clash = sorted(set(manifest_extra) & set(manifest))
+        if clash:
+            raise PackageError(f"manifest_extra would replace {', '.join(clash)}")
+        manifest.update(manifest_extra)
+    return Built(manifest, probe, from_files)
 
 
 def _open_staging(out_root: Path, grace_seconds: float) -> Path:
@@ -539,13 +601,16 @@ def _open_staging(out_root: Path, grace_seconds: float) -> Path:
     return stage
 
 
-def _verify_staged(stage: Path) -> None:
+def _verify_staged(stage: Path, manifest: dict[str, Any] | None = None) -> None:
     """Refuse a staged package that isn't whole: every playlist the master
     or the manifest names is there and ends (#EXT-X-ENDLIST), and every
     init section, segment, sidecar and trickplay sprite they reference is
     there, inside the package and, but for a sidecar (a track without a
-    cue extracts to an empty file), not empty. Raises PackageError."""
-    manifest = json.loads((stage / MANIFEST_FILE).read_text())
+    cue extracts to an empty file), not empty. The manifest is the staged
+    manifest.json unless given (a library v2 package.json, which names its
+    files under the same keys). Raises PackageError."""
+    if manifest is None:
+        manifest = json.loads((stage / MANIFEST_FILE).read_text())
     listings: dict[str, dict[str, int]] = {}
     missing: dict[str, None] = {}  # an ordered set: I-frame playlists name the segments again
 
@@ -1868,6 +1933,9 @@ class _SubtitleFile:
     language: str  # an ISO 639-2 code, und when the record names none
     label: str     # the catalog's label: the manifest entry's `title`
     forced: bool
+    # The catalog's id of the file (the record's `id`), None when it names
+    # none: the library v2 handover maps it to the file's rendition.
+    asset_id: str | None = None
 
 
 def _subtitle_files(entries: list[Any] | None, source: Path) -> list[_SubtitleFile]:
@@ -1886,11 +1954,13 @@ def _subtitle_files(entries: list[Any] | None, source: Path) -> list[_SubtitleFi
             log.warning("packager.subtitle_file.ignored", entry=str(entry)[:300])
             continue
         label = entry.get("label")
+        asset_id = entry.get("id")
         out.append(_SubtitleFile(
             path=path,
             language=_language_code(entry.get("language")) or "und",
             label=label.strip() if isinstance(label, str) else "",
             forced=entry.get("forced") is True,
+            asset_id=asset_id if isinstance(asset_id, str) and asset_id else None,
         ))
     return out
 
