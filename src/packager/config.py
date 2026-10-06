@@ -46,6 +46,10 @@ class Config:
     # Output root for packaged items. Mounted from the katalog-packages
     # PVC in the deployment.
     packages_root: str = "/var/lib/katalog/packages"
+    # The work tree of the library v2 layout, on the library's share: the
+    # startup sweep clears dead runs' leftovers in its staging/. A run's
+    # own paths come from its worker record, never from here.
+    work_root: str = "/var/lib/katalog/.work"
     # --- packaging --------------------------------------------------------
     # HLS segment length when the transcoder's renditions.json doesn't say
     # (it records the keyframe interval it encoded with, which wins).
@@ -98,6 +102,7 @@ class Config:
             produce_topic=os.environ.get("PRODUCE_TOPIC", ""),
             error_sleep_seconds=float(os.environ.get("ERROR_SLEEP_SECONDS", "60")),
             packages_root=os.environ.get("PACKAGES_ROOT", "/var/lib/katalog/packages"),
+            work_root=os.environ.get("WORK_ROOT", "").strip() or "/var/lib/katalog/.work",
             segment_seconds=int(os.environ.get("SEGMENT_SECONDS", "6")),
             surround_audio=surround,
             surround_bitrate=os.environ.get("SURROUND_BITRATE", "448k"),

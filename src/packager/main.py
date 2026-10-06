@@ -3,7 +3,8 @@
   - the extras loop (a second thread: trailers and other bonus material,
     extras.py)
   - at startup, a sweep of what runs that ended uncleanly left in the
-    item folders (thread)
+    package store's item folders and in the library v2 work tree's
+    staging folder (thread)
   - a tiny FastAPI server for /healthz and /readyz, so kubelet probes work.
 
 Same shape as katalog-analyzer's main — intentionally — so anyone
@@ -16,6 +17,7 @@ import os
 import signal
 import sys
 import threading
+from pathlib import Path
 
 import structlog
 import uvicorn
@@ -24,6 +26,7 @@ from fastapi import FastAPI
 from .config import Config
 from .extras import run_extras_worker
 from .katalog import KatalogClient
+from .library import sweep_staging
 from .packager import sweep_leftovers
 from .worker import run_worker
 
@@ -45,14 +48,19 @@ def _configure_logging() -> None:
     )
 
 
-def _sweep(grace_seconds: float) -> None:
-    """The startup sweep (sweep_leftovers): what runs that ended uncleanly
-    left in the item folders. A walk of every item folder, so on its own
-    thread; the worker doesn't wait for it."""
-    try:
-        sweep_leftovers(grace_seconds)
-    except Exception:
-        structlog.get_logger("packager.main").exception("packager.sweep.failed")
+def _sweep(grace_seconds: float, work_root: str) -> None:
+    """The startup sweep: what runs that ended uncleanly left in the
+    package store's item folders (sweep_leftovers, a walk of every one of
+    them) and in the library v2 work tree's staging folder (sweep_staging,
+    that folder only; the library itself is never walked). Either finds
+    nothing where its tree isn't there. On its own thread; the worker
+    doesn't wait for it."""
+    for sweep, args in ((sweep_leftovers, (grace_seconds,)), (sweep_staging, (Path(work_root),))):
+        try:
+            sweep(*args)
+        except Exception:
+            structlog.get_logger("packager.main").exception("packager.sweep.failed",
+                                                            sweep=sweep.__name__)
 
 
 def main() -> int:
@@ -73,6 +81,7 @@ def main() -> int:
         hls_subtitles=cfg.hls_subtitles,
         preferred_languages=cfg.preferred_languages or None,
         old_package_grace_seconds=cfg.old_package_grace_seconds,
+        work_root=cfg.work_root,
     )
 
     def katalog_client() -> KatalogClient:
@@ -97,7 +106,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
 
-    threading.Thread(target=_sweep, args=(cfg.old_package_grace_seconds,),
+    threading.Thread(target=_sweep, args=(cfg.old_package_grace_seconds, cfg.work_root),
                      daemon=True, name="packager-sweep").start()
 
     worker_thread = threading.Thread(
