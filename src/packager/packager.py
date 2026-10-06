@@ -168,6 +168,11 @@ AUDIO_GROUP = "audio"
 SURROUND_GROUP = "audio-surround"
 SUBTITLE_GROUP = "subs"
 
+# The video codecs a rendition may have: passthrough only, never an
+# encode here. A library v2 package takes HEVC only (library.py).
+VIDEO_CODECS = ("hevc", "h264")
+_CODEC_NAMES = {"hevc": "HEVC", "h264": "H.264"}
+
 STEREO_BITRATE = "192k"
 _STEREO_FORMAT = "aformat=sample_rates=48000:channel_layouts=stereo"
 _SURROUND_FORMAT = "aformat=sample_rates=48000:channel_layouts=5.1(side)|5.1"
@@ -405,18 +410,24 @@ def build_package(
     subtitle_files: list[Any] | None = None,
     trickplay: bool = True,
     manifest_extra: dict[str, Any] | None = None,
+    codecs: tuple[str, ...] = VIDEO_CODECS,
 ) -> Built:
     """Build one package into `stage`, a folder the caller made and owns:
     hls/ (the media playlists, the master), subs/ and trickplay/. Writes
     nothing beside them and no manifest; package_item's arguments, as it
-    passes them (see there). Raises on any failure, leaving what it wrote."""
+    passes them (see there). `codecs` are the video codecs a rendition may
+    have: v0 in another fails the run, a lower rung in another is left out.
+    Raises on any failure, leaving what it wrote."""
     src = inputs.primary.path
     segment_seconds = inputs.segment_seconds or options.segment_seconds
     probe = _ffprobe(src)
-    if probe.video.get("codec_name") not in ("hevc", "h264"):
+    if probe.video.get("codec_name") not in codecs:
+        names = " and ".join(_CODEC_NAMES.get(c, c) for c in codecs)
+        allowed = ("are the allowed input codecs" if len(codecs) > 1
+                   else "is the allowed input codec")
         raise PackageError(
             f"video codec {probe.video.get('codec_name')!r} not supported "
-            "(passthrough only; HEVC and H.264 are the allowed input codecs)"
+            f"(passthrough only; {names} {allowed})"
         )
     # The catalog's language for a track wins over the file's tag.
     overrides = _track_overrides(track_languages)
@@ -477,7 +488,7 @@ def build_package(
         )
         videos = [_StagedVideo(inputs.primary, packaging_source, probe)]
         for rung in inputs.video[1:]:
-            staged = _remux_video(rung, tmpdir, inputs.timestamp_offset)
+            staged = _remux_video(rung, tmpdir, inputs.timestamp_offset, codecs)
             if staged is not None:
                 videos.append(staged)
         subtitle_meta = _extract_subtitles(
@@ -1389,17 +1400,20 @@ class _StagedVideo:
     probe: _Probe
 
 
-def _remux_video(rung: VideoInput, tmpdir: Path, ts_offset: float) -> _StagedVideo | None:
+def _remux_video(
+    rung: VideoInput, tmpdir: Path, ts_offset: float, codecs: tuple[str, ...] = VIDEO_CODECS,
+) -> _StagedVideo | None:
     """Stream-copy a lower rung's video into an MP4 for shaka, on the
-    shared timeline. A rung that can't be packaged is skipped (logged):
-    the item still gets its top rendition."""
+    shared timeline. A rung that can't be packaged (or whose codec isn't
+    one of `codecs`) is skipped (logged): the item still gets its top
+    rendition."""
     try:
         probe = _ffprobe(rung.path)
     except (subprocess.CalledProcessError, ValueError) as e:
         log.warning("packager.rung.probe_failed", rung=rung.id, error=str(e)[:300])
         return None
     codec = probe.video.get("codec_name")
-    if codec not in ("hevc", "h264"):
+    if codec not in codecs:
         log.warning("packager.rung.unsupported_codec", rung=rung.id, codec=codec)
         return None
     target = tmpdir / f"{rung.id}.mp4"
