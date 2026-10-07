@@ -175,6 +175,15 @@ flag doesn't count: ffmpeg flags the first subtitle default when a file
 has several and flags none, which showed German subtitles by themselves
 on an English film.
 
+**HEVC parameter sets.** Some files carry an HEVC decoder configuration
+(the Matroska CodecPrivate) that names no VPS, SPS or PPS: they are in
+the stream only. FFmpeg's MP4 muxer (7.1 and later) writes an empty
+`hvcC` for such a stream copied as `hvc1`, which shaka-packager can't
+parse, so the packager copies it through Annex B (`hevc_mp4toannexb`),
+and the muxer builds the `hvcC` from the parameter sets of the first
+frame. Nothing is re-encoded; every other stream is copied exactly as
+before.
+
 **Compatibility.** Rendition dirs stay `vN` / `aN`, so the existing
 playback routes serve every rung and both audio groups. `renditions.video[0]`
 is still the top rung. Before a ladder is enabled, the playback service

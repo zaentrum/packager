@@ -1319,6 +1319,7 @@ def _prepare_source(
         "-c:v", "copy",
     ]
     if probe.video.get("codec_name") == "hevc":
+        args += _hevc_copy_args(src, probe.video_index)
         # Tag HEVC as hvc1 so MP4 readers (and shaka-packager) recognise
         # the codec — many MKV→MP4 muxers leave it as hev1, which some
         # tools then reject. ONLY for HEVC sources; forcing it on H.264
@@ -1423,7 +1424,8 @@ def _remux_video(
         *_timeline_input_args(rung.timeline),
         "-i", str(rung.path),
         "-map", vmap, "-c:v", "copy",
-        *(["-tag:v", "hvc1"] if codec == "hevc" else []),
+        *([*_hevc_copy_args(rung.path, probe.video_index), "-tag:v", "hvc1"]
+          if codec == "hevc" else []),
         "-an", "-sn", "-dn",
         *_timeline_output_args(rung.timeline, ts_offset),
         "-movflags", "+faststart", str(target),
@@ -1434,6 +1436,104 @@ def _remux_video(
         log.warning("packager.rung.remux_failed", rung=rung.id, error=str(e)[:300])
         return None
     return _StagedVideo(rung, target, probe)
+
+
+# An HEVC stream's parameter sets (VPS, SPS, PPS) are in its decoder
+# configuration record, the hvcC its container carries (a Matroska
+# CodecPrivate), and may be in the stream as well. Some files' hvcC names
+# none of them: their parameter sets are in the stream only. FFmpeg's MP4
+# muxer (since 7.1) rebuilds the hvcC it is handed, needs a VPS, an SPS
+# and a PPS in it for an hvc1 track, and without them writes an empty hvcC
+# box, which shaka-packager can't parse ("Failed to parse hevc"). The
+# stream is then copied through Annex B (hevc_mp4toannexb): it reaches the
+# muxer without a decoder configuration, and the muxer builds a whole one
+# from the parameter sets of the first frame. Nothing is re-encoded, and
+# every other stream is copied exactly as before.
+_HEVC_PARAMETER_SETS = frozenset({32, 33, 34})  # VPS, SPS, PPS
+_DUMP_LINE = re.compile(r"[0-9a-f]{8}: ")
+
+
+def _hevc_copy_args(path: Path, stream_index: int | None) -> list[str]:
+    """What a stream copy of the HEVC stream at stream_index needs on top
+    to become an hvc1 track shaka-packager reads: the Annex B round trip
+    when its decoder configuration has no parameter sets, else nothing."""
+    if not _parameter_sets_in_band_only(path, stream_index):
+        return []
+    log.info("packager.hevc.in_band_parameter_sets", path=str(path), stream=stream_index)
+    return ["-bsf:v", "hevc_mp4toannexb"]
+
+
+def _parameter_sets_in_band_only(path: Path, stream_index: int | None) -> bool:
+    """Whether the HEVC stream's decoder configuration record, the hvcC its
+    container carries, lacks a VPS, an SPS or a PPS. False when it has all
+    three, when it is none (no record, or Annex B parameter sets, which the
+    muxer reads itself) and when it can't be read."""
+    record = _codec_private(path, stream_index)
+    return record is not None and _hvcc_lacks_parameter_sets(record)
+
+
+def _codec_private(path: Path, stream_index: int | None) -> bytes | None:
+    """A stream's extradata (a Matroska CodecPrivate, an MP4 sample entry's
+    record), as ffprobe dumps it; None without one, or when it can't be
+    read."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams",
+             str(stream_index) if stream_index is not None else "v:0",
+             "-show_entries", "stream=extradata_size,extradata", "-show_data",
+             "-print_format", "json", str(path)],
+            capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL, timeout=120)
+        streams = json.loads(out.stdout).get("streams") or []
+    except (OSError, ValueError, AttributeError, subprocess.SubprocessError) as e:
+        log.warning("packager.extradata_probe_failed", path=str(path), error=str(e)[:200])
+        return None
+    if len(streams) != 1 or not isinstance(streams[0], dict):
+        return None
+    size = streams[0].get("extradata_size")
+    data = _dump_bytes(streams[0].get("extradata") or "")
+    return data if isinstance(size, int) and size > 0 and len(data) == size else None
+
+
+def _dump_bytes(dump: str) -> bytes:
+    """The bytes of an ffprobe -show_data dump: lines of an offset, then up
+    to 16 bytes in hex, two to a group, in the 41 columns after it, then
+    their text. b"" for a dump it can't read."""
+    out = bytearray()
+    for line in dump.splitlines():
+        if _DUMP_LINE.match(line):
+            try:
+                out += bytes.fromhex(line[10:51])
+            except ValueError:
+                return b""
+    return bytes(out)
+
+
+def _hvcc_lacks_parameter_sets(record: bytes) -> bool:
+    """Whether an HEVCDecoderConfigurationRecord (ISO/IEC 14496-15) names
+    no VPS, no SPS or no PPS of the base layer (nuh_layer_id 0), or ends
+    before its arrays do: the record FFmpeg's MP4 muxer can't rebuild.
+    False for what isn't one (none, or Annex B parameter sets)."""
+    if len(record) < 23 or record[0] != 1:
+        return False
+    found: set[int] = set()
+    pos = 23
+    for _ in range(record[22]):              # numOfArrays
+        if pos + 3 > len(record):
+            return True
+        nal_type = record[pos] & 0x3F
+        count = int.from_bytes(record[pos + 1:pos + 3], "big")
+        pos += 3
+        for _ in range(count):
+            if pos + 2 > len(record):
+                return True
+            length = int.from_bytes(record[pos:pos + 2], "big")
+            pos += 2
+            if pos + length > len(record):
+                return True
+            if length >= 2 and ((record[pos] & 1) << 5 | record[pos + 1] >> 3) == 0:
+                found.add(nal_type)
+            pos += length
+    return not _HEVC_PARAMETER_SETS <= found
 
 
 # The English name of every ISO 639-1 language, by its 639-1 code, its
