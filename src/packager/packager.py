@@ -1896,6 +1896,50 @@ def _audio_meta_from_stream(
     }
 
 
+@dataclass(frozen=True)
+class _Sidecar:
+    """How one embedded subtitle stream becomes a sidecar file: its name
+    in subs/, the manifest's `format` for it, ffmpeg's output options for
+    it, and whether it is written in the one pass over the source with the
+    others (_extract_subtitles)."""
+    index: int             # among the source's subtitle streams
+    name: str
+    format: str
+    options: tuple[str, ...]
+    one_pass: bool
+
+
+# Subtitle codecs that are bitmaps but not PGS: WebVTT can't be made of
+# them (XSUB, and DVB teletext, which libzvbi decodes to bitmaps by
+# default), and FFmpeg has no muxer for a VobSub .idx/.sub pair or a .dvb
+# file. Their extraction fails while ffmpeg sets its outputs up, before
+# it reads the source, so each keeps its own attempt, outside the pass
+# with the others, which it would otherwise fail.
+_SETUP_FAILS = frozenset({"dvd_subtitle", "dvb_subtitle", "xsub", "dvb_teletext"})
+
+
+def _sidecar(index: int, codec: str) -> _Sidecar:
+    if codec == "hdmv_pgs_subtitle":
+        # PGS — stream-copy to a raw .sup file. The PGS bitstream IS the
+        # .sup container (sequence of PCS/WDS/PDS/ODS/END segments);
+        # ffmpeg -c:s copy preserves every byte. Clients that ship a PGS
+        # renderer (Media3's PgsDecoder on Android, a libpgs-based canvas
+        # overlay on web, a Swift PGS layer on iOS) can decode + composite
+        # the bitmaps frame-accurate.
+        return _Sidecar(index, f"{index}.sup", "pgs", ("-c:s", "copy", "-f", "sup"), True)
+    if codec == "dvd_subtitle":
+        # VobSub — a .sub + .idx pair (.idx is the palette + index, .sub
+        # the bitmap stream), were ffmpeg to write format=vobsub.
+        return _Sidecar(index, f"{index}.idx", "vobsub", ("-c:s", "copy", "-f", "vobsub"),
+                        False)
+    if codec == "dvb_subtitle":
+        # DVB bitmap subs — rare outside broadcast recordings: a raw .dvb
+        # file, for the same renderer-on-the-client story as PGS.
+        return _Sidecar(index, f"{index}.dvb", "dvb", ("-c:s", "copy"), False)
+    return _Sidecar(index, f"{index}.vtt", "webvtt", ("-c:s", "webvtt"),
+                    codec not in _SETUP_FAILS)
+
+
 def _extract_subtitles(
     src: Path, probe: _Probe, subs_dir: Path,
     *,
@@ -1911,6 +1955,15 @@ def _extract_subtitles(
     `format` hint and fall back to the WebVTT tracks for the same
     language. HLS can't carry the image formats; they stay sidecar-only.
 
+    The PGS and text tracks are written in one ffmpeg run, one output
+    each: the source is read once, not once per track — a title with
+    dozens of tracks on slow storage took one full read of the file each.
+    When that run fails, each track is extracted alone, as before, so a
+    track ffmpeg can't extract costs that track only. A track of a codec
+    that fails while ffmpeg sets its outputs up keeps an attempt of its
+    own (_SETUP_FAILS): VobSub and DVB tracks so are never extracted, as
+    ffmpeg can write neither.
+
     Returns the list of subtitle entries for the manifest. Each
     entry carries `format` so the catalog (and downstream clients)
     can distinguish what's on disk.
@@ -1925,112 +1978,82 @@ def _extract_subtitles(
     if not probe.subtitles:
         return []
     subs_dir.mkdir(parents=True, exist_ok=True)
+    codecs = [s.get("codec_name", "") for s in probe.subtitles]
+    sidecars = [_sidecar(i, codec) for i, codec in enumerate(codecs)]
+    together = [c for c in sidecars if c.one_pass]
+    written = _extract_together(src, subs_dir, together) if len(together) > 1 else None
+    if written is None:
+        written = {c.index for c in together if _extract_alone(src, subs_dir, c, codecs[c.index])}
+    written |= {c.index for c in sidecars
+                if not c.one_pass and _extract_alone(src, subs_dir, c, codecs[c.index])}
     out: list[dict[str, Any]] = []
-    for i, s in enumerate(probe.subtitles):
-        codec = s.get("codec_name", "")
+    for c, s in zip(sidecars, probe.subtitles, strict=True):
+        if c.index not in written:
+            continue
+        if c.format == "pgs":
+            log.info("packager.subs.pgs_sidecar", idx=c.index,
+                     bytes=(subs_dir / c.name).stat().st_size)
+        elif c.format == "vobsub":
+            log.info("packager.subs.vobsub_sidecar", idx=c.index)
+        elif c.format == "dvb":
+            log.info("packager.subs.dvb_sidecar", idx=c.index)
         tags = s.get("tags") or {}
         disp = s.get("disposition") or {}
-        common = {
-            "id": f"sub{i}",
+        out.append({
+            "id": f"sub{c.index}",
             "language": _track_language(s),
             "title": tags.get("title") or "",
             "default": False,
             "forced": bool(disp.get("forced")),
-            "visible": visible_indices is None or i in visible_indices,
-        }
-        if codec == "hdmv_pgs_subtitle":
-            # PGS — stream-copy to a raw .sup file. The PGS bitstream
-            # IS the .sup container (sequence of PCS/WDS/PDS/ODS/END
-            # segments); ffmpeg -c:s copy preserves every byte. Clients
-            # that ship a PGS renderer (Media3's PgsDecoder on Android,
-            # a libpgs-based canvas overlay on web, a Swift PGS layer
-            # on iOS) can decode + composite the bitmaps frame-accurate.
-            target = subs_dir / f"{i}.sup"
-            try:
-                subprocess.run(
-                    [
-                        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-                        "-i", str(src),
-                        "-map", f"0:s:{i}",
-                        "-c:s", "copy",
-                        "-f", "sup",
-                        str(target),
-                    ],
-                    check=True,
-                )
-            except subprocess.CalledProcessError as e:
-                log.warning("packager.subs.failed", idx=i, codec=codec, error=str(e))
-                continue
-            log.info("packager.subs.pgs_sidecar", idx=i, bytes=target.stat().st_size)
-            out.append({**common, "path": f"subs/{i}.sup", "format": "pgs"})
-            continue
-        if codec == "dvd_subtitle":
-            # VobSub — ffmpeg writes a .sub + .idx pair when format=vobsub
-            # is requested. Both files travel together (.idx is the
-            # palette + index, .sub is the bitmap stream).
-            target = subs_dir / f"{i}.idx"
-            try:
-                subprocess.run(
-                    [
-                        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-                        "-i", str(src),
-                        "-map", f"0:s:{i}",
-                        "-c:s", "copy",
-                        "-f", "vobsub",
-                        str(target),
-                    ],
-                    check=True,
-                )
-            except subprocess.CalledProcessError as e:
-                log.warning("packager.subs.failed", idx=i, codec=codec, error=str(e))
-                continue
-            log.info("packager.subs.vobsub_sidecar", idx=i)
-            out.append({**common, "path": f"subs/{i}.idx", "format": "vobsub"})
-            continue
-        if codec == "dvb_subtitle":
-            # DVB bitmap subs — rare outside broadcast recordings, but
-            # possible. Stream-copy to a raw .dvb file
-            # for the same renderer-on-the-client story as PGS.
-            target = subs_dir / f"{i}.dvb"
-            try:
-                subprocess.run(
-                    [
-                        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-                        "-i", str(src),
-                        "-map", f"0:s:{i}",
-                        "-c:s", "copy",
-                        str(target),
-                    ],
-                    check=True,
-                )
-            except subprocess.CalledProcessError as e:
-                log.warning("packager.subs.failed", idx=i, codec=codec, error=str(e))
-                continue
-            log.info("packager.subs.dvb_sidecar", idx=i)
-            out.append({**common, "path": f"subs/{i}.dvb", "format": "dvb"})
-            continue
-        target = subs_dir / f"{i}.vtt"
-        try:
-            subprocess.run(
-                [
-                    "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-                    "-i", str(src),
-                    "-map", f"0:s:{i}",
-                    "-c:s", "webvtt",
-                    str(target),
-                ],
-                check=True,
-            )
-        except subprocess.CalledProcessError as e:
-            log.warning("packager.subs.failed", idx=i, codec=codec, error=str(e))
-            continue
-        # Client-side visibility hint. None means show every entry
-        # (no whitelist configured); a set narrows to the source
-        # indices the language filter accepted. We still write the
-        # WebVTT file for invisible tracks so a power-user feature
-        # can opt back in without re-packaging.
-        out.append({**common, "path": f"subs/{i}.vtt", "format": "webvtt"})
+            # Client-side visibility hint. None means show every entry
+            # (no whitelist configured); a set narrows to the source
+            # indices the language filter accepted. We still write the
+            # file for invisible tracks so a power-user feature can opt
+            # back in without re-packaging.
+            "visible": visible_indices is None or c.index in visible_indices,
+            "path": f"subs/{c.name}",
+            "format": c.format,
+        })
     return out
+
+
+def _extract_together(src: Path, subs_dir: Path, sidecars: list[_Sidecar]) -> set[int] | None:
+    """Write every one of the sidecars in one ffmpeg run over the source,
+    an output each. Returns the indices it wrote — all of them — or None
+    when the run failed, with what it wrote removed."""
+    args = ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning", "-i", str(src)]
+    for c in sidecars:
+        args += ["-map", f"0:s:{c.index}", *c.options, str(subs_dir / c.name)]
+    t0 = time.monotonic()
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except OSError as e:
+        result = subprocess.CompletedProcess(args, -1, "", str(e))
+    stderr = (result.stderr or "").strip()
+    if result.returncode == 0 and all((subs_dir / c.name).is_file() for c in sidecars):
+        log.info("packager.subs.one_pass", tracks=len(sidecars),
+                 elapsed_s=round(time.monotonic() - t0, 1), warnings=stderr[-300:] or None)
+        return {c.index for c in sidecars}
+    log.warning("packager.subs.one_pass_failed", tracks=len(sidecars), code=result.returncode,
+                error=stderr[-500:] or None)
+    for c in sidecars:
+        (subs_dir / c.name).unlink(missing_ok=True)
+    return None
+
+
+def _extract_alone(src: Path, subs_dir: Path, c: _Sidecar, codec: str) -> bool:
+    """Write one sidecar in a run of its own, as every one was once.
+    False, logged, when ffmpeg fails."""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
+             "-i", str(src), "-map", f"0:s:{c.index}", *c.options, str(subs_dir / c.name)],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        log.warning("packager.subs.failed", idx=c.index, codec=codec, error=str(e))
+        return False
+    return True
 
 
 # The subtitle files next to a source the packager takes, by extension;
