@@ -61,19 +61,53 @@ def test_default_skips_commentary_and_hidden_tracks() -> None:
 
 def test_surround_plan_first_per_language_copy_or_encode() -> None:
     streams = [
-        _a("eng", 8, "truehd"),           # encode -> E-AC-3 5.1
+        _a("eng", 8, "truehd"),           # 7.1: encoded, downmixed -> E-AC-3 5.1
         _a("eng", 6, "ac3"),              # second English surround: skipped
-        _a("ger", 6, "eac3"),             # already E-AC-3: copied
+        _a("ger", 6, "eac3"),             # already an E-AC-3 5.1: copied
         _a("eng", 6, "dts", comment=True),
-        _a("fre", 6, "dts"),              # hidden by the whitelist
+        _a("fre", 6, "dts"),              # hidden by the whitelist: a companion all the same
         _a("ita", 2, "aac"),              # stereo
     ]
     plan = pk._surround_plan(streams, {0, 1, 2, 3, 5}, pk.PackageOptions())
+    # Every surround track's language keeps its 5.1: the package is what is
+    # left of the original once it is deleted.
     assert [(s.source_index, s.mode, s.hls_codec) for s in plan] == [
-        (0, "encode", "ec-3"), (2, "copy", "ec-3")]
+        (0, "encode", "ec-3"), (2, "copy", "ec-3"), (4, "encode", "ec-3")]
     assert pk._surround_plan(streams, {0}, pk.PackageOptions(surround_codec="off")) == []
-    ac3 = pk._surround_plan(streams, {1}, pk.PackageOptions(surround_codec="ac3"))
-    assert [(s.mode, s.hls_codec) for s in ac3] == [("copy", "ac-3")]
+    ac3 = pk._surround_plan(streams[1:], {0}, pk.PackageOptions(surround_codec="ac3"))
+    assert [(s.source_index, s.mode, s.hls_codec) for s in ac3] == [
+        (0, "copy", "ac-3"), (1, "encode", "ac-3"), (3, "encode", "ac-3")]
+
+
+@pytest.mark.parametrize(("channels", "codec", "mode"), [
+    (6, "eac3", "copy"),        # an E-AC-3 5.1 (Atmos too) is kept as it is
+    (8, "eac3", "encode"),      # an E-AC-3 7.1 is made a 5.1, as every companion is
+    (5, "eac3", "encode"),      # 5.0: up to 5.1
+    (3, "aac", "encode"),       # 3.0 is surround to a record's essence: > 2 channels
+    (4, "flac", "encode"),
+    (8, "pcm_s24le", "encode"),
+])
+def test_every_surround_track_gets_a_5_1_companion(channels: int, codec: str, mode: str) -> None:
+    [s] = pk._surround_plan([_a("eng", channels, codec)], {0}, pk.PackageOptions())
+    assert (s.source_index, s.mode, s.codec, s.hls_codec, s.bitrate) == (
+        0, mode, "eac3", "ec-3", "448k")
+
+
+def test_a_stereo_or_mono_source_gets_no_companion() -> None:
+    streams = [_a("eng", 2, "ac3"), _a("ger", 1, "aac"), _a("fre", 2, "eac3")]
+    assert pk._surround_plan(streams, {0, 1, 2}, pk.PackageOptions()) == []
+
+
+def test_the_default_companion_is_a_shown_one() -> None:
+    # English hidden by the whitelist (the default stereo is French, which
+    # has no 5.1): the German 5.1 is the group's default, not the English.
+    streams = [_a("eng", 6, "dts"), _a("ger", 6, "dts"), _a("fre", 2, "aac")]
+    plan = pk._surround_plan(streams, {1, 2}, pk.PackageOptions())
+    assert [s.source_index for s in plan] == [0, 1]
+    assert pk._pick_default_surround(plan, streams, 2, ["en", "de"], {1, 2}) == 1
+    # Without a shown one, a hidden one: the group still has its default.
+    assert pk._pick_default_surround(plan, streams, 2, ["en"], {2}) == 0
+    assert pk._pick_default_surround(plan, streams, 2, ["en"]) == 0
 
 
 
@@ -153,6 +187,25 @@ def test_prepare_source_command(monkeypatch, tmp_path: Path) -> None:
     assert [(m["idx"], m["codec"], m["channels"], m["default"], m["mode"])
             for m in surround_meta] == [(0, "ec-3", 6, False, "encode"),
                                         (1, "ec-3", 6, True, "copy")]
+
+
+def test_a_hidden_tracks_companion_is_hidden_too(monkeypatch, tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: calls.append(args))
+    audio = [_a("eng", 6, "dts"), _a("fre", 8, "truehd"), _a("ger", 2, "aac")]
+    visible = {0, 2}
+    surround = pk._surround_plan(audio, visible, pk.PackageOptions())
+    _mp4, meta, surround_meta = pk._prepare_source(
+        Path("/m/src.mkv"), _probe(audio), tmp_path, audio_visible_indices=visible,
+        default_index=0, surround=surround,
+        surround_default=pk._pick_default_surround(surround, audio, 0, ["en"], visible))
+    assert [(m["idx"], m["visible"]) for m in meta] == [(0, True), (1, False), (2, True)]
+    assert [(m["idx"], m["channels"], m["default"], m["visible"], m["mode"])
+            for m in surround_meta] == [(0, 6, True, True, "encode"),
+                                        (1, 6, False, False, "encode")]
+    # The 7.1 is made a 5.1 like the others: the same filter, a 5.1 layout.
+    graph = calls[0][calls[0].index("-filter_complex") + 1]
+    assert "[am1]aformat=sample_rates=48000:channel_layouts=5.1(side)|5.1[m1]" in graph
 
 
 def test_prepare_source_legacy_timeline_has_no_copyts(monkeypatch, tmp_path: Path) -> None:

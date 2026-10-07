@@ -15,12 +15,14 @@ Design rules:
   audio group, plus one I-frame playlist per rendition. The master is
   assembled by `packager.hls` from shaka's media playlists.
 * Audio: every source track becomes an AAC-LC 48 kHz stereo rendition
-  (group "audio" — what every browser decodes). A visible source track
-  with >= 6 channels additionally gets a 5.1 E-AC-3 (or AC-3) rendition,
-  first per language, in group "audio-surround". Exactly one rendition
-  per group is DEFAULT=YES: the preferred-language track; in the 5.1
-  group its companion, else the 5.1 rendition of its language, else that
-  of the first preferred language with one, else the first.
+  (group "audio" — what every browser decodes). A source track with
+  more than two channels (with SURROUND_AUDIO) additionally gets a 5.1
+  E-AC-3 (or AC-3) rendition, first per language, in group
+  "audio-surround", shown or hidden as its stereo rendition is. Exactly
+  one rendition per group is DEFAULT=YES: the preferred-language track;
+  in the 5.1 group its companion, else the 5.1 rendition of its
+  language, else that of the first preferred language with one, else the
+  first — a shown one before a hidden one.
 * Subtitles are extracted to sidecar files (WebVTT for text, native
   bitmap formats for PGS/VobSub/DVB) exactly as before; the subtitle
   files next to the source (the item record's subtitleFiles) are
@@ -454,7 +456,8 @@ def build_package(
     preferred = list(options.preferred_languages) or list(language_whitelist or [])
     default_audio = _pick_default_audio(probe.audio, audio_visible, preferred)
     surround = _surround_plan(probe.audio, audio_visible, options)
-    default_surround = _pick_default_surround(surround, probe.audio, default_audio, preferred)
+    default_surround = _pick_default_surround(surround, probe.audio, default_audio, preferred,
+                                              audio_visible)
     log.info(
         "packager.lang_filter",
         whitelist=language_whitelist or None,
@@ -1204,26 +1207,32 @@ def _surround_plan(
     visible: set[int],
     options: PackageOptions,
 ) -> list[_SurroundTrack]:
-    """Which source tracks get a 5.1 companion: visible, >= 6 channels,
-    not a commentary, first such track per language (a second English
-    5.1 would be a duplicate). Stream-copied when the source already is
-    the target codec (an E-AC-3 track), encoded otherwise (DTS, TrueHD,
-    FLAC, PCM, AC-3 when the target is E-AC-3)."""
+    """Which source tracks get a 5.1 companion: every surround track — more
+    than two channels, as a record's essence counts surround — but a
+    commentary, the first such track per language (a second English one
+    would be a duplicate). A track hidden by the language whitelist gets
+    its companion too, hidden as its stereo rendition is: the package
+    keeps what the original carries. Stream-copied when the track already
+    is a 5.1 of the target codec (an E-AC-3 5.1, Atmos included), encoded
+    to 5.1 otherwise: DTS, TrueHD, FLAC, PCM, AC-3 when the target is
+    E-AC-3, a 7.1 downmixed, fewer channels upmixed. `visible` is not
+    consulted (see _surround_meta)."""
     codec = (options.surround_codec or "off").lower()
     if codec not in _SURROUND_CODECS:
         return []
     plan: list[_SurroundTrack] = []
     seen: set[str] = set()
     for i, s in enumerate(streams):
-        if i not in visible or int(s.get("channels") or 0) < 6 or _is_commentary(s):
+        channels = int(s.get("channels") or 0)
+        if channels <= 2 or _is_commentary(s):
             continue
         key = _lang_key(_track_language(s))
         if key in seen:
             continue
         seen.add(key)
-        mode = "copy" if (s.get("codec_name") or "").lower() == codec else "encode"
-        plan.append(_SurroundTrack(i, mode, codec, _SURROUND_CODECS[codec],
-                                   options.surround_bitrate))
+        same = (s.get("codec_name") or "").lower() == codec and channels == 6
+        plan.append(_SurroundTrack(i, "copy" if same else "encode", codec,
+                                   _SURROUND_CODECS[codec], options.surround_bitrate))
     return plan
 
 
@@ -1232,12 +1241,14 @@ def _pick_default_surround(
     streams: list[dict[str, Any]],
     default_index: int | None,
     preferred: list[str],
+    visible: set[int] | None = None,
 ) -> int | None:
     """The source index of the one 5.1 rendition marked DEFAULT=YES, so the
-    5.1 group has exactly one, as the stereo group does: the default stereo
-    track's own companion; else the 5.1 rendition in the default track's
-    language (a companion of another track of it); else the one in the
-    first preferred language that has one; else the first. None without 5.1
+    5.1 group has exactly one, as the stereo group does: a visible one
+    (`visible`, None: all) before a hidden one; the default stereo track's
+    own companion; else the 5.1 rendition in the default track's language
+    (a companion of another track of it); else the one in the first
+    preferred language that has one; else the first. None without 5.1
     renditions. (The plan holds at most one per language.)"""
     if not plan:
         return None
@@ -1245,9 +1256,10 @@ def _pick_default_surround(
                    if default_index is not None else None)
     wanted = [_lang_key(p) for p in preferred]
 
-    def rank(s: _SurroundTrack) -> tuple[bool, bool, int]:
+    def rank(s: _SurroundTrack) -> tuple[bool, bool, bool, int]:
         key = _lang_key(_track_language(streams[s.source_index]))
-        return (s.source_index != default_index, key != default_key,
+        return (visible is not None and s.source_index not in visible,
+                s.source_index != default_index, key != default_key,
                 wanted.index(key) if key in wanted else len(wanted))
 
     return min(plan, key=rank).source_index
@@ -1386,9 +1398,11 @@ def _prepare_source(
             "codec": s.hls_codec,
             "language": _track_language(stream),
             "title": tags.get("title") or "",
-            "channels": int(stream.get("channels") or 6) if s.mode == "copy" else 6,
+            # Always a 5.1: a copy is one (_surround_plan), an encode is made one.
+            "channels": 6,
             "default": s.source_index == surround_default,
-            "visible": True,
+            # Shown where its stereo rendition is.
+            "visible": audio_visible_indices is None or s.source_index in audio_visible_indices,
             "mode": s.mode,
         })
     return transmuxed, meta, surround_meta
