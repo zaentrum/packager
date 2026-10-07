@@ -54,9 +54,10 @@ class Config:
     # HLS segment length when the transcoder's renditions.json doesn't say
     # (it records the keyframe interval it encoded with, which wins).
     segment_seconds: int = 6
-    # 5.1 companion for >= 6-channel tracks: eac3 | ac3 | off. Off until
-    # chino-stream drops the audio-surround group for clients that don't
-    # advertise eac3/ac3: a player that can't decode it may still pick it.
+    # The 5.1 companion of every surround track: eac3 | ac3 | off. Off
+    # unless the platform turns it on (its pipeline.surroundAudio);
+    # chino-stream serves the audio-surround group only to clients whose
+    # caps say they decode its codec.
     surround_audio: str = "off"
     surround_bitrate: str = "448k"
     # Reference the WebVTT HLS renditions from the master. Off by default:

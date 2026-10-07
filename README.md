@@ -130,17 +130,28 @@ hide every track of a source in one language,
 track tagged `und` (unknown) or `zxx` (no dialogue) is always visible.
 
 **Audio.** Every source track becomes an AAC-LC 48 kHz stereo rendition
-in group `audio`, as before. With `SURROUND_AUDIO` set (it is `off` by
-default until chino-stream filters the master per client), a visible
-track with ≥ 6 channels also gets a 5.1 E-AC-3 rendition in group
-`audio-surround`, first per language, commentary excluded. The source track is stream-copied when it
-already is E-AC-3, encoded at 448k otherwise. In the stereo group,
+in group `audio`, as before. With `SURROUND_AUDIO` set (`eac3`; it is
+`off` unless the platform turns it on), every surround track — more than
+two channels, as a library record's essence counts surround — also gets
+a 5.1 E-AC-3 rendition in group `audio-surround`, the first per
+language, commentary excluded: a film in four languages keeps a 5.1 in
+each, and a stereo film gets none. A track the language whitelist hides
+gets its companion too, hidden as its stereo rendition is (the package
+keeps what the original carries). An E-AC-3 5.1 (Atmos included) is
+stream-copied, bit for bit; anything else is encoded to a 5.1 at 448k: a
+7.1 downmixed (a 5.1 can't keep its two extra channels, which a v2
+record's deletion gate still names as lost), fewer channels upmixed.
+Every companion is a 5.1: `CHANNELS="6"`, `CODECS` `ec-3`, its NAME the
+language's with " 5.1" ("German 5.1"). chino-stream serves the group
+only to a client whose caps include `eac3` (`internal/play/ladder.go`);
+`/play/info` lists the stereo renditions. In the stereo group,
 DEFAULT=YES goes to the first language of `PREFERRED_LANGUAGES`
 (default: the `packager.language_whitelist` order) that has a track. In
 the 5.1 group it goes to that track's 5.1 companion; when it has none,
 to the 5.1 rendition of its language, else of the first preferred
-language that has one, else to the first — so the 5.1 group has its one
-default even when the default language has no 5.1 track. Language tags
+language that has one, else to the first, a shown one before a hidden
+one — so the 5.1 group has its one default even when the default
+language has no 5.1 track. Language tags
 match across ISO 639-1/-2 (`de` = `ger` = `deu`). In `manifest.json`,
 `renditions.audio` still lists the stereo tracks only, with exactly one
 `default`. The 5.1 renditions go under `renditions.audioSurround` (also
@@ -460,7 +471,7 @@ Dockerfile
 | `KAFKA_TOPIC_PREFIX` | `stube.` | Tenant topic prefix of the extras' topic, `<prefix>catalog.extra.transcoded` (see [Extras](#extras)) |
 | `EXTRAS_GROUP_ID` | `packager-extras` | The extras' consumer group |
 | `SEGMENT_SECONDS` | `6` | Segment length when renditions.json doesn't set it |
-| `SURROUND_AUDIO` | `off` | 5.1 companion codec: `eac3`, `ac3` or `off`. Turn on only once chino-stream drops the `audio-surround` group for clients that can't decode it |
+| `SURROUND_AUDIO` | `off` | 5.1 companion codec: `eac3`, `ac3` or `off` (see "Audio"). chino-stream serves the `audio-surround` group only to clients that decode it |
 | `SURROUND_BITRATE` | `448k` | Bitrate of an encoded 5.1 companion |
 | `HLS_SUBTITLES` | `false` | Reference the WebVTT renditions from the master |
 | `PREFERRED_LANGUAGES` | (empty) | DEFAULT=YES language order, e.g. `de,en`; empty = whitelist order |

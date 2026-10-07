@@ -68,8 +68,7 @@ def test_config_packages_root_override(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_config_surround_is_off_unless_asked(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Off by default: a master with an audio-surround group reaches clients
-    # that can't decode it until chino-stream filters it per client.
+    # Off unless the platform turns it on (its pipeline.surroundAudio).
     monkeypatch.setenv("KATALOG_API_URL", "http://katalog-app")
     monkeypatch.setenv("OIDC_TOKEN_URL", "https://sso.example/token")
     monkeypatch.setenv("OIDC_CLIENT_ID", "katalog")
