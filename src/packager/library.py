@@ -355,11 +355,13 @@ class Placed:
 
 @dataclass(frozen=True)
 class SidecarCopy:
-    """A file from beside the original, as its source folder keeps it."""
-    name: str               # its name in sources/<sid>/
-    original_name: str      # its name beside the original
-    path: Path              # where it was copied from (a recorded one: where it is)
-    kind: str               # subtitle | nfo | image | other
+    """The copy a source folder keeps of a subtitle file that came with
+    the original: its name there (the record logic's, subtitle-<n>…), the
+    file it was copied from (a recorded copy: itself), and its bytes'
+    sha256:<hex>, by which a file is known for it whatever it is called."""
+    name: str
+    path: Path
+    sha256: str
 
 
 def package_version(
@@ -413,6 +415,7 @@ def package_version(
     original = Path(item.path)
     if lib.build.mode == ESTABLISH:
         _at_its_arrival(original, lib)
+        _named_as_its_source_names_it(item, lib)
     fixity = _check_original(original, lib.source.size_bytes, lib.source.qh1, "the original")
     open_staging(staging)
     try:
@@ -448,14 +451,30 @@ def _at_its_arrival(original: Path, lib: ItemLibrary) -> None:
 
 
 def _names_its_original(source: dict[str, Any], lib: ItemLibrary) -> None:
-    """A source recorded already names its original as the version will
-    keep it: a version's originals are its sources' files."""
+    """A source record names its original as the version will keep it: a
+    version's originals are its sources' files."""
     name = (source.get("file") or {}).get("name")
     if name != lib.build.original_name:
         raise PackageError(
             f"sources/{lib.source.source_id} names its original {name!r}, and the version "
             f"would keep it as {lib.build.original_name!r}: a version names its originals as "
             f"its sources do")
+
+
+def _named_as_its_source_names_it(item: ClaimedItem, lib: ItemLibrary) -> None:
+    """The name the worker record gives the original in its version folder
+    is the one its source record has — or will have: the record logic
+    names a source's file from the name it arrived under
+    (library_original_name) — checked before anything is built."""
+    sdir = Path(lib.source.record_dir)
+    if (sdir / SUMS).is_file():
+        _names_its_original(_recorded_source(sdir, lib.source.source_id)[0], lib)
+    elif rec.library_original_name(Path(item.path).name) != lib.build.original_name:
+        raise PackageError(
+            f"the worker record names the original {lib.build.original_name!r} in its version "
+            f"folder, and its source record would name it "
+            f"{rec.library_original_name(Path(item.path).name)!r}: a version names its originals "
+            f"as its sources do")
 
 
 def _check_original(path: Path, size: int | None, recorded: str | None, what: str) -> str:
@@ -528,15 +547,16 @@ def _source_of(
     <stagingDir>/source/ unless the source is recorded already (True when
     it is staged now), else read — and, for a run that renames the
     original into the version folder, one that names its original as the
-    version keeps it."""
+    version keeps it, whichever it is."""
     sdir = Path(lib.source.record_dir)
-    if not (sdir / SUMS).is_file():
+    staged = not (sdir / SUMS).is_file()
+    if staged:
         source, copies = _stage_source(staging / "source", item, lib, probe, fixity, now)
-        return source, copies, True
-    source, copies = _recorded_source(sdir, lib.source.source_id)
+    else:
+        source, copies = _recorded_source(sdir, lib.source.source_id)
     if lib.build.original_name is not None:
         _names_its_original(source, lib)
-    return source, copies, False
+    return source, copies, staged
 
 
 def _into_the_record(
@@ -751,15 +771,19 @@ def _stage_source(
     fixity: str, now: str,
 ) -> tuple[dict[str, Any], list[SidecarCopy]]:
     """sources/<sid>/ in staging (contract sections 3.2, 3.3), in the
-    record logic's order: a copy of every subtitle file the catalog named
-    and of the original's <stem>.nfo/.jpg/.png/.txt, each under the name
-    libv2_records.sidecar_names gives it; source.json and its ffprobe.json;
-    the checksums over all of them, last. Returns the record and the
+    record logic's order: a copy of each subtitle file the catalog named
+    that is there, numbered from 1 in the catalog's order, under the name
+    the record logic gives it (subtitle-<n>.<lang>[.forced][.sdh].<ext>:
+    libv2_records.sidecar_entry) — and of nothing else that sat beside the
+    original; source.json and its ffprobe.json; the checksums over all of
+    them, last. Each copy is written under a draft name and described from
+    its own bytes before it gets its name. Returns the record and the
     copies."""
     folder.mkdir()
     sid = lib.source.source_id
     original = Path(item.path)
-    files: list[tuple[Path, str, str | None, bool]] = []      # (path, kind, language, forced)
+    copies: list[SidecarCopy] = []
+    entries: list[dict[str, Any]] = []
     for f in _subtitles_of(item, lib):
         try:
             if f.path.stat().st_size > _SUBTITLE_FILE_MAX_BYTES:
@@ -768,18 +792,20 @@ def _stage_source(
         except OSError as e:
             log.warning("packager.library.sidecar_missing", path=str(f.path), error=str(e)[:200])
             continue
+        n = len(entries) + 1
+        draft = folder / f".copy-{n}"
+        copy_new(f.path, draft)
         # The record keeps the catalog's language as BCP 47 ("ger" -> "de"):
         # the worker record hands the packager its ISO 639-2 code.
-        language = rec.lang(f.language)[0] if f.language != "und" else None
-        files.append((f.path, "subtitle", language, f.forced))
-    files += [(Path(p), kind, None, False) for p, kind in rec.companion_files(str(original))]
-    copies, entries = [], []
-    for (path, kind, language, forced), name in zip(
-            files, rec.sidecar_names([p.name for p, *_ in files]), strict=True):
-        copy_new(path, folder / name)
-        copies.append(SidecarCopy(name=name, original_name=path.name, path=path, kind=kind))
-        entries.append(rec.sidecar_entry(sid, name, str(folder / name), path.name, kind,
-                                         language=language, forced=forced))
+        entry = rec.sidecar_entry(sid, n, str(draft), f.path.name,
+                                  language=rec.lang(f.language)[0] if f.language != "und" else None,
+                                  forced=f.forced)
+        name = entry["file"].rsplit("/", 1)[1]
+        if os.path.lexists(folder / name):
+            raise PackageError(f"two subtitle files would be copied as {name}")
+        os.rename(draft, folder / name)
+        copies.append(SidecarCopy(name=name, path=f.path, sha256=entry["sha256"]))
+        entries.append(entry)
     doc, probe_bytes = records.source_record(lib, original, fixity, probe, entries, now)
     record = rec.json_bytes(doc)
     (folder / records.PROBE_FILE).write_bytes(probe_bytes)
@@ -796,7 +822,9 @@ def _stage_source(
 
 def _recorded_source(sdir: Path, source_id: str) -> tuple[dict[str, Any], list[SidecarCopy]]:
     """A source record in place already (an earlier version of the same
-    original wrote it): its source.json, and the copies it holds."""
+    original wrote it): its source.json, and the copies of subtitle files
+    it holds (one written before the record logic kept only those may name
+    others, which are no subtitle's)."""
     try:
         doc = json.loads((sdir / records.SOURCE_RECORD).read_text())
     except (OSError, ValueError) as e:
@@ -808,30 +836,44 @@ def _recorded_source(sdir: Path, source_id: str) -> tuple[dict[str, Any], list[S
     copies = []
     for e in doc.get("sidecars") or []:
         file = e.get("file") if isinstance(e, dict) else None
-        if isinstance(file, str) and file.startswith(prefix):
-            name = file[len(prefix):]
-            copies.append(SidecarCopy(name=name, original_name=str(e.get("originalName") or name),
-                                      path=sdir / name, kind=str(e.get("kind") or "other")))
+        if isinstance(file, str) and file.startswith(prefix) and e.get("kind") == "subtitle":
+            copies.append(SidecarCopy(name=file[len(prefix):], path=sdir / file[len(prefix):],
+                                      sha256=str(e.get("sha256") or "")))
     return doc, copies
+
+
+def _known_as(path: Path, copies: list[SidecarCopy], taken: set[int]) -> int | None:
+    """Which of the copies not taken yet a subtitle file is: the one it is,
+    or was copied from, by its path, else — in order — one of its bytes;
+    None when it is none of them. Names say nothing: the library gives a
+    copy a name of its own."""
+    i = next((i for i, c in enumerate(copies) if i not in taken and c.path == path), None)
+    if i is None and (digest := _sha_or_none(path)) is not None:
+        i = next((i for i, c in enumerate(copies) if i not in taken and c.sha256 == digest), None)
+    return i
+
+
+def _sha_or_none(path: Path) -> str | None:
+    """sha256:<hex> of a file's bytes; None for one that can't be read."""
+    try:
+        return rec.sha_file(str(path))
+    except OSError:
+        return None
 
 
 def _copies_of(files: dict[str, Any], copies: list[SidecarCopy]) -> dict[str, SidecarCopy]:
     """The copy of the subtitle file each subtitle made from one (by its id;
-    `files` is Built.from_files) is: by its path — the file a copy this run
-    made was made from, or a recorded copy the catalog names itself — else
-    by its name, in order, among those a recorded source holds."""
-    subtitles = [c for c in copies if c.kind == "subtitle"]
-    by_path = {c.path: c for c in subtitles}
-    by_name: dict[str, list[SidecarCopy]] = {}
-    for c in subtitles:
-        by_name.setdefault(c.original_name, []).append(c)
+    `files` is Built.from_files) is: the copy it is, or was copied from, by
+    its path — a copy this run made, or a recorded one the catalog names
+    itself — else, in order, a copy of the same bytes (_known_as). Each
+    copy is one file's."""
     out: dict[str, SidecarCopy] = {}
+    taken: set[int] = set()
     for sub_id, f in sorted(files.items(), key=lambda kv: int(kv[0].removeprefix("sub"))):
-        c = by_path.get(f.path)
-        if c is None and by_name.get(f.path.name):
-            c = by_name[f.path.name].pop(0)
-        if c is not None:
-            out[sub_id] = c
+        i = _known_as(f.path, copies, taken)
+        if i is not None:
+            taken.add(i)
+            out[sub_id] = copies[i]
     return out
 
 
@@ -848,11 +890,18 @@ def _handover(
 ) -> list[dict[str, Any]]:
     """The handover's sidecars: each subtitle file the catalog named (by
     its id) mapped to the rendition made from it, by the package's
-    fromSidecar and the copy it names (contract section 2.5): the file by
-    its path — the copy itself, or the file it was made from — else, in
-    order, by the name of the file it was made from."""
+    fromSidecar and the copy it names (contract section 2.5): the file the
+    copy is, or was copied from, by its path, else, in order, one of the
+    copy's bytes."""
     copy_of = {f"sources/{source_id}/{c.name}": c for c in copies}
     files = _subtitles_of(item, _library(item))
+    digests: dict[int, str | None] = {}
+
+    def digest(i: int) -> str | None:
+        if i not in digests:
+            digests[i] = _sha_or_none(files[i].path)
+        return digests[i]
+
     taken: set[int] = set()
     out = []
     for s in package.get("subtitles") or []:
@@ -860,9 +909,9 @@ def _handover(
         if c is None:
             continue
         i = next((i for i, f in enumerate(files) if i not in taken and f.path == c.path), None)
-        if i is None:
-            i = next((i for i, f in enumerate(files)
-                      if i not in taken and f.path.name == c.original_name), None)
+        if i is None and c.sha256:
+            i = next((i for i in range(len(files)) if i not in taken and digest(i) == c.sha256),
+                     None)
         if i is None:
             continue
         taken.add(i)
@@ -996,6 +1045,7 @@ def take_in(item: ClaimedItem) -> Placed:
         raise PackageError(_unfinished(lib))
     original = Path(item.path)
     _at_its_arrival(original, lib)
+    _named_as_its_source_names_it(item, lib)
     fixity = _check_original(original, lib.source.size_bytes, lib.source.qh1, "the original")
     open_staging(staging)
     try:

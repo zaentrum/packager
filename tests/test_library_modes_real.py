@@ -108,7 +108,8 @@ class Tree:
         """The worker record of a run of `mode`; `copies`: its subtitle file
         named by its copy in the source record, as the catalog names it once
         the version is established."""
-        sub = (self.source_dir if copies else self.original.parent) / "Clip (2024).de.srt"
+        sub = (self.source_dir / "subtitle-1.de.srt" if copies
+               else self.original.parent / "Clip (2024).de.srt")
         return {
             "id": ITEM, "type": "movie", "title": "Clip", "year": 2024, "durationMs": 12_000,
             "path": str(path or self.original), "movieTmdbId": None,
@@ -232,8 +233,7 @@ def test_a_takein_renames_the_original_into_a_version_with_no_package(
     assert sorted(p.name for p in t.item_dir.iterdir()) == ["sources", "versions"]
     assert not t.original.exists() and (vdir / NAME).stat().st_ino == ino
     assert sorted(p.name for p in t.source_dir.iterdir()) == [
-        "Clip (2024).de.srt", "Clip (2024).nfo", "checksums.sha256", "ffprobe.json",
-        "source.json"]
+        "checksums.sha256", "ffprobe.json", "source.json", "subtitle-1.de.srt"]
     version = json.loads((vdir / "version.json").read_text())
     source = json.loads((t.source_dir / "source.json").read_text())
     assert (version["originalFiles"], version["sourceIds"], version["runtimeMs"]) == (
@@ -274,7 +274,7 @@ def test_an_add_puts_a_package_beside_the_original_in_its_version(
     assert package["role"] == "derived"
     subs = package["subtitles"]
     assert [(s["id"], s.get("fromSidecar")) for s in subs] == [
-        ("sub0", None), ("sub1", f"sources/{SOURCE}/Clip (2024).de.srt")]
+        ("sub0", None), ("sub1", f"sources/{SOURCE}/subtitle-1.de.srt")]
     [payload] = catalog.handovers
     assert "original" not in payload and "takenIn" not in payload
     assert payload["package"] == package and payload["versionDir"] == str(vdir)

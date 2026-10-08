@@ -7,11 +7,13 @@ that has it, with the golden records in tests/fixtures/libv2_records/
 from the same commit, and set the values below.
 
 The golden records are the record logic's reference build of what a
-packager writes for an original (golden_tree in the schemas repository's
-tools tests): the same probe, the same files beside the original and the
-same moments and ids must give the same bytes through the packager's own
-writer — its source folder (source.json, ffprobe.json, the sidecar
-copies, the checksums) and its version.json."""
+packager writes when it establishes a version of an original (golden_tree
+in the schemas repository's tools tests): the same probe, the same files
+beside the original and the same moments and ids must give the same bytes
+through the packager's own writer — its source folder (source.json,
+ffprobe.json, the copy of the subtitle file, the checksums; nothing of the
+.nfo beside it) and its version.json, which keeps the original under the
+name the library gives it."""
 
 from __future__ import annotations
 
@@ -25,9 +27,9 @@ from packager import library, records
 from packager import libv2_records as rec
 from packager.katalog import ClaimedItem
 
-# zaentrum/schemas 92effa9e6103735cf175ddf1c239758c9aaeae06, tools/libv2_records.py
-SHA256 = "3954f76ae4b8f709e1edc0524a13dde477b5a5a32aa4775a7d8922a33b6326e8"
-LIBV2_RECORDS = 1
+# zaentrum/schemas 911cfd11b4ca6b7ed8d907a067c9c46f2135886d, tools/libv2_records.py
+SHA256 = "fb8f08d073ca6ac7b0fabe2446a4f224af0fa13ca8e021f785f81652c253196a"
+LIBV2_RECORDS = 2
 
 GOLDEN = Path(__file__).parent / "fixtures" / "libv2_records"
 ITEM = "f0f0f0f0-1111-4222-8333-444444444444"
@@ -68,6 +70,7 @@ def test_the_packager_writes_the_reference_records(tmp_path: Path) -> None:
                        "sizeBytes": original.stat().st_size, "qh1": rec.qh1(str(original))},
             "build": {"versionId": vid, "stagingDir": str(work / "staging" / vid),
                       "versionDir": str(item_dir / "versions" / vid),
+                      "mode": "establish", "originalName": rec.library_original_name(ORIGINAL),
                       "createdBy": "katalog-manager", "chapters": None, "chaptersFrom": None,
                       # As the catalog hands them over: a kind the record has no word
                       # for is "other", labelled with the catalog's own.
@@ -88,6 +91,8 @@ def test_the_packager_writes_the_reference_records(tmp_path: Path) -> None:
     for name, golden in (("source.json", "source.json"), ("ffprobe.json", "ffprobe.json"),
                          ("checksums.sha256", "source.checksums.sha256")):
         assert (folder / name).read_bytes() == (expected / golden).read_bytes(), name
-    assert [c.name for c in copies] == [SIDECAR, COMPANION]
+    assert [c.name for c in copies] == ["subtitle-1.de.srt"]
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "checksums.sha256", "ffprobe.json", "source.json", "subtitle-1.de.srt"]
     version = records.version_record(item.library, source, probe, AT)
     assert rec.json_bytes(version) == (expected / "version.json").read_bytes()

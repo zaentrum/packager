@@ -219,9 +219,9 @@ def test_a_v2_run_puts_the_source_and_the_version_into_the_record(packaged) -> N
     assert sorted(p.name for p in vdir.iterdir()) == [
         ".complete", "checksums.sha256", "hls", "package.json", "subs", "trickplay",
         "version.json"]
+    # The subtitle file's copy, named as the library names it; nothing of the .nfo.
     assert sorted(p.name for p in sdir.iterdir()) == [
-        "Clip (2024).de.srt", "Clip (2024).nfo", "checksums.sha256", "ffprobe.json",
-        "source.json"]
+        "checksums.sha256", "ffprobe.json", "source.json", "subtitle-1.de.srt"]
     # The chain holds, every file's digest included; the package plays.
     assert rec.chain_problems(str(vdir), "version.json", rec.PACKAGE_DIRS, full=True) == []
     package = json.loads((vdir / "package.json").read_text())
@@ -235,8 +235,12 @@ def test_a_v2_run_puts_the_source_and_the_version_into_the_record(packaged) -> N
         "video", "audio", "audio", "subtitle", "subtitle"]
     assert source["streams"][0]["codec"] == "hevc"
     assert source["essence"]["chapters"] is True and source["essence"]["surround"] is True
-    assert [x["originalName"] for x in source["sidecars"]] == [
-        "Clip (2024).de.srt", "Clip (2024).nfo"]
+    assert [(Path(x["file"]).name, x["language"]) for x in source["sidecars"]] == [
+        ("subtitle-1.de.srt", "de")]
+    assert source["file"]["name"] == "original.mkv" and "origin" not in source
+    probe = json.loads((sdir / "ffprobe.json").read_text())
+    assert probe["format"]["filename"] == "original.mkv"
+    assert "title" not in {k.lower() for k in probe["format"].get("tags") or {}}
 
     version = json.loads((vdir / "version.json").read_text())
     # The catalog has no chapters: the original's own are kept.
@@ -254,7 +258,7 @@ def test_a_v2_run_puts_the_source_and_the_version_into_the_record(packaged) -> N
     subs = package["subtitles"]
     assert [(s["id"], s.get("sourceStreamIndex"), s.get("fromSidecar"), s["default"]) for s in
             subs] == [("sub0", 3, None, False), ("sub1", 4, None, False),
-                      ("sub2", None, f"sources/{SOURCE}/Clip (2024).de.srt", False)]
+                      ("sub2", None, f"sources/{SOURCE}/subtitle-1.de.srt", False)]
     assert subs[1]["forced"] is True and subs[1]["purpose"] == "forced"
 
     [payload] = catalog.handovers

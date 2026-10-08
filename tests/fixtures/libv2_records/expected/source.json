@@ -4,18 +4,13 @@
   "takenAt": "2026-10-06T10:00:00Z",
   "takenBy": "packager",
   "file": {
-    "name": "Example Film (2024) - 2160p.mkv",
+    "name": "original.mkv",
     "kind": "stream-container",
     "sizeBytes": 200000,
     "mtime": "2026-10-06T09:00:00Z",
     "fixity": {
       "qh1": "sha256:a09d4d4b2ad43c07b5cde7d04945457fe720122ec870a7e9b119078fedc56a4d"
     }
-  },
-  "origin": {
-    "libraryPath": "Example Film (2024)/Example Film (2024) - 2160p.mkv",
-    "takenBy": "import",
-    "folder": "Example Film (2024)"
   },
   "labels": {
     "quality": "2160p",
@@ -28,12 +23,11 @@
     "format": "matroska,webm",
     "durationMs": 60000,
     "bitrate": 2000000,
-    "title": "Example Film",
+    "title": null,
     "muxingApp": null,
     "writingApp": null,
     "creationTime": null,
     "tags": {
-      "title": "Example Film",
       "ENCODER": "libmatroska"
     }
   },
@@ -256,8 +250,7 @@
   ],
   "sidecars": [
     {
-      "file": "sources/8bca399e-7836-5df6-a6a1-edf538b03074/Example Film (2024) - 2160p.de.srt",
-      "originalName": "Example Film (2024) - 2160p.de.srt",
+      "file": "sources/8bca399e-7836-5df6-a6a1-edf538b03074/subtitle-1.de.srt",
       "kind": "subtitle",
       "format": "srt",
       "language": "de",
@@ -266,14 +259,6 @@
       "purpose": "dialogue",
       "sizeBytes": 38,
       "sha256": "sha256:37db83633a86bf79edc5a0ba4efdb07326386e95321030b87df7f37ab284d3b4"
-    },
-    {
-      "file": "sources/8bca399e-7836-5df6-a6a1-edf538b03074/Example Film (2024) - 2160p.nfo",
-      "originalName": "Example Film (2024) - 2160p.nfo",
-      "kind": "nfo",
-      "format": "nfo",
-      "sizeBytes": 43,
-      "sha256": "sha256:52655d552c25b14defa43c81323fafd843ffa3f8f79e29c7c3f73a26713a60fb"
     }
   ],
   "covers": [],
@@ -314,7 +299,7 @@
     "version": "ffprobe version 7.1",
     "at": "2026-10-06T10:00:00Z",
     "file": "sources/8bca399e-7836-5df6-a6a1-edf538b03074/ffprobe.json",
-    "sha256": "sha256:c78ce567cbee958d965f5650e7d84b7636214bfa1d30cf3671db080e49e381b7",
+    "sha256": "sha256:b118e28ae061e3ab228f0c8e0d4ef5999939bcb9299c31b838763f97dff3fd1b",
     "note": null
   }
 }

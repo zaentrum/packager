@@ -170,7 +170,8 @@ def test_a_mode_that_moves_no_original_takes_no_name_for_it(mode: str) -> None:
     ({"mode": "takein", "originalName": "Sintel (2010).mkv"}, "library.build.originalName"),
     ({"mode": "establish", "originalName": "original.MKV"}, "library.build.originalName"),
     ({"mode": "establish", "originalName": "../original.mkv"}, "library.build.originalName"),
-    ({"mode": "establish", "originalName": "original-0.mkv"}, "library.build.originalName"),
+    ({"mode": "establish", "originalName": "original.toolongext"}, "library.build.originalName"),
+    ({"mode": "establish", "originalName": "original.mkv\n"}, "library.build.originalName"),
     ({"mode": "establish", "originalName": "original"}, "library.build.originalName"),
     ({"mode": "takein", "originalName": "version.json"}, "library.build.originalName"),
 ])

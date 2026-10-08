@@ -53,6 +53,8 @@ from typing import Any
 import httpx
 import structlog
 
+from . import libv2_records as rec
+
 log = structlog.get_logger(__name__)
 
 # Keycloak default for client_credentials is 300 s; refresh 30 s ahead
@@ -85,9 +87,6 @@ MOVES_ORIGINAL = frozenset({ESTABLISH, TAKEIN})
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _QH1 = re.compile(r"sha256:[0-9a-f]{64}")
-# The name an original gets in its version folder: original.<ext>, or
-# original-<n>.<ext> for a part of a version split into several.
-_ORIGINAL_NAME = re.compile(r"original(-[1-9][0-9]*)?\.[a-z0-9]{1,8}")
 
 
 class LibraryRecordError(ValueError):
@@ -241,8 +240,10 @@ def _mode(value: Any) -> str | None:
 
 def _original_name(value: Any) -> str:
     """The name the catalog gives the original in its version folder,
-    checked, never made up: the packager renames the original to it."""
-    if not isinstance(value, str) or not _ORIGINAL_NAME.fullmatch(value):
+    checked by the record logic's own rule (original.<ext>, or
+    original-<n>.<ext> for a part of a version split into several), never
+    made up: the packager renames the original to it."""
+    if not isinstance(value, str) or not rec.ORIGINAL_NAME_RE.fullmatch(value):
         raise LibraryRecordError(f"worker record: library.build.originalName is not the name "
                                  f"of an original in its version folder (original.<ext>): "
                                  f"{value!r}")

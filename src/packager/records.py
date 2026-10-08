@@ -57,16 +57,16 @@ def source_record(
     sidecars: list[dict[str, Any]], now: str,
 ) -> tuple[dict[str, Any], bytes]:
     """sources/<sid>/source.json and the bytes of its ffprobe.json
-    (contract section 3.3): taken in by the packager, from the arrivals
-    (origin.takenBy import), with the fixity the catalog recorded. The
-    file is named as the library keeps it: by the name the worker record
-    gives it in its version folder, for a run that renames it there, else
-    by its own."""
-    name = lib.build.original_name or original.name
+    (contract section 3.3): taken in by the packager, with the fixity the
+    catalog recorded. The record logic reads the name the original arrived
+    under, and where it sat among the arrivals, for what they claim (its
+    labels, its numbering) and keeps neither: it names the file as the
+    library does (file.name, original.<ext>), and the probe it returns for
+    ffprobe.json names it so too, with no container title."""
     doc, probe_bytes = rec.source_record(
-        lib.source.source_id, name, original.stat().st_size, taken_at=now,
-        taken_by="packager", library_path=lib.source.library_path or name,
-        qh1=fixity_qh1, mtime=rec.ts_of_mtime(str(original)), origin_taken_by="import",
+        lib.source.source_id, original.name, original.stat().st_size, taken_at=now,
+        taken_by="packager", library_path=lib.source.library_path or original.name,
+        qh1=fixity_qh1, mtime=rec.ts_of_mtime(str(original)),
         probe=probe.raw, probe_version=probe.version, sidecars=sidecars)
     return doc, probe_bytes
 

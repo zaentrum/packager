@@ -264,9 +264,10 @@ def _whole(share: Share) -> None:
     assert sorted(p.name for p in share.version_dir.iterdir()) == [
         ".complete", "checksums.sha256", "hls", "package.json", "subs", "trickplay",
         "version.json"]
+    # The copy of the subtitle file that came with the original, under the
+    # name the library gives it; nothing of the .nfo beside it.
     assert sorted(p.name for p in share.source_dir.iterdir()) == [
-        "Sintel (2010).en.srt", "Sintel (2010).nfo", "checksums.sha256", "ffprobe.json",
-        "source.json"]
+        "checksums.sha256", "ffprobe.json", "source.json", "subtitle-1.en.srt"]
     sums = dict(reversed(line.split("  ", 1))
                 for line in (share.source_dir / "checksums.sha256").read_text().splitlines())
     assert sorted(sums) == sorted(p.name for p in share.source_dir.iterdir()
@@ -299,16 +300,17 @@ def test_a_version_goes_into_the_record(binaries: Binaries, share: Share) -> Non
 
     source = json.loads((share.source_dir / "source.json").read_text())
     assert (source["sourceId"], source["takenBy"]) == (SOURCE, "packager")
-    assert source["origin"] == {"libraryPath": "Sintel (2010)/Sintel (2010).mkv",
-                                "takenBy": "import", "folder": "Sintel (2010)"}
+    # Named as the library names it, and nothing of where it came from.
+    assert source["file"]["name"] == "original.mkv" and "origin" not in source
     assert source["file"]["fixity"] == {"qh1": rec.qh1(str(share.original))}
     assert source["probe"]["file"] == f"sources/{SOURCE}/ffprobe.json"
     assert source["probe"]["sha256"] == rec.sha_file(str(share.source_dir / "ffprobe.json"))
-    assert json.loads((share.source_dir / "ffprobe.json").read_text()) == _raw_probe()
-    assert [(s["file"], s["originalName"], s["kind"]) for s in source["sidecars"]] == [
-        (f"sources/{SOURCE}/Sintel (2010).en.srt", "Sintel (2010).en.srt", "subtitle"),
-        (f"sources/{SOURCE}/Sintel (2010).nfo", "Sintel (2010).nfo", "nfo")]
-    assert (share.source_dir / "Sintel (2010).en.srt").read_bytes() == share.srt.read_bytes()
+    assert json.loads((share.source_dir / "ffprobe.json").read_text()) == rec.scrub_probe(
+        _raw_probe(), "original.mkv")
+    assert [(s["file"], s["kind"], s["language"]) for s in source["sidecars"]] == [
+        (f"sources/{SOURCE}/subtitle-1.en.srt", "subtitle", "en")]
+    assert "originalName" not in source["sidecars"][0]
+    assert (share.source_dir / "subtitle-1.en.srt").read_bytes() == share.srt.read_bytes()
 
     version = json.loads((share.version_dir / "version.json").read_text())
     assert (version["versionId"], version["sourceIds"], version["originalFiles"]) == (
@@ -324,7 +326,7 @@ def test_a_version_goes_into_the_record(binaries: Binaries, share: Share) -> Non
     assert package["createdAt"] == version["createdAt"]
     [sub] = package["subtitles"]
     assert (sub["id"], sub["path"], sub["fromSidecar"], sub["default"]) == (
-        "sub0", "subs/0.vtt", f"sources/{SOURCE}/Sintel (2010).en.srt", False)
+        "sub0", "subs/0.vtt", f"sources/{SOURCE}/subtitle-1.en.srt", False)
     assert [(v["id"], v["sourceStreamIndex"]) for v in package["renditions"]["video"]] == [
         ("v0", 0)]
     [audio] = package["renditions"]["audio"]
@@ -375,8 +377,7 @@ def test_a_run_that_dies_before_a_rename_is_built_again(
     if dies_at == "version":
         # The source is in the record, whole; the catalog doesn't know.
         assert sorted(source_before) == [
-            "Sintel (2010).en.srt", "Sintel (2010).nfo", "checksums.sha256", "ffprobe.json",
-            "source.json"]
+            "checksums.sha256", "ffprobe.json", "source.json", "subtitle-1.en.srt"]
         inode = (share.source_dir / "source.json").stat().st_ino
     else:
         assert not share.item_dir.exists()
@@ -396,7 +397,7 @@ def test_a_run_that_dies_before_a_rename_is_built_again(
     assert payload["sidecars"] == [{"subtitleAssetId": ASSET, "rendition": "sub0",
                                     "path": "subs/0.vtt"}]
     assert payload["package"]["subtitles"][0]["fromSidecar"] == (
-        f"sources/{SOURCE}/Sintel (2010).en.srt")
+        f"sources/{SOURCE}/subtitle-1.en.srt")
 
 
 def test_a_run_that_dies_after_the_renames_is_reported_again(
@@ -639,7 +640,7 @@ def test_an_original_the_transcoder_left_as_it_was(
 
 # ------------------------------------------------------------- sidecars
 
-def test_every_file_beside_the_original_is_copied_once_under_a_name_of_its_own(
+def test_each_subtitle_file_is_copied_once_under_the_name_the_library_gives_it(
     binaries: Binaries, share: Share,
 ) -> None:
     folder = share.original.parent
@@ -648,42 +649,70 @@ def test_every_file_beside_the_original_is_copied_once_under_a_name_of_its_own(
     other.write_text("1\n00:00:03,000 --> 00:00:04,000\nAgain.\n")
     forced = folder / "Sintel (2010).de.forced.srt"
     forced.write_text("1\n00:00:01,000 --> 00:00:02,000\n[Zeichen]\n")
+    hearing = folder / "Sintel (2010).en.sdh.srt"
+    hearing.write_text("1\n00:00:01,000 --> 00:00:02,000\n[door creaks]\n")
+    # Nothing that is no subtitle file is copied: not an image, not a text.
     (folder / "Sintel (2010).jpg").write_bytes(b"\xff\xd8jpg")
-    (folder / "Sintel (2010).txt").write_bytes(b"x" * (10 * 1024 * 1024 + 1))  # too large
-    (folder / "Other.nfo").write_text("not this film's")
+    (folder / "Sintel (2010).txt").write_text("notes")
     record = share.record(subtitleFiles=[
         {"id": ASSET, "path": str(share.srt), "language": "eng", "label": "English"},
         {"id": "b2", "path": str(other), "language": "eng"},
+        {"id": "d4", "path": str(folder / "gone.srt"), "language": "fre"},   # not there
         {"id": "c3", "path": str(forced), "language": "ger", "forced": True},
-        {"id": "d4", "path": str(folder / "gone.srt"), "language": "fre"},
+        {"id": "e5", "path": str(hearing), "language": "eng"},
     ])
     catalog = Catalog()
     run(record, catalog)
     assert catalog.statuses == ["in_progress", "done"]
+    # Numbered from 1 in the catalog's order, the one not there left out.
+    assert sorted(p.name for p in share.source_dir.iterdir()) == [
+        "checksums.sha256", "ffprobe.json", "source.json", "subtitle-1.en.srt",
+        "subtitle-2.en.srt", "subtitle-3.de.forced.srt", "subtitle-4.en.sdh.srt"]
     source = json.loads((share.source_dir / "source.json").read_text())
-    assert [(Path(s["file"]).name, s["originalName"], s["kind"]) for s in source["sidecars"]] == [
-        ("Sintel (2010).en.srt", "Sintel (2010).en.srt", "subtitle"),
-        ("Sintel (2010).en-1.srt", "Sintel (2010).en.srt", "subtitle"),
-        ("Sintel (2010).de.forced.srt", "Sintel (2010).de.forced.srt", "subtitle"),
-        ("Sintel (2010).jpg", "Sintel (2010).jpg", "image"),
-        ("Sintel (2010).nfo", "Sintel (2010).nfo", "nfo")]
-    assert (share.source_dir / "Sintel (2010).en-1.srt").read_bytes() == other.read_bytes()
-    forced_entry = source["sidecars"][2]
-    assert (forced_entry["forced"], forced_entry["purpose"]) == (True, "forced")
+    assert [(Path(s["file"]).name, s["language"], s["purpose"]) for s in source["sidecars"]] == [
+        ("subtitle-1.en.srt", "en", "dialogue"), ("subtitle-2.en.srt", "en", "dialogue"),
+        ("subtitle-3.de.forced.srt", "de", "forced"), ("subtitle-4.en.sdh.srt", "en", "sdh")]
+    assert not [s for s in source["sidecars"] if "originalName" in s]
+    assert (share.source_dir / "subtitle-2.en.srt").read_bytes() == other.read_bytes()
     package = catalog.handovers[0]["package"]
     assert [(s["id"], s["fromSidecar"]) for s in package["subtitles"]] == [
-        ("sub0", f"sources/{SOURCE}/Sintel (2010).en.srt"),
-        ("sub1", f"sources/{SOURCE}/Sintel (2010).en-1.srt"),
-        ("sub2", f"sources/{SOURCE}/Sintel (2010).de.forced.srt")]
+        ("sub0", f"sources/{SOURCE}/subtitle-1.en.srt"),
+        ("sub1", f"sources/{SOURCE}/subtitle-2.en.srt"),
+        ("sub3", f"sources/{SOURCE}/subtitle-3.de.forced.srt"),
+        ("sub4", f"sources/{SOURCE}/subtitle-4.en.sdh.srt")]
     assert package["subtitles"][2]["purpose"] == "forced"
     assert catalog.handovers[0]["sidecars"] == [
         {"subtitleAssetId": ASSET, "rendition": "sub0", "path": "subs/0.vtt"},
         {"subtitleAssetId": "b2", "rendition": "sub1", "path": "subs/1.vtt"},
-        {"subtitleAssetId": "c3", "rendition": "sub2", "path": "subs/2.vtt"}]
+        {"subtitleAssetId": "c3", "rendition": "sub3", "path": "subs/3.vtt"},
+        {"subtitleAssetId": "e5", "rendition": "sub4", "path": "subs/4.vtt"}]
     # Copies, never links, in the writer's mode.
-    for name in ("Sintel (2010).en.srt", "Sintel (2010).jpg"):
-        st = (share.source_dir / name).stat()
-        assert st.st_nlink == 1 and st.st_ino != (folder / name).stat().st_ino
+    for copy, of in (("subtitle-1.en.srt", share.srt), ("subtitle-3.de.forced.srt", forced)):
+        st = (share.source_dir / copy).stat()
+        assert st.st_nlink == 1 and st.st_ino != of.stat().st_ino
+
+
+def test_a_subtitle_file_is_known_for_its_copy_by_its_bytes(
+    binaries: Binaries, share: Share,
+) -> None:
+    # A second version of a recorded source, whose catalog names the
+    # subtitle files beside the original under other names: a copy is known
+    # by its bytes, never by a name.
+    run(share.record(), Catalog())
+    renamed = share.original.parent / "renamed.srt"
+    renamed.write_bytes(share.srt.read_bytes())
+    unknown = share.original.parent / "unknown.srt"
+    unknown.write_text("1\n00:00:03,000 --> 00:00:04,000\nNot the copy's.\n")
+    catalog = Catalog()
+    run(share.record(version=NEXT_VERSION, recorded=True, subtitleFiles=[
+        {"id": "x9", "path": str(unknown), "language": "eng"},
+        {"id": ASSET, "path": str(renamed), "language": "eng", "label": "English"}]), catalog)
+    assert catalog.statuses == ["in_progress", "done"]
+    [payload] = catalog.handovers
+    assert [(x["id"], x.get("fromSidecar")) for x in payload["package"]["subtitles"]] == [
+        ("sub0", None), ("sub1", f"sources/{SOURCE}/subtitle-1.en.srt")]
+    assert payload["sidecars"] == [{"subtitleAssetId": ASSET, "rendition": "sub1",
+                                    "path": "subs/1.vtt"}]
 
 
 # ------------------------------------------------------------- extras
@@ -749,7 +778,8 @@ def test_an_extra_goes_into_its_titles_folder(binaries: Binaries, share: Share) 
         "localizedTitles": {"de": "Vorschau"}, "language": "en",
         "createdAt": "2026-10-06T08:00:00Z", "createdBy": "katalog-manager/api",
         "originalFiles": [], "originals": []}
-    assert doc["packagedFrom"] == [{"name": "trailer.mov", "sizeBytes": x.file.stat().st_size,
+    # The file it was made from, named as the library names an original.
+    assert doc["packagedFrom"] == [{"name": "original.mov", "sizeBytes": x.file.stat().st_size,
                                     "fixity": {"qh1": rec.qh1(str(x.file))}}]
     assert doc["origin"] == {"kind": "link", "site": "video.example", "externalId": "t-0001",
                              "fetchedAt": "2026-10-05T08:00:00Z"}
@@ -827,4 +857,4 @@ def test_the_umask_writes_what_the_catalog_can_read(binaries: Binaries, share: S
         run(share.record(), Catalog())
     finally:
         os.umask(old)
-    assert (share.source_dir / "Sintel (2010).en.srt").stat().st_mode & 0o777 == 0o664
+    assert (share.source_dir / "subtitle-1.en.srt").stat().st_mode & 0o777 == 0o664

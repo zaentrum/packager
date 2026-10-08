@@ -18,6 +18,14 @@ either — the builders return records and bytes, and the writer puts them where
 through a temporary file and a rename. What a builder could not know stays empty rather than
 guessed, and what it normalises it says, in the notes it returns.
 
+No record names a file as it arrived, and no file in the library is named so: a name, a folder or a
+container title can tell where a file came from. An original a version keeps, a source describes or
+an extra was packaged from is named by library_original_name(), original.<ext>; the copy of a
+subtitle file that came with it by subtitle_copy_name(), subtitle-<n>.<lang>[.forced][.sdh].<ext>;
+and the probe a source keeps is the tool's output with the two edits scrub_probe() makes. The name a
+file arrived under is read for what it claims — its labels and its numbering — and the record keeps
+those values, never the name.
+
 The order a version's folder is written in, which only the writer can keep:
 
   version.json        version_record(), then json_bytes()
@@ -25,20 +33,28 @@ The order a version's folder is written in, which only the writer can keep:
   package.json        package_record(), holding the checksums file's hash
   .complete           complete(): sha256:<hex> of package.json, written last
 
-A source folder: source.json from source_record() (with the verbatim probe it returns, written
-beside it as ffprobe.json) and each sidecar copied in under sidecar_names(), then the
-checksums.sha256 that lists exactly those files. An extra's folder: extra.json from
-extra_record(), the package, then the chain as a version's, its checksums over extra.json and
-every package file. chain_problems() checks a folder written that way.
+The original a version is established with is no link of that chain — its source record's fixity
+covers it, and it is deleted later — and goes in under library_original_name() once the rest is
+built: renamed last into the staged folder, which then goes into place whole. A version taken in
+before anything packaged it is version.json and its original alone; its package is added later, in
+the same order.
+
+A source folder: source.json from source_record() (with the probe it returns, written beside it as
+ffprobe.json), a copy of each subtitle file that came with the original under the name
+sidecar_entry() gives it, then the checksums.sha256 that lists exactly those files. Nothing else that
+sat beside the original is copied: NFO text routinely names where a file came from. An extra's
+folder: extra.json from extra_record(), the package, then the chain as a version's, its checksums
+over extra.json and every package file. chain_problems() checks a folder written that way.
 
 Piped into a pod behind a tool that uses it (cat libv2_records.py tool.py | python3 - …), this
 file runs as part of that tool, so it defines no main and runs nothing when it is read.
 """
-import datetime, hashlib, json, os, re, shutil, subprocess, uuid
+import copy, datetime, hashlib, json, os, re, shutil, subprocess, uuid
 
 # The version of what this module writes. A change to the shape of a record it builds is a new
-# value, and the copy a writer vendors names the one it was taken at.
-LIBV2_RECORDS = 1
+# value, and the copy a writer vendors names the one it was taken at. 2: no record names a file as
+# it arrived, and a source copies only the subtitle files that came with its original.
+LIBV2_RECORDS = 2
 
 NS = uuid.uuid5(uuid.NAMESPACE_URL, "https://zaentrum.github.io/schemas/library")
 PACKAGE_DIRS = ("hls", "subs", "trickplay", "trailers")
@@ -49,14 +65,12 @@ OS_ARTEFACTS = re.compile(r"^(\.DS_Store|\._.*|Thumbs\.db|desktop\.ini|@eaDir|\.
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$")
 SEGMENT_KINDS = {"intro", "recap", "credits", "preview", "commercial", "other"}
-# The command a source record's ffprobe.json is the output of, verbatim.
+# The command a source record's ffprobe.json is the output of, but for the edits scrub_probe() makes.
 FFPROBE_ARGS = ("-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", "-show_chapters")
-# The names a source folder keeps for itself, which a sidecar copied in beside them cannot have.
-SOURCE_RECORDS = ("source.json", "ffprobe.json", SUMS)
-# Small files beside an original that are copied into its source folder with the subtitles:
-# <stem>.nfo, .jpg, .png and .txt, each of at most 10 MB, by the kind a source record names them.
-COMPANION_KINDS = {".nfo": "nfo", ".jpg": "image", ".png": "image", ".txt": "other"}
-COMPANION_MAX_BYTES = 10 * 1024 * 1024
+# The names the library gives an original (library_original_name) and the copy of a subtitle file that
+# came with it (subtitle_copy_name): nothing of the name either arrived under, and only [a-z0-9.-].
+ORIGINAL_NAME_RE = re.compile(r"^original(-[0-9]+)?\.[a-z0-9]{1,8}$")
+SUBTITLE_COPY_RE = re.compile(r"^subtitle-[0-9]+\.[a-z]{2,8}(\.forced)?(\.sdh)?\.[a-z0-9]{1,8}$")
 # The values HLS gives VIDEO-RANGE, as a video rendition's videoRange keeps them.
 VIDEO_RANGES = ("SDR", "PQ", "HLG")
 
@@ -268,6 +282,41 @@ def naming(name):
         season, episode, end = int(m.group(5)), int(m.group(6)), None
     return {"scheme": "unknown", "seasonNumber": season, "episodeNumber": episode,
             "episodeEnd": int(end) if end else None, "raw": m.group(0)}
+
+
+# ---------------------------------------------------------------- the names the library gives
+def _extension(name):
+    """A file name's extension as a name in the library keeps it: lower-cased, when it is one to eight
+    letters and digits, and bin when it is anything else or nothing."""
+    ext = os.path.splitext(str(name or "").replace("\\", "/").rsplit("/", 1)[-1])[1][1:].lower()
+    return ext if re.fullmatch(r"[a-z0-9]{1,8}", ext) else "bin"
+
+
+def library_original_name(arrival_name: str, part: int | None = None) -> str:
+    """The name the library gives an original: original.<ext>, or original-<part>.<ext> for one part
+    of a version split into several, in part order from 1 — <ext> the extension of the name it arrived
+    under, lower-cased when that is one to eight letters and digits, and bin when it is not. Nothing
+    else of that name is kept. The same name is the original's in its version folder, its source
+    record's file.name, the version's originalFiles and an extra's packagedFrom."""
+    if part is not None and (not isinstance(part, int) or isinstance(part, bool) or part < 1):
+        raise ValueError(f"a part of a version is numbered from 1, not {part!r}")
+    return f"original.{_extension(arrival_name)}" if part is None else f"original-{part}.{_extension(arrival_name)}"
+
+
+def subtitle_copy_name(n: int, language: str | None, forced: bool, sdh: bool, ext: str) -> str:
+    """The name of the copy a source folder keeps of the nth subtitle file that came with its original
+    (n from 1, in the order the catalog lists them): subtitle-<n>.<lang>[.forced][.sdh].<ext>, lang
+    the BCP 47 primary language subtag of language, lower-cased ('ger' and 'de-CH' are de), or und when
+    it names none, and ext the file's own extension, lower-cased, or bin when it is not one to eight
+    letters and digits. It says only what the record says of the file, never the name it came with."""
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+        raise ValueError(f"the subtitle files of a source are numbered from 1, not {n!r}")
+    primary = str(language or "").strip().replace("_", "-").split("-")[0]
+    code = (lang(primary)[0] or "und").lower()
+    if not re.fullmatch(r"[a-z]{2,8}", code):
+        code = "und"
+    return f"subtitle-{n}.{code}" + (".forced" if forced else "") + (".sdh" if sdh else "") + \
+        f".{_extension('x.' + str(ext or '').lstrip('.'))}"
 
 
 # ---------------------------------------------------------------- streams, as ffprobe reported them
@@ -662,6 +711,22 @@ def ffprobe_version():
         return None
 
 
+def scrub_probe(probe: dict, library_name: str) -> dict:
+    """The probe as a source folder keeps it, ffprobe.json: a copy of the tool's output with two edits
+    and nothing else changed — format.filename is library_name, the name the library gives the
+    original, not the path the tool read, and every key of format.tags that is title, in any case, is
+    gone. Both could tell where the file came from. The probe passed in is left as it was."""
+    out = copy.deepcopy(probe)
+    fmt = out.get("format") if isinstance(out, dict) else None
+    if isinstance(fmt, dict):
+        fmt["filename"] = library_name
+        tags = fmt.get("tags")
+        if isinstance(tags, dict):
+            for key in [k for k in tags if str(k).lower() == "title"]:
+                del tags[key]
+    return out
+
+
 def fidelity(streams, container):
     """Whether a file was untouched or already a re-encode, with what says so."""
     v = next((x for x in streams if x["type"] == "video" and not x["dispositions"].get("attachedPic")), None)
@@ -686,15 +751,16 @@ def fidelity(streams, container):
 
 def probed(probe):
     """What a probe found in a file, in the terms a source record and an extra share: its container,
-    every stream, whether it was already a re-encode, and its essence."""
+    every stream, whether it was already a re-encode, and its essence. The container's title tag is
+    not among them, in any case: it routinely names where the file came from."""
     fmt = probe.get("format") or {}
-    tags = {k: text(v) for k, v in (fmt.get("tags") or {}).items() if text(v)}
+    tags = {k: text(v) for k, v in (fmt.get("tags") or {}).items() if text(v) and str(k).lower() != "title"}
     streams = [norm_stream(s) for s in probe.get("streams") or []]
     infer_forced_by_size(streams)
     duration = fmt.get("duration")
     container = {"format": fmt.get("format_name") or "",
                  "durationMs": int(float(duration) * 1000) if duration else None,
-                 "bitrate": num(fmt.get("bit_rate")), "title": tags.get("title"),
+                 "bitrate": num(fmt.get("bit_rate")), "title": None,
                  "muxingApp": tags.get("muxing_application") or tags.get("encoder"),
                  "writingApp": tags.get("writing_application"),
                  "creationTime": tags.get("creation_time"), "tags": tags}
@@ -763,35 +829,6 @@ def segments(rows):
 
 
 # ---------------------------------------------------------------- sources/<sourceId>/
-def sidecar_names(names, taken=()):
-    """The name each file copied into a source folder is kept under, in order: its own, unless the
-    folder's records or a file copied before it have it, when -1, -2, … go before its extension."""
-    used, out = set(SOURCE_RECORDS) | set(taken), []
-    for name in names:
-        stem, ext = os.path.splitext(name)
-        candidate, n = name, 0
-        while candidate in used:
-            n += 1
-            candidate = f"{stem}-{n}{ext}"
-        used.add(candidate)
-        out.append(candidate)
-    return out
-
-
-def companion_files(original):
-    """The small files beside an original a source folder keeps copies of with its subtitles: those
-    named <stem>.nfo, .jpg, .png or .txt, of at most 10 MB. [(path, kind)], by name."""
-    folder, stem = os.path.dirname(original), os.path.splitext(os.path.basename(original))[0]
-    out = []
-    for name in (listdir(folder) if os.path.isdir(folder) else []):
-        base, ext = os.path.splitext(name)
-        path = os.path.join(folder, name)
-        if base == stem and ext.lower() in COMPANION_KINDS and os.path.isfile(path) \
-                and os.path.getsize(path) <= COMPANION_MAX_BYTES:
-            out.append((path, COMPANION_KINDS[ext.lower()]))
-    return out
-
-
 def sidecar_language(raw):
     """A sidecar's language as the catalog's row has it, when the format can hold that code, and its
     BCP 47 code otherwise; None when the row names none."""
@@ -801,47 +838,47 @@ def sidecar_language(raw):
     return r if LANGUAGE_RE.match(r) else lang(r)[0]
 
 
-def sidecar_entry(source_id, name, path, original_name, kind="subtitle", language=None, forced=False):
-    """One sidecars[] entry of a source record: the copy kept as sources/<sourceId>/<name> — path is
-    that copy, or the original it was taken from, the same bytes — with its size and hash. A subtitle
-    also says its language, whether it is forced or for the hard of hearing, as its name or the
-    catalog says (".forced." / ".sdh.", ".cc." in the name), and so what it is for."""
-    entry = {"file": f"sources/{source_id}/{name}", "originalName": original_name, "kind": kind,
-             "format": os.path.splitext(original_name)[1].lower().lstrip(".") or None}
-    if kind == "subtitle":
-        low = original_name.lower()
-        forced = bool(forced) or ".forced." in low
-        hearing = bool(re.search(r"\.(sdh|cc)\.", low))
-        entry.update(language=sidecar_language(language), forced=forced, hearingImpaired=hearing,
-                     purpose="forced" if forced else "sdh" if hearing else "dialogue")
-    entry.update(sizeBytes=os.path.getsize(path), sha256=sha_file(path))
-    return entry
+def sidecar_entry(source_id, n, path, arrival_name, language=None, forced=False):
+    """One sidecars[] entry of a source record: the copy of the nth subtitle file that came with the
+    original (n from 1, in the order the catalog lists them), kept as sources/<sourceId>/<the name
+    subtitle_copy_name() gives it> — path is that copy, or the file it is taken from, the same bytes —
+    with its size and hash, its language as the catalog's row has it, whether it is forced or for the
+    hard of hearing, as the name it arrived under or the catalog says (".forced." / ".sdh.", ".cc."
+    in the name), and so what it is for. That name is read for what it says, and kept nowhere: the
+    entry's file is where the copy goes."""
+    low = arrival_name.lower()
+    forced = bool(forced) or ".forced." in low
+    hearing = bool(re.search(r"\.(sdh|cc)\.", low))
+    ext = os.path.splitext(arrival_name)[1]
+    return {"file": f"sources/{source_id}/{subtitle_copy_name(n, language, forced, hearing, ext)}",
+            "kind": "subtitle", "format": ext.lower().lstrip(".") or None, "language": sidecar_language(language),
+            "forced": forced, "hearingImpaired": hearing, "purpose": "forced" if forced else "sdh" if hearing else "dialogue",
+            "sizeBytes": os.path.getsize(path), "sha256": sha_file(path)}
 
 
 def source_record(source_id, name, size_bytes, *, taken_at, taken_by, library_path, qh1=None, mtime=None,
-                  origin_taken_by="import", probe=None, probe_version=None, sidecars=(), note=None):
+                  probe=None, probe_version=None, sidecars=(), note=None):
     """sources/<sourceId>/source.json for one original, and the bytes of the ffprobe.json written
     beside it (None without a probe). Returns (record, probe bytes).
 
-    library_path is where the original sat, relative to the arrivals it came through; probe is the
-    verbatim ffprobe output (ffprobe()), whose facts — container, streams, fidelity, essence — the
-    record carries. Without one the record carries the file's size and fixity alone, and probe.note
-    says why. Without qh1 — an original already gone, so nothing could fingerprint it — the record
-    has no fixity, which only a note that says why may excuse."""
+    name is the name the original arrived under, and library_path where it sat, relative to the
+    arrivals it came through: the record reads what they claim — its labels, its numbering — and
+    keeps neither, nor where the file came from; file.name is the name the library gives it,
+    library_original_name(name). probe is the tool's output (ffprobe()), whose facts — container,
+    streams, fidelity, essence — the record carries, and which is kept beside it with the two edits
+    scrub_probe() makes. Without one the record carries the file's size and fixity alone, and
+    probe.note says why. Without qh1 — an original already gone, so nothing could fingerprint it —
+    the record has no fixity, which only a note that says why may excuse."""
     if qh1 is None and not text(note):
         raise ValueError("a source record without the original's fixity needs a note that says why it has none")
     folder = os.path.dirname(library_path.replace("\\", "/"))
-    file = {"name": name, "kind": "stream-container", "sizeBytes": size_bytes}
+    file = {"name": library_original_name(name), "kind": "stream-container", "sizeBytes": size_bytes}
     if mtime:
         file["mtime"] = mtime
     if qh1:
         file["fixity"] = {"qh1": qh1}
     rec = {"schema": "zaentrum.library.source/2", "sourceId": source_id, "takenAt": taken_at, "takenBy": taken_by,
-           "file": file, "origin": {"libraryPath": library_path}}
-    if origin_taken_by:
-        rec["origin"]["takenBy"] = origin_taken_by
-    if folder:
-        rec["origin"]["folder"] = folder
+           "file": file}
     named = naming(name)
     if named:
         rec["naming"] = named
@@ -849,7 +886,7 @@ def source_record(source_id, name, size_bytes, *, taken_at, taken_by, library_pa
     raw = None
     if probe:
         facts = probed(probe)
-        raw = json_bytes(probe)
+        raw = json_bytes(scrub_probe(probe, file["name"]))
         rec.update(container=facts["container"], fidelity=facts["fidelity"], streams=facts["streams"],
                    sidecars=list(sidecars), covers=[], essence=facts["essence"],
                    probe={"tool": "ffprobe", "version": probe_version, "at": taken_at,
@@ -869,18 +906,24 @@ def source_record(source_id, name, size_bytes, *, taken_at, taken_by, library_pa
 def version_record(version_id, source, *, created_at, created_by, chapters=(), chapters_from=None, segments=(),
                    original_files=()):
     """versions/<versionId>/version.json for a version made from source, a source record: its edition as
-    the file and folder names say, its presentation and runtime as the probe found them, the marks it
-    keeps, and the source it was made from. original_files stays empty unless the version keeps the
-    original in its folder, which no writer of the platform does: an original waits outside the library
-    until its package is recorded, and is deleted then."""
+    the name the file arrived under and its folder claimed — the source's labels say what they did —
+    its presentation and runtime as the probe found them, the marks it keeps, and the source it was
+    made from. original_files names the originals the version keeps in its folder: the source's
+    file.name when the version is established with its original, which goes in beside the package, or
+    taken in before anything packaged it; none for a re-package, whose original stays in the version
+    that holds it."""
     streams = source.get("streams") or []
     v0 = next((x for x in streams if x["type"] == "video" and not x["dispositions"].get("attachedPic")), None)
-    name = source["file"]["name"]
-    folder_edition = (source.get("labels") or {}).get("folderEdition")
-    kind = edition_word(name) or edition_word(folder_edition)
+    claims = source.get("labels") or {}
+    folder_edition = claims.get("folderEdition")
+    # what the name the file arrived under claimed, read when its source was recorded; a source record
+    # from before 2026-10-08 still names the file as it arrived, and that name claims the same
+    named = edition_word(claims.get("edition")) or edition_word(source["file"]["name"])
+    kind = named or edition_word(folder_edition)
+    evidence = [{"signal": "filename", "value": named, "weight": 0.6}] if named else \
+        [{"signal": "folder-name", "value": text(folder_edition), "weight": 0.6}] if kind else []
     edition = {"kind": kind or "unknown", "label": text(folder_edition), "decidedBy": "inferred",
-               "decidedAt": created_at,
-               "evidence": [{"signal": "filename", "value": name, "weight": 0.6}] if kind else []}
+               "decidedAt": created_at, "evidence": evidence}
     dynamic = (v0.get("hdr") or {}).get("format") if v0 else None
     three_d = (v0 or {}).get("stereo3d")
     presentation = {
@@ -1033,8 +1076,10 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
 
     source is the record the package was made from — a source record, or an extra record that was
     probed — whose streams and essence say what the package failed to carry; without them that is said
-    to be unmeasured. sidecars maps a subtitle rendition's id to the copy of the sidecar it was made
-    from, sources/<sourceId>/<name>, relative to the item folder. The playlist flags a reader could
+    to be unmeasured. role is derived while the folder keeps the original beside the package, and
+    canonical when it keeps none. sidecars maps a subtitle rendition's id to the copy of the subtitle
+    file it was made from, as its source's sidecars[] names it (sources/<sourceId>/subtitle-<n>…),
+    relative to the item folder. The playlist flags a reader could
     not follow are normalised, each with a note: a second default audio rendition is not one, a
     package with none has its first, a forced subtitle is never the default, and of the rest only
     the first default is one."""
@@ -1099,8 +1144,10 @@ def extra_record(extra_id, *, created_at, created_by, kind, title, localized_tit
     """extras/<extraId>/extra.json: what the extra is, as the catalog took it in, and what a probe of
     its original found. An extra of the platform keeps no original — it is deleted once the package is
     recorded — so original_files and originals stay empty, and packaged_from describes the original the
-    package was made from: [{name, sizeBytes, fixity: {qh1}}]. Without a language, the language spoken
-    in its first audio track is the extra's."""
+    package was made from: [{name, sizeBytes, fixity: {qh1}}], each named here as the library names an
+    original, library_original_name() of the name it arrived under — the nth of several original-<n> —
+    whatever name it is given. Without a language, the language spoken in its first audio track is the
+    extra's."""
     doc = {"schema": "zaentrum.library.extra/2", "extraId": extra_id, "createdAt": created_at,
            "createdBy": created_by, "kind": kind, "title": title, "localizedTitles": dict(localized_titles or {}),
            "language": language, "runtimeMs": None}
@@ -1108,7 +1155,9 @@ def extra_record(extra_id, *, created_at, created_by, kind, title, localized_tit
         doc["seasonNumber"] = season_number
     doc.update(originalFiles=list(original_files), originals=list(originals))
     if packaged_from:
-        doc["packagedFrom"] = list(packaged_from)
+        parts = len(packaged_from) > 1
+        doc["packagedFrom"] = [dict(o, name=library_original_name(o.get("name"), i + 1 if parts else None))
+                               for i, o in enumerate(packaged_from)]
     if origin:
         doc["origin"] = origin
     if probe:

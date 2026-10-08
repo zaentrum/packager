@@ -136,8 +136,8 @@ def test_the_original_is_renamed_in_last_and_the_record_sees_it_with_its_version
     monkeypatch.setattr(library, "place", place)
     run(record(share, "establish"), Catalog())
     assert seen == [
-        ("source", ["Sintel (2010).en.srt", "Sintel (2010).nfo", "checksums.sha256",
-                    "ffprobe.json", "source.json"], True),
+        ("source", ["checksums.sha256", "ffprobe.json", "source.json", "subtitle-1.en.srt"],
+         True),
         ("version", [".complete", "checksums.sha256", "hls", NAME, "package.json", "subs",
                      "trickplay", "version.json"], False),
     ]
@@ -352,12 +352,12 @@ def test_a_version_placed_before_the_modes_is_reported_as_it_is(
     assert share.original.exists() and share.tree(share.version_dir) == placed
 
 
-def test_an_establish_names_its_original_as_its_recorded_source_does(
+def test_an_establish_after_a_run_that_died_between_its_renames(
     binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A run from before the modes recorded the source under the original's
-    # arrival name and died before its version: the version would keep a
-    # file its source doesn't name.
+    # A run from before the modes recorded the source and died before its
+    # version: its record names the original as the library does, so the
+    # establish that follows keeps it in the version under that name.
     real = library.place
 
     def place(staged: Path, target: Path) -> bool:
@@ -371,11 +371,42 @@ def test_an_establish_names_its_original_as_its_recorded_source_does(
     monkeypatch.setattr(library, "place", real)
     catalog = Catalog()
     run(record(share, "establish"), catalog)
+    assert catalog.statuses == ["in_progress", "done"]
+    assert json.loads((share.version_dir / "version.json").read_text())["originalFiles"] == [NAME]
+
+
+def test_an_establish_names_its_original_as_its_recorded_source_does(
+    binaries: Binaries, share: Share,
+) -> None:
+    # A source recorded before the record logic named files as the library
+    # does: the version would keep a file its source doesn't name.
+    run(record(share, None, name=None), Catalog(status=500))
+    source = json.loads((share.source_dir / "source.json").read_text())
+    source["file"]["name"] = "Sintel (2010).mkv"
+    (share.source_dir / "source.json").write_bytes(rec.json_bytes(source))
+    catalog = Catalog()
+    run(record(share, "establish", version=NEXT_VERSION, recorded=True), catalog)
     assert catalog.statuses == ["in_progress", "failed"]
     assert (f"sources/{SOURCE} names its original 'Sintel (2010).mkv', and the version would "
             f"keep it as 'original.mkv'") in catalog.error
-    assert share.original.exists() and not share.version_dir.exists()
-    assert not share.staging.exists() and _left(share) == []
+    assert share.original.exists() and binaries.builds == 1     # nothing built for it
+    assert not (share.item_dir / "versions" / NEXT_VERSION).exists()
+    assert not (share.work / "staging" / NEXT_VERSION).exists()
+
+
+@pytest.mark.parametrize(("mode", "name"), [("establish", "original.mp4"),
+                                            ("takein", "original-2.mkv")])
+def test_a_run_keeps_its_original_only_under_the_name_its_source_gives_it(
+    binaries: Binaries, share: Share, mode: str, name: str,
+) -> None:
+    # The record logic names a source's file from the name it arrived under:
+    # a worker record that names it otherwise fails before anything is built.
+    catalog = Catalog()
+    go(record(share, mode, name=name), catalog)
+    assert catalog.statuses == ["in_progress", "failed"]
+    assert (f"the worker record names the original {name!r} in its version folder, and its "
+            f"source record would name it 'original.mkv'") in catalog.error
+    assert binaries.builds == 0 and share.original.exists() and not share.item_dir.exists()
 
 
 def test_an_establish_takes_its_original_from_its_arrival_only(
@@ -433,8 +464,7 @@ def test_a_takein_renames_the_original_into_a_version_with_no_package(
     source = json.loads((share.source_dir / "source.json").read_text())
     assert source["file"]["name"] == NAME
     assert sorted(p.name for p in share.source_dir.iterdir()) == [
-        "Sintel (2010).en.srt", "Sintel (2010).nfo", "checksums.sha256", "ffprobe.json",
-        "source.json"]
+        "checksums.sha256", "ffprobe.json", "source.json", "subtitle-1.en.srt"]
 
     [payload] = catalog.handovers
     assert payload == {
@@ -554,7 +584,7 @@ def test_a_takein_is_never_packaged(binaries: Binaries, share: Share) -> None:
 def _copies(share: Share) -> list[dict]:
     """The subtitle files of a title whose version is established, as the
     catalog names them: the copies in its source record."""
-    return [{"id": ASSET, "path": str(share.source_dir / "Sintel (2010).en.srt"),
+    return [{"id": ASSET, "path": str(share.source_dir / "subtitle-1.en.srt"),
              "language": "eng", "label": "English"}]
 
 
@@ -597,7 +627,7 @@ def test_an_add_puts_a_package_into_the_version_that_holds_its_original(
     assert package["role"] == "derived"
     # The subtitle file that came with the original, from its copy.
     assert [(x["id"], x["fromSidecar"]) for x in package["subtitles"]] == [
-        ("sub0", f"sources/{SOURCE}/Sintel (2010).en.srt")]
+        ("sub0", f"sources/{SOURCE}/subtitle-1.en.srt")]
     [payload] = catalog.handovers
     assert payload == {
         "layout": "v2", "versionId": VERSION, "packageId": package["packageId"],
