@@ -389,7 +389,19 @@ A record without a mode is a run from before the catalog named them,
 built as a `repackage` is. The packager reads the original where the
 record's `path` says — its arrival before its version is established, the
 version folder's `original.<ext>` after — and names it by the record's
-`build.originalName`: it never makes up a path or a name.
+`build.originalName`: it never makes up a path or a name. That name must
+be the one its source record has, or gets — the record logic names a
+source's file from the name it arrived under (`original.<ext>`) — else
+the run fails before anything is built.
+
+**No name a file arrived under** is kept anywhere in the record: not as a
+file's or a folder's name, not in a record, not in a package. A source
+record names its original `original.<ext>`, keeps what the name it arrived
+under claims (its labels, its numbering) but never the name, says nothing
+of where the file came from, and keeps no container title; its
+`ffprobe.json` is the tool's output with the file named so too and no
+title tag. Of what came with the original, only its subtitle files are
+copied, as `subtitle-<n>.<lang>[.forced][.sdh].<ext>`.
 
 Each folder is written once, built in staging and renamed into place in
 one step, so a reader sees all of it or nothing. A run:
@@ -400,14 +412,14 @@ one step, so a reader sees all of it or nothing. A run:
 2. builds the package in `version/`, as above (`hls/`, `subs/`,
    `trickplay/`);
 3. unless the source is recorded already, builds `source/`: the
-   original's verbatim probe (`ffprobe.json`), a copy of every subtitle
-   file the record names and of the original's `<stem>.nfo`, `.jpg`,
-   `.png` and `.txt` (up to 10 MB; a name taken already gets `-1`, `-2`,
-   … before its extension), `source.json`, and `checksums.sha256` last;
+   original's probe (`ffprobe.json`), a copy of each subtitle file the
+   record names that is there, numbered from 1 in the record's order
+   under the name the library gives it, `source.json`, and
+   `checksums.sha256` last;
 4. writes `version.json`: the catalog's chapters (else the original's
-   own) and detected ranges, the edition the file name claims, the
-   presentation and runtime the probe says, and the original it keeps
-   (`originalFiles`), for an establish or a takein;
+   own) and detected ranges, the edition the name it arrived under
+   claims, the presentation and runtime the probe says, and the original
+   it keeps (`originalFiles`), for an establish or a takein;
 5. closes the chain: `checksums.sha256` over `version.json` and every
    package file — never the original, whose fixity is its source
    record's — `package.json` with the checksums file's hash, then
@@ -482,8 +494,10 @@ packager's own records against the golden ones of the same commit. To take
 a new copy, copy `tools/libv2_records.py` and `tools/testdata/libv2_records/`
 from the schemas repository at one commit and update the test's values.
 The packager adds what only it knows: which stream of the original each
-rendition was made from. A subtitle made from a file next to the original
-names its copy (`fromSidecar: "sources/<sourceId>/<name>"`). No subtitle is `default` in
+rendition was made from. A subtitle made from a file that came with the
+original names its copy (`fromSidecar: "sources/<sourceId>/subtitle-<n>…"`):
+the file the copy was made from, or the copy itself, by its path, else a
+copy of the same bytes — never by a name. No subtitle is `default` in
 `package.json`, as no subtitle is DEFAULT=YES in the master: the record
 forbids a forced track flagged default, which `manifest.json` uses to say
 "show it by itself".
@@ -503,8 +517,10 @@ is in a version folder.
 
 **Extras** go into their title's `extras/<extraId>/` the same way, built
 in `extra/` of their staging folder: `extra.json` (what the catalog took
-the extra in as, the packager's probe of its file, and that file in
-`packagedFrom`; the folder keeps no original), the package (no
+the extra in as — a title the catalog gives none of is its kind's word —
+the packager's probe of its file, and that file in `packagedFrom`, named
+as the library names an original; the folder keeps no original), the
+package (no
 trickplay), the chain over `extra.json` and the package, one rename. Their
 handover is `POST /api/extras/{id}/packaging-complete` with `layout: v2`.
 
@@ -565,9 +581,11 @@ libx265). It also validates the tree it writes with the schemas
 repository's `validate-library-v2.py --check-checksums` when a checkout
 of it is beside this one (or `ZAENTRUM_SCHEMAS` names one) whose schemas
 know the platform's additive package and extra fields, and a Python with
-`jsonschema` and `referencing` can run it (this one, or
+`jsonschema[format-nongpl]` and `referencing` can run it (this one, or
 `LIBRARY_V2_PYTHON`). `tests/test_library_modes_real.py` runs each build
-mode on such a clip, a takein with `ffmpeg` and `ffprobe` alone.
+mode on such a clip, a takein with `ffmpeg` and `ffprobe` alone, finds no
+name the clip arrived under anywhere in the title's folder or its
+handovers, and validates each tree the same way.
 
 ## Build the container
 
