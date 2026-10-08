@@ -401,7 +401,11 @@ under claims (its labels, its numbering) but never the name, says nothing
 of where the file came from, and keeps no container title; its
 `ffprobe.json` is the tool's output with the file named so too and no
 title tag. Of what came with the original, only its subtitle files are
-copied, as `subtitle-<n>.<lang>[.forced][.sdh].<ext>`.
+copied, as `subtitle-<n>.<lang>[.forced][.sdh].<ext>`. A file that holds
+several episodes covers them (`covers`) as the record's
+`library.source.covers` lists them, in episode order, this episode — their
+holder — first; a list that isn't one of distinct episode ids beginning
+with the item's own fails the step, and a movie's file covers none.
 
 Each folder is written once, built in staging and renamed into place in
 one step, so a reader sees all of it or nothing. A run:
