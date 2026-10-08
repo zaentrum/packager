@@ -393,6 +393,22 @@ def test_an_establish_takes_its_original_from_its_arrival_only(
     assert inside.exists() and binaries.builds == 0
 
 
+@pytest.mark.parametrize("mode", ["establish", "takein"])
+def test_a_link_is_never_taken_in_for_its_original(
+    binaries: Binaries, share: Share, mode: str,
+) -> None:
+    body = record(share, mode)
+    kept_at = share.original.with_name("elsewhere.mkv")
+    share.original.rename(kept_at)
+    share.original.symlink_to(kept_at)
+    catalog = Catalog()
+    go(body, catalog)
+    assert catalog.statuses == ["in_progress", "failed"]
+    assert "is a link: a version folder keeps the file itself" in catalog.error
+    assert binaries.builds == 0 and not share.item_dir.exists()
+    assert share.original.is_symlink() and kept_at.exists()
+
+
 # ------------------------------------------------------------- takein
 
 def test_a_takein_renames_the_original_into_a_version_with_no_package(

@@ -412,7 +412,7 @@ def package_version(
         raise PackageError(_unfinished(lib))
     original = Path(item.path)
     if lib.build.mode == ESTABLISH:
-        _outside_the_record(original, lib)
+        _at_its_arrival(original, lib)
     fixity = _check_original(original, lib.source.size_bytes, lib.source.qh1, "the original")
     open_staging(staging)
     try:
@@ -435,12 +435,16 @@ def _unfinished(lib: ItemLibrary) -> str:
             f"is written once, and one another writer left half-written is never completed")
 
 
-def _outside_the_record(original: Path, lib: ItemLibrary) -> None:
-    """An original a run renames into its version folder comes from its
-    arrival: one in the title's record already is another version's."""
+def _at_its_arrival(original: Path, lib: ItemLibrary) -> None:
+    """An original a run renames into its version folder is a file at its
+    arrival — checked before anything is built: one in the title's record
+    already is another version's, and a link is not the file."""
     if Path(os.path.normpath(original)).is_relative_to(lib.item_dir):
         raise PackageError(f"the original {original} is in the title's record already: a run "
                            f"takes an original into its version folder from its arrival")
+    if original.is_symlink():
+        raise PackageError(f"the original {original} is a link: a version folder keeps the "
+                           f"file itself")
 
 
 def _names_its_original(source: dict[str, Any], lib: ItemLibrary) -> None:
@@ -991,7 +995,7 @@ def take_in(item: ClaimedItem) -> Placed:
     if os.path.lexists(sdir) and not (sdir / SUMS).is_file():
         raise PackageError(_unfinished(lib))
     original = Path(item.path)
-    _outside_the_record(original, lib)
+    _at_its_arrival(original, lib)
     fixity = _check_original(original, lib.source.size_bytes, lib.source.qh1, "the original")
     open_staging(staging)
     try:
