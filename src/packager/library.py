@@ -86,6 +86,7 @@ from .packager import (
     _started_before,
     _subdirs,
     _subtitle_files,
+    _SubtitleFile,
     _verify_staged,
     build_package,
 )
@@ -812,9 +813,9 @@ def _recorded_source(sdir: Path, source_id: str) -> tuple[dict[str, Any], list[S
 
 def _copies_of(files: dict[str, Any], copies: list[SidecarCopy]) -> dict[str, SidecarCopy]:
     """The copy of the subtitle file each subtitle made from one (by its id;
-    `files` is Built.from_files) is: by its path for the copies this run
-    made, else by its name, in order, among those a recorded source
-    holds."""
+    `files` is Built.from_files) is: by its path — the file a copy this run
+    made was made from, or a recorded copy the catalog names itself — else
+    by its name, in order, among those a recorded source holds."""
     subtitles = [c for c in copies if c.kind == "subtitle"]
     by_path = {c.path: c for c in subtitles}
     by_name: dict[str, list[SidecarCopy]] = {}
@@ -830,7 +831,7 @@ def _copies_of(files: dict[str, Any], copies: list[SidecarCopy]) -> dict[str, Si
     return out
 
 
-def _subtitles_of(item: ClaimedItem, lib: ItemLibrary) -> list[Any]:
+def _subtitles_of(item: ClaimedItem, lib: ItemLibrary) -> list[_SubtitleFile]:
     """The subtitle files of the item's record a run takes: beside the
     original, or in its source record's folder, which keeps a copy of each
     that came with it — where they are once the original is in a version
@@ -843,9 +844,9 @@ def _handover(
 ) -> list[dict[str, Any]]:
     """The handover's sidecars: each subtitle file the catalog named (by
     its id) mapped to the rendition made from it, by the package's
-    fromSidecar and the copy it names (contract section 2.5): the file the
-    copy is — or was made from — else, in order, one of the name the copy
-    was made from."""
+    fromSidecar and the copy it names (contract section 2.5): the file by
+    its path — the copy itself, or the file it was made from — else, in
+    order, by the name of the file it was made from."""
     copy_of = {f"sources/{source_id}/{c.name}": c for c in copies}
     files = _subtitles_of(item, _library(item))
     taken: set[int] = set()
