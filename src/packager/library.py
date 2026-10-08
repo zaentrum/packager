@@ -21,8 +21,10 @@ record's build mode (katalog.BUILD_MODES): `establish` a version with its
 package and its original, which is renamed into the staged folder last,
 under the name the record gives it, before that folder is renamed into
 place; `takein` a version with its original and no package, and so no
-chain (take_in); `repackage` — and a record without a mode — a version
-with a package and no original, which stays where it is.
+chain (take_in); `add` the package of a version that holds only its
+original, built in staging and renamed into the version folder, its chain
+last; `repackage` — and a record without a mode — a version with a
+package and no original, which stays where it is.
 
 A package closes one chain, bottom up: checksums.sha256 lists the record
 (version.json, extra.json) and every package file, package.json holds the
@@ -65,7 +67,15 @@ import structlog
 
 from . import libv2_records as rec
 from . import records
-from .katalog import ESTABLISH, TAKEIN, ClaimedExtra, ClaimedItem, ExtraLibrary, ItemLibrary
+from .katalog import (
+    ADD,
+    ESTABLISH,
+    TAKEIN,
+    ClaimedExtra,
+    ClaimedItem,
+    ExtraLibrary,
+    ItemLibrary,
+)
 from .packager import (
     _SUBTITLE_FILE_MAX_BYTES,
     SENTINEL,
@@ -379,7 +389,9 @@ def package_version(
     Neither is ever written over. A run that fails removes its staging
     folder, the original back where it came from first; one that dies
     leaves both to the next run of its version, or to the startup sweep,
-    which put the original back the same way."""
+    which put the original back the same way. An add puts the package
+    into the version folder there already (_add_package); a takein is
+    never packaged (take_in)."""
     lib = _library(item)
     if lib.build.mode == TAKEIN:
         raise PackageError("the worker record's build mode is takein: a takein is taken in, "
@@ -389,6 +401,10 @@ def package_version(
     staging = Path(lib.build.staging_dir)
     if not restore_original(staging):
         raise PackageError(kept(staging))
+    if lib.build.mode == ADD:
+        return _add_package(item, lib, inputs, options=options,
+                            language_whitelist=language_whitelist,
+                            keep_original_if_single=keep_original_if_single)
     if os.path.lexists(vdir):
         return _version_there(item)
     if os.path.lexists(sdir) and not (sdir / SUMS).is_file():
@@ -541,6 +557,186 @@ def _into_the_record(
     if not restore_original(staging):
         raise PackageError(kept(staging))
     return False
+
+
+def _add_package(
+    item: ClaimedItem, lib: ItemLibrary, inputs: PackageInputs, *, options: PackageOptions,
+    language_whitelist: list[str] | None, keep_original_if_single: bool,
+) -> Placed:
+    """Add a package to a version folder that holds only its original
+    (build mode add), its version.json as it is, never written again:
+
+      1. the staging folder, empty but for its sentinel;
+      2. the package, in <stagingDir>/version/, with a copy of the
+         version's version.json beside it;
+      3. the chain over the two (checksums.sha256, package.json,
+         .complete), then the package and the chain checked;
+      4. the package's folders (hls/, subs/, trickplay/) renamed into the
+         version folder, then its chain — checksums.sha256, package.json,
+         .complete last — once version.json is still the record the chain
+         lists; then the chain checked there (_add_into).
+
+    A version folder whose package is complete is the work of a run whose
+    handover was lost, and is reported again as it is. One that holds part
+    of a package and no .complete — an add that died between its renames
+    — is completed from what that run left in staging when that is the
+    rest of it (_complete_add); else the run fails, and the folder stays as
+    it is. A run that fails before its renames removes its staging folder;
+    one whose renames failed moves back what they moved, and one that
+    can't keeps it, for the next run to complete."""
+    vid, sid = lib.build.version_id, lib.source.source_id
+    vdir, sdir = Path(lib.build.version_dir), Path(lib.source.record_dir)
+    staging = Path(lib.build.staging_dir)
+    version = _holding_its_original(item, lib)
+    parts = _package_parts(vdir)
+    if COMPLETE in parts:
+        return _version_there(item)
+    if parts:
+        return _complete_add(item, lib, version, parts)
+    original = Path(item.path)
+    _check_original(original, lib.source.size_bytes, lib.source.qh1, "the original")
+    if not (sdir / SUMS).is_file():
+        raise PackageError(f"versions/{vid} is there, but its source sources/{sid} is not")
+    open_staging(staging)
+    vstage = staging / "version"
+    try:
+        vstage.mkdir()
+        built = build_package(
+            item.id, item.path, item.type, vstage, inputs=inputs, options=options,
+            language_whitelist=language_whitelist,
+            keep_original_if_single=keep_original_if_single,
+            title=item.title, year=item.year, series_title=item.series_title,
+            season_number=item.season_number, episode_number=item.episode_number,
+            tmdb_id=item.tmdb_id, track_languages=item.track_languages,
+            subtitle_files=item.subtitle_files, codecs=HEVC_ONLY,
+        )
+        probe = records.probe_original(original)
+        now = utc_now()
+        source, copies = _recorded_source(sdir, sid)
+        sidecars = {sub_id: f"sources/{sid}/{c.name}"
+                    for sub_id, c in _copies_of(built.from_files, copies).items()}
+        (vstage / VERSION_RECORD).write_bytes(version)
+        peak = rec.peak_bandwidth(str(vstage), built.manifest["hls"]["master"])
+        package_id = str(uuid.uuid4())
+        body = close_chain(vstage, VERSION_RECORD, version, rec.PACKAGE_DIRS, lambda listed:
+                           records.package_record(package_id, built, listed, source, probe,
+                                                  sidecars, peak, now, beside_original=True))
+        package = json.loads(body)
+        _verify_staged(vstage, package)
+        problem = verify_chain(vstage, VERSION_RECORD)
+        if problem is not None:
+            raise PackageError(f"the staged package is not whole: {problem}")
+        _add_into(vstage, vdir, version, _package_parts(vstage))
+    except Exception:
+        if _package_parts(vdir):
+            log.error("packager.library.add_unfinished", item_id=item.id, version_id=vid,
+                      parts=_package_parts(vdir), staging=str(staging))
+        else:
+            remove_staging(staging)
+        raise
+    log.info("packager.library.package_added", item_id=item.id, version_id=vid,
+             package_id=package_id, files=package["checksums"]["files"],
+             bytes=package["checksums"]["bytes"])
+    return Placed(vdir, body, package, _handover(item, package, copies, sid))
+
+
+def _holding_its_original(item: ClaimedItem, lib: ItemLibrary) -> bytes:
+    """version.json, as it is, of the version folder an add adds a package
+    to: this version's record, of this source, keeping the original the
+    worker record names, which is there, in that folder — and nothing but
+    those and what a package adds. Raises PackageError for any other."""
+    vid, sid = lib.build.version_id, lib.source.source_id
+    vdir = Path(lib.build.version_dir)
+    if not vdir.is_dir():
+        raise PackageError(f"versions/{vid} is not there: a package is added to the version "
+                           f"folder that holds its original")
+    try:
+        data = (vdir / VERSION_RECORD).read_bytes()
+        version = json.loads(data)
+        entries = sorted(os.listdir(vdir))
+    except (OSError, ValueError) as e:
+        raise PackageError(f"versions/{vid} can't be read: {e}") from e
+    if not isinstance(version, dict) or version.get("versionId") != vid \
+            or sid not in (version.get("sourceIds") or []):
+        raise PackageError(f"versions/{vid} holds the record of another version or source")
+    keeps = [n for n in version.get("originalFiles") or [] if isinstance(n, str)]
+    original = Path(os.path.normpath(item.path))
+    if original.parent != vdir or original.name not in keeps:
+        raise PackageError(f"the original {item.path} is not one versions/{vid} keeps "
+                           f"({', '.join(keeps) or 'none'}): a package is added to the version "
+                           f"that holds its original")
+    if original.is_symlink() or not original.is_file():
+        raise PackageError(f"versions/{vid} keeps its original {original.name}, which is not "
+                           f"there")
+    others = [n for n in entries
+              if n not in {VERSION_RECORD, *keeps, *rec.PACKAGE_DIRS, *CHAIN}]
+    if others:
+        raise PackageError(f"versions/{vid} holds what no version folder does "
+                           f"({', '.join(others)}): a version folder is never written over")
+    return data
+
+
+def _package_parts(folder: Path) -> list[str]:
+    """What of a package a folder holds: its folders, then its chain, in
+    the order an add renames them."""
+    return [n for n in (*rec.PACKAGE_DIRS, *CHAIN) if os.path.lexists(folder / n)]
+
+
+def _add_into(vstage: Path, vdir: Path, version: bytes, names: list[str]) -> None:
+    """Rename `names` — a staged package's folders, then its chain, .complete
+    last — from vstage into the version folder vdir, never over anything,
+    once vdir's version.json is still `version`, the record the chain
+    lists; then check the chain there. A step that fails moves back what
+    this moved, logging what it can't."""
+    moved: list[str] = []
+    try:
+        if (vdir / VERSION_RECORD).read_bytes() != version:
+            raise PackageError(f"versions/{vdir.name}/version.json changed while its package "
+                               f"was built")
+        for name in names:
+            if os.path.lexists(vdir / name):
+                raise PackageError(f"versions/{vdir.name}/{name} is there already: a version "
+                                   f"folder is never written over")
+            os.rename(vstage / name, vdir / name)
+            moved.append(name)
+        problem = verify_chain(vdir, VERSION_RECORD)
+        if problem is not None:
+            raise PackageError(f"versions/{vdir.name} with its package added is not whole: "
+                               f"{problem}")
+    except Exception:
+        for name in reversed(moved):
+            try:
+                os.rename(vdir / name, vstage / name)
+            except OSError as e:
+                log.error("packager.library.add_undo_failed", path=str(vdir / name),
+                          error=str(e)[:200])
+        raise
+
+
+def _complete_add(item: ClaimedItem, lib: ItemLibrary, version: bytes, parts: list[str]) -> Placed:
+    """Complete an add that died between its renames: the rest of its
+    package renamed from its staging folder into the version folder, once
+    it is all there — each part of it in one of the two, none in both, its
+    chain among them, and the staged copy of version.json the version
+    folder's own — and the chain then holds. Else the run fails, and
+    nothing is moved."""
+    vid = lib.build.version_id
+    vdir = Path(lib.build.version_dir)
+    vstage = Path(lib.build.staging_dir) / "version"
+    rest = _package_parts(vstage) if vstage.is_dir() else []
+    try:
+        same = (vstage / VERSION_RECORD).read_bytes() == version
+    except OSError:
+        same = False
+    if set(rest) & set(parts) or not all(n in rest or n in parts for n in CHAIN) or not same:
+        raise PackageError(
+            f"versions/{vid} holds part of a package ({', '.join(parts)}) and no {COMPLETE}, "
+            f"and its staging folder doesn't hold the rest of it: a version folder is never "
+            f"written over")
+    log.warning("packager.library.add_completing", item_id=item.id, version_id=vid,
+                there=parts, rest=rest)
+    _add_into(vstage, vdir, version, rest)
+    return _version_there(item)
 
 
 def _stage_source(

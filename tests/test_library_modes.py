@@ -533,6 +533,206 @@ def test_a_takein_is_never_packaged(binaries: Binaries, share: Share) -> None:
         library.take_in(ClaimedItem.from_json(record(share, "establish")))
 
 
+# ------------------------------------------------------------- add
+
+def _taken_in(share: Share) -> dict:
+    """A version a takein left in the record — version.json and the
+    original — and the worker record of the add for it: the catalog's path
+    is the original's in the version folder now."""
+    add = record(share, "add", name=None, recorded=True)
+    go(record(share, "takein"), Catalog())
+    add["path"] = str(share.version_dir / NAME)
+    return add
+
+
+def test_an_add_puts_a_package_into_the_version_that_holds_its_original(
+    binaries: Binaries, share: Share,
+) -> None:
+    add = _taken_in(share)
+    vdir = share.version_dir
+    version = (vdir / "version.json").read_bytes()
+    stat = (vdir / "version.json").stat()
+    ino = _ino(vdir / NAME)
+    catalog = Catalog()
+    go(add, catalog)
+    assert catalog.statuses == ["in_progress", "done"]
+    assert binaries.builds == 1
+    assert sorted(p.name for p in vdir.iterdir()) == [
+        ".complete", "checksums.sha256", "hls", NAME, "package.json", "trickplay",
+        "version.json"]
+    # version.json is never written again; the original stays as it is.
+    assert (vdir / "version.json").read_bytes() == version
+    assert ((vdir / "version.json").stat().st_ino, (vdir / "version.json").stat().st_mtime_ns) \
+        == (stat.st_ino, stat.st_mtime_ns)
+    assert _ino(vdir / NAME) == ino
+    assert library.verify_chain(vdir, "version.json") is None
+    sums = (vdir / "checksums.sha256").read_text()
+    assert "  version.json\n" in sums and NAME not in sums
+    package = json.loads((vdir / "package.json").read_text())
+    assert package["role"] == "derived"
+    [payload] = catalog.handovers
+    assert payload == {
+        "layout": "v2", "versionId": VERSION, "packageId": package["packageId"],
+        "versionDir": str(vdir), "complete": (vdir / ".complete").read_text().strip(),
+        "sourceId": SOURCE, "sourceRecorded": True, "package": package, "sidecars": [],
+        "source": SOURCE_BLOCK,
+    }
+    assert not share.staging.exists() and _left(share) == []
+
+
+def test_an_add_whose_handover_was_lost_is_reported_again(
+    binaries: Binaries, share: Share,
+) -> None:
+    add = _taken_in(share)
+    catalog = Catalog()
+
+    def dies(_payload: dict) -> None:
+        raise _Killed
+
+    catalog.on_handover = dies
+    with pytest.raises(_Killed):
+        go(add, catalog)
+    first = catalog.handovers[0]
+    placed = share.tree(share.version_dir)
+    catalog = Catalog()
+    go(add, catalog)
+    assert catalog.statuses == ["in_progress", "done"]
+    assert binaries.builds == 1 and catalog.handovers == [first]
+    assert share.tree(share.version_dir) == placed
+    assert not share.staging.exists() and _left(share) == []
+
+
+def _dies_renaming(share: Share, monkeypatch: pytest.MonkeyPatch, name: str,
+                   exc: BaseException):
+    """The add's rename of `name` into the version folder fails with exc.
+    Returns the rename to put back."""
+    real = os.rename
+
+    def rename(src, dst):
+        if Path(dst) == share.version_dir / name:
+            raise exc
+        real(src, dst)
+
+    monkeypatch.setattr(os, "rename", rename)
+    return real
+
+
+@pytest.mark.parametrize("dies_at", ["trickplay", "checksums.sha256", "package.json",
+                                     ".complete"])
+def test_an_add_that_died_between_its_renames_is_completed(
+    binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch, dies_at: str,
+) -> None:
+    add = _taken_in(share)
+    real = _dies_renaming(share, monkeypatch, dies_at, _Killed())
+    with pytest.raises(_Killed):
+        go(add, Catalog())
+    monkeypatch.setattr(os, "rename", real)
+    assert not (share.version_dir / dies_at).exists()
+    assert not (share.version_dir / ".complete").exists()
+    catalog = Catalog()
+    go(add, catalog)
+    assert catalog.statuses == ["in_progress", "done"]
+    assert binaries.builds == 1                         # completed, not built again
+    vdir = share.version_dir
+    assert library.verify_chain(vdir, "version.json") is None
+    assert rec.chain_problems(str(vdir), "version.json", full=True) == []
+    [payload] = catalog.handovers
+    assert payload["package"] == json.loads((vdir / "package.json").read_text())
+    assert payload["complete"] == (vdir / ".complete").read_text().strip()
+    assert payload["source"] == SOURCE_BLOCK and "original" not in payload
+    assert not share.staging.exists() and _left(share) == []
+
+
+@pytest.mark.parametrize("staged", ["gone", "a part in both"])
+def test_a_half_added_version_that_cant_be_completed_is_never_written_over(
+    binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch, staged: str,
+) -> None:
+    add = _taken_in(share)
+    real = _dies_renaming(share, monkeypatch, "package.json", _Killed())
+    with pytest.raises(_Killed):
+        go(add, Catalog())
+    monkeypatch.setattr(os, "rename", real)
+    if staged == "gone":                       # the sweep took the dead run's staging folder
+        library.remove_staging(share.staging)
+    else:
+        (share.staging / "version" / "hls").mkdir()
+    before = share.tree(share.version_dir)
+    catalog = Catalog()
+    go(add, catalog)
+    assert catalog.statuses == ["in_progress", "failed"]
+    assert (f"versions/{VERSION} holds part of a package (hls, trickplay, checksums.sha256) "
+            f"and no .complete, and its staging folder doesn't hold the rest of it") in (
+        catalog.error)
+    assert share.tree(share.version_dir) == before and binaries.builds == 1
+
+
+def test_an_add_whose_renames_fail_moves_back_what_they_moved(
+    binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    add = _taken_in(share)
+    taken_in = share.tree(share.version_dir)
+    real = _dies_renaming(share, monkeypatch, ".complete",
+                          OSError(errno.EIO, "Input/output error"))
+    catalog = Catalog()
+    go(add, catalog)
+    monkeypatch.setattr(os, "rename", real)
+    assert catalog.statuses == ["in_progress", "failed"] and "Input/output error" in catalog.error
+    assert share.tree(share.version_dir) == taken_in    # the version as the takein left it
+    assert not share.staging.exists()
+    catalog = Catalog()
+    go(add, catalog)
+    assert catalog.statuses == ["in_progress", "done"] and binaries.builds == 2
+
+
+def test_an_add_whose_version_record_changes_meanwhile_adds_nothing(
+    binaries: Binaries, share: Share,
+) -> None:
+    add = _taken_in(share)
+    binaries.hooks.append(lambda _out: (share.version_dir / "version.json").write_text("{}\n"))
+    catalog = Catalog()
+    go(add, catalog)
+    assert catalog.statuses == ["in_progress", "failed"]
+    assert "version.json changed while its package was built" in catalog.error
+    assert sorted(p.name for p in share.version_dir.iterdir()) == [NAME, "version.json"]
+
+
+@pytest.mark.parametrize("case", ["no folder", "not its original", "another file",
+                                  "another version", "no source"])
+def test_a_package_is_added_only_to_the_version_that_holds_its_original(
+    binaries: Binaries, share: Share, case: str,
+) -> None:
+    if case == "no folder":
+        add = record(share, "add", name=None)
+    else:
+        add = _taken_in(share)
+        if case == "not its original":
+            (share.version_dir / NAME).rename(share.original)
+            add["path"] = str(share.original)
+        elif case == "another file":
+            (share.version_dir / "notes.txt").write_text("x")
+        elif case == "another version":
+            add["library"]["build"]["versionId"] = NEXT_VERSION
+            add["library"]["build"]["versionDir"] = str(share.version_dir.parent / NEXT_VERSION)
+            add["library"]["build"]["stagingDir"] = str(share.work / "staging" / NEXT_VERSION)
+            share.version_dir.rename(share.version_dir.parent / NEXT_VERSION)
+            add["path"] = str(share.version_dir.parent / NEXT_VERSION / NAME)
+        else:
+            os.unlink(share.source_dir / "checksums.sha256")
+    catalog = Catalog()
+    go(add, catalog)
+    assert catalog.statuses[-1] == "failed" and catalog.handovers == []
+    assert binaries.builds == 0
+    assert {
+        "no folder": f"versions/{VERSION} is not there: a package is added to the version "
+                     f"folder that holds its original",
+        "not its original": f"the original {share.original} is not one versions/{VERSION} "
+                            f"keeps (original.mkv)",
+        "another file": f"versions/{VERSION} holds what no version folder does (notes.txt)",
+        "another version": f"versions/{NEXT_VERSION} holds the record of another version",
+        "no source": f"versions/{VERSION} is there, but its source sources/{SOURCE} is not",
+    }[case] in catalog.error
+
+
 # ------------------------------------------------------------- repackage
 
 def test_a_repackage_is_a_new_version_and_the_original_stays_where_it_is(
