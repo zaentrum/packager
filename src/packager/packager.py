@@ -413,13 +413,16 @@ def build_package(
     trickplay: bool = True,
     manifest_extra: dict[str, Any] | None = None,
     codecs: tuple[str, ...] = VIDEO_CODECS,
+    subtitle_folders: tuple[Path, ...] = (),
 ) -> Built:
     """Build one package into `stage`, a folder the caller made and owns:
     hls/ (the media playlists, the master), subs/ and trickplay/. Writes
     nothing beside them and no manifest; package_item's arguments, as it
     passes them (see there). `codecs` are the video codecs a rendition may
     have: v0 in another fails the run, a lower rung in another is left out.
-    Raises on any failure, leaving what it wrote."""
+    `subtitle_folders` are where else than beside the source its subtitle
+    files may be (_subtitle_files). Raises on any failure, leaving what it
+    wrote."""
     src = inputs.primary.path
     segment_seconds = inputs.segment_seconds or options.segment_seconds
     probe = _ffprobe(src)
@@ -439,7 +442,7 @@ def build_package(
 
     # The subtitle files next to the source come after its own
     # subtitle tracks, as tracks like them.
-    sub_files = _subtitle_files(subtitle_files, Path(source_path))
+    sub_files = _subtitle_files(subtitle_files, Path(source_path), subtitle_folders)
 
     # Resolve client-visibility windows for audio + subtitle
     # tracks from the language whitelist. Tracks ALWAYS get
@@ -2178,18 +2181,23 @@ class _SubtitleFile:
     asset_id: str | None = None
 
 
-def _subtitle_files(entries: list[Any] | None, source: Path) -> list[_SubtitleFile]:
+def _subtitle_files(
+    entries: list[Any] | None, source: Path, folders: tuple[Path, ...] = (),
+) -> list[_SubtitleFile]:
     """The item record's subtitleFiles the packager takes: an absolute
     `path` to a .srt, .vtt, .ass or .ssa file in the source's folder or
-    below it; its `language` when that is a code (_language_code), else
+    below it — or in one of `folders` (a library v2 run's: the source
+    record's, which keeps a copy of each file that came with the
+    original); its `language` when that is a code (_language_code), else
     und; its `label`; `forced` only when true. Any other entry is
     ignored, logged."""
-    folder = Path(os.path.normpath(source.parent))
+    roots = [Path(os.path.normpath(f)) for f in (source.parent, *folders)]
     out: list[_SubtitleFile] = []
     for entry in entries or []:
         raw = entry.get("path") if isinstance(entry, dict) else None
         path = Path(os.path.normpath(raw)) if isinstance(raw, str) and raw.strip() else None
-        if (path is None or not path.is_absolute() or not path.is_relative_to(folder)
+        if (path is None or not path.is_absolute()
+                or not any(path.is_relative_to(root) for root in roots)
                 or path.suffix.lower() not in _SUBTITLE_FILE_SUFFIXES):
             log.warning("packager.subtitle_file.ignored", entry=str(entry)[:300])
             continue

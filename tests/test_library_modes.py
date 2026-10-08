@@ -535,13 +535,22 @@ def test_a_takein_is_never_packaged(binaries: Binaries, share: Share) -> None:
 
 # ------------------------------------------------------------- add
 
+def _copies(share: Share) -> list[dict]:
+    """The subtitle files of a title whose version is established, as the
+    catalog names them: the copies in its source record."""
+    return [{"id": ASSET, "path": str(share.source_dir / "Sintel (2010).en.srt"),
+             "language": "eng", "label": "English"}]
+
+
 def _taken_in(share: Share) -> dict:
     """A version a takein left in the record — version.json and the
-    original — and the worker record of the add for it: the catalog's path
-    is the original's in the version folder now."""
+    original — and the worker record of the add for it: the catalog's
+    paths are the original's in the version folder now, and its subtitle
+    file's copy in the source record."""
     add = record(share, "add", name=None, recorded=True)
     go(record(share, "takein"), Catalog())
     add["path"] = str(share.version_dir / NAME)
+    add["subtitleFiles"] = _copies(share)
     return add
 
 
@@ -558,7 +567,7 @@ def test_an_add_puts_a_package_into_the_version_that_holds_its_original(
     assert catalog.statuses == ["in_progress", "done"]
     assert binaries.builds == 1
     assert sorted(p.name for p in vdir.iterdir()) == [
-        ".complete", "checksums.sha256", "hls", NAME, "package.json", "trickplay",
+        ".complete", "checksums.sha256", "hls", NAME, "package.json", "subs", "trickplay",
         "version.json"]
     # version.json is never written again; the original stays as it is.
     assert (vdir / "version.json").read_bytes() == version
@@ -570,11 +579,15 @@ def test_an_add_puts_a_package_into_the_version_that_holds_its_original(
     assert "  version.json\n" in sums and NAME not in sums
     package = json.loads((vdir / "package.json").read_text())
     assert package["role"] == "derived"
+    # The subtitle file that came with the original, from its copy.
+    assert [(x["id"], x["fromSidecar"]) for x in package["subtitles"]] == [
+        ("sub0", f"sources/{SOURCE}/Sintel (2010).en.srt")]
     [payload] = catalog.handovers
     assert payload == {
         "layout": "v2", "versionId": VERSION, "packageId": package["packageId"],
         "versionDir": str(vdir), "complete": (vdir / ".complete").read_text().strip(),
-        "sourceId": SOURCE, "sourceRecorded": True, "package": package, "sidecars": [],
+        "sourceId": SOURCE, "sourceRecorded": True, "package": package,
+        "sidecars": [{"subtitleAssetId": ASSET, "rendition": "sub0", "path": "subs/0.vtt"}],
         "source": SOURCE_BLOCK,
     }
     assert not share.staging.exists() and _left(share) == []
@@ -617,7 +630,7 @@ def _dies_renaming(share: Share, monkeypatch: pytest.MonkeyPatch, name: str,
     return real
 
 
-@pytest.mark.parametrize("dies_at", ["trickplay", "checksums.sha256", "package.json",
+@pytest.mark.parametrize("dies_at", ["subs", "trickplay", "checksums.sha256", "package.json",
                                      ".complete"])
 def test_an_add_that_died_between_its_renames_is_completed(
     binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch, dies_at: str,
@@ -660,9 +673,9 @@ def test_a_half_added_version_that_cant_be_completed_is_never_written_over(
     catalog = Catalog()
     go(add, catalog)
     assert catalog.statuses == ["in_progress", "failed"]
-    assert (f"versions/{VERSION} holds part of a package (hls, trickplay, checksums.sha256) "
-            f"and no .complete, and its staging folder doesn't hold the rest of it") in (
-        catalog.error)
+    assert (f"versions/{VERSION} holds part of a package (hls, subs, trickplay, "
+            f"checksums.sha256) and no .complete, and its staging folder doesn't hold the rest "
+            f"of it") in catalog.error
     assert share.tree(share.version_dir) == before and binaries.builds == 1
 
 
@@ -743,13 +756,16 @@ def test_a_repackage_is_a_new_version_and_the_original_stays_where_it_is(
     first = share.tree(share.version_dir)
     kept_at = share.version_dir / NAME
     ino = _ino(kept_at)
-    repackage["path"] = str(kept_at)            # the catalog's path, once it took the version
+    # The catalog's paths, once it took the version: the original in it, the
+    # subtitle file's copy in the source record.
+    repackage.update(path=str(kept_at), subtitleFiles=_copies(share))
     catalog = Catalog()
     run(repackage, catalog)
     assert catalog.statuses == ["in_progress", "done"]
     second = share.item_dir / "versions" / NEXT_VERSION
     assert sorted(p.name for p in second.iterdir()) == [
-        ".complete", "checksums.sha256", "hls", "package.json", "trickplay", "version.json"]
+        ".complete", "checksums.sha256", "hls", "package.json", "subs", "trickplay",
+        "version.json"]
     assert json.loads((second / "version.json").read_text())["originalFiles"] == []
     assert json.loads((second / "package.json").read_text())["role"] == "canonical"
     assert library.verify_chain(second, "version.json") is None
@@ -757,6 +773,8 @@ def test_a_repackage_is_a_new_version_and_the_original_stays_where_it_is(
     assert share.tree(share.version_dir) == first and _ino(kept_at) == ino
     [payload] = catalog.handovers
     assert payload["versionId"] == NEXT_VERSION and "original" not in payload
+    assert payload["sidecars"] == [{"subtitleAssetId": ASSET, "rendition": "sub0",
+                                    "path": "subs/0.vtt"}]
     assert not (share.work / "staging" / NEXT_VERSION).exists() and _left(share) == []
 
 

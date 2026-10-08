@@ -100,6 +100,22 @@ def test_subtitle_files_ignore_an_entry_they_cant_take(entry) -> None:
     assert pk._subtitle_files(None, source) == []
 
 
+def test_subtitle_files_in_a_folder_the_run_names_besides() -> None:
+    # A library v2 run's original in its version folder: the files that
+    # came with it are its source record's copies.
+    item = "/lib/movies/f0/f001"
+    source = Path(f"{item}/versions/v1/original.mkv")
+    sources = Path(f"{item}/sources/s1")
+    entries = [{"path": f"{item}/sources/s1/Movie.de.srt", "language": "ger"},
+               {"path": f"{item}/sources/s2/Movie.en.srt", "language": "eng"},  # another's
+               {"path": f"{item}/sources/s1/../s2/Movie.fr.srt"},
+               {"path": f"{item}/versions/v1/subs/0.vtt"}]
+    assert [f.path for f in pk._subtitle_files(entries, source, (sources,))] == [
+        sources / "Movie.de.srt", source.parent / "subs" / "0.vtt"]
+    assert [f.path for f in pk._subtitle_files(entries, source)] == [
+        source.parent / "subs" / "0.vtt"]
+
+
 # --------------------------------------------- subtitle files: their text
 @pytest.mark.parametrize(("raw", "text"), [
     ("Café\n".encode(), "Café\n"),

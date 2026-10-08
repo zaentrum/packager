@@ -483,6 +483,7 @@ def _stage_version(
         season_number=item.season_number, episode_number=item.episode_number,
         tmdb_id=item.tmdb_id, track_languages=item.track_languages,
         subtitle_files=item.subtitle_files, codecs=HEVC_ONLY,
+        subtitle_folders=(Path(lib.source.record_dir),),
     )
     probe = records.probe_original(Path(item.path))
     now = utc_now()
@@ -609,6 +610,7 @@ def _add_package(
             season_number=item.season_number, episode_number=item.episode_number,
             tmdb_id=item.tmdb_id, track_languages=item.track_languages,
             subtitle_files=item.subtitle_files, codecs=HEVC_ONLY,
+            subtitle_folders=(sdir,),
         )
         probe = records.probe_original(original)
         now = utc_now()
@@ -753,7 +755,7 @@ def _stage_source(
     sid = lib.source.source_id
     original = Path(item.path)
     files: list[tuple[Path, str, str | None, bool]] = []      # (path, kind, language, forced)
-    for f in _subtitle_files(item.subtitle_files, original):
+    for f in _subtitles_of(item, lib):
         try:
             if f.path.stat().st_size > _SUBTITLE_FILE_MAX_BYTES:
                 log.warning("packager.library.sidecar_too_large", path=str(f.path))
@@ -828,24 +830,40 @@ def _copies_of(files: dict[str, Any], copies: list[SidecarCopy]) -> dict[str, Si
     return out
 
 
+def _subtitles_of(item: ClaimedItem, lib: ItemLibrary) -> list[Any]:
+    """The subtitle files of the item's record a run takes: beside the
+    original, or in its source record's folder, which keeps a copy of each
+    that came with it — where they are once the original is in a version
+    folder."""
+    return _subtitle_files(item.subtitle_files, Path(item.path), (Path(lib.source.record_dir),))
+
+
 def _handover(
     item: ClaimedItem, package: dict[str, Any], copies: list[SidecarCopy], source_id: str,
 ) -> list[dict[str, Any]]:
     """The handover's sidecars: each subtitle file the catalog named (by
     its id) mapped to the rendition made from it, by the package's
-    fromSidecar and the copy it names (contract section 2.5)."""
+    fromSidecar and the copy it names (contract section 2.5): the file the
+    copy is — or was made from — else, in order, one of the name the copy
+    was made from."""
     copy_of = {f"sources/{source_id}/{c.name}": c for c in copies}
-    by_name: dict[str, list[Any]] = {}
-    for f in _subtitle_files(item.subtitle_files, Path(item.path)):
-        by_name.setdefault(f.path.name, []).append(f)
+    files = _subtitles_of(item, _library(item))
+    taken: set[int] = set()
     out = []
     for s in package.get("subtitles") or []:
         c = copy_of.get(s.get("fromSidecar"))
-        if c is None or not by_name.get(c.original_name):
+        if c is None:
             continue
-        f = by_name[c.original_name].pop(0)
-        if f.asset_id:
-            out.append({"subtitleAssetId": f.asset_id, "rendition": s["id"], "path": s["path"]})
+        i = next((i for i, f in enumerate(files) if i not in taken and f.path == c.path), None)
+        if i is None:
+            i = next((i for i, f in enumerate(files)
+                      if i not in taken and f.path.name == c.original_name), None)
+        if i is None:
+            continue
+        taken.add(i)
+        if files[i].asset_id:
+            out.append({"subtitleAssetId": files[i].asset_id, "rendition": s["id"],
+                        "path": s["path"]})
     return out
 
 
