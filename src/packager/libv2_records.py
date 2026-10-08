@@ -53,8 +53,10 @@ import copy, datetime, hashlib, json, os, re, shutil, subprocess, uuid
 
 # The version of what this module writes. A change to the shape of a record it builds is a new
 # value, and the copy a writer vendors names the one it was taken at. 2: no record names a file as
-# it arrived, and a source copies only the subtitle files that came with its original.
-LIBV2_RECORDS = 2
+# it arrived, and a source copies only the subtitle files that came with its original. 3: a source
+# covers the episodes its file holds as the database linked them, and its naming reads a file of
+# several episodes as the catalog's scanner does, from the first to the last.
+LIBV2_RECORDS = 3
 
 NS = uuid.uuid5(uuid.NAMESPACE_URL, "https://zaentrum.github.io/schemas/library")
 PACKAGE_DIRS = ("hls", "subs", "trickplay", "trailers")
@@ -232,11 +234,22 @@ EDITION_WORDS = [
     ("remastered", r"\bremaster(ed)?\b"), ("restored", r"\brestor(ed|ation)\b"), ("imax", r"\bimax\b"),
     ("final-cut", r"final[ ._-]?cut"),
 ]
-# 'S01E02', 'S01E02-03', 'S07E23-E24', '1x05' — the range must not swallow a quality token
-# ('S01E02-1080p' numbers one episode), so a bare range end is at most three digits and is not
-# followed by another digit or a 'p'.
-EPISODE_TOKEN = re.compile(r"S(\d{1,3})[ ._-]?E(\d{1,4})(?:[ ._-]?E(\d{1,4})|-(\d{1,3})(?![0-9p]))?"
-                           r"|(?<![0-9a-z])(\d{1,2})x(\d{2,3})(?![0-9])", re.I)
+# How a name numbers the episodes its file holds, read as the catalog's scanner reads a name, so that a
+# source's naming says the range the catalog links the file's episodes by: S05E15, letter case aside, standing
+# apart from the words around it — no letter, digit or underscore just before or after — and not followed by
+# a digit; for a file of several, the episodes after it, each where the one before ends — S05E15E16,
+# S05E15-E16 (or .E16, _E16, " E16"), S05E15-16, S05E15-E17, S05E15E16E17 — each after the one before, and
+# at most MAX_COVERED episodes from the first to the last. A number after a dash that a p follows is none
+# (S05E15-720p is the fifteenth episode in 720p), and neither is one a digit follows (S05E15-1080), one no
+# higher than the one before, or one that would cover more than MAX_COVERED (S05E15-264); the token ends
+# where it still stands apart (S05E15-E16x numbers the fifteenth alone). '1x05', which the scanner does not
+# read, numbers one episode and never a range.
+EPISODE_HEAD = re.compile(r"\bS(\d{1,2})E(\d{1,3})", re.I | re.A)
+EPISODE_MORE = re.compile(r"(?:[ ._-]?E|-)(\d{1,3})", re.I | re.A)
+EPISODE_NXN = re.compile(r"(?<![0-9a-z])(\d{1,2})x(\d{2,3})(?![0-9])", re.I)
+# The most episodes one file covers, the first and the last among them.
+MAX_COVERED = 10
+DIGITS = "0123456789"
 
 
 def medium_of(token):
@@ -270,18 +283,49 @@ def labels(name, folder):
     }
 
 
+def episode_range(stem):
+    """The first token of stem that numbers episodes as the catalog's scanner reads one (EPISODE_HEAD
+    above): (where it starts, where it ends, its season, the first episode, the last) — the last the first
+    for a file of one episode — or None."""
+    word = lambda c: c in DIGITS or c == "_" or "a" <= c <= "z" or "A" <= c <= "Z"
+    for m in EPISODE_HEAD.finditer(stem):
+        end = m.end()
+        if end < len(stem) and stem[end] in DIGITS:
+            continue  # E1500: no episode of a season numbers so
+        first = last = int(m.group(2))
+        after, at = [], end
+        while True:  # the episodes after the first, each where the one before ends
+            x = EPISODE_MORE.match(stem, at)
+            if not x:
+                break
+            n, nxt = int(x.group(1)), x.end()
+            dashed = stem[at] == "-" and stem[at + 1] in DIGITS
+            if nxt < len(stem) and (stem[nxt] in DIGITS or (dashed and stem[nxt] in "pP")):
+                break  # -720p, -1080: no episode
+            if n <= last or n - first + 1 > MAX_COVERED:
+                break
+            after.append((nxt, n))
+            at, last = nxt, n
+        for tok_end, tok_last in reversed([(end, first)] + after):  # the longest of it that stands apart
+            if tok_end == len(stem) or not word(stem[tok_end]):
+                return m.start(), tok_end, int(m.group(1)), first, tok_last
+    return None
+
+
 def naming(name):
-    """How the file's own name numbered what it holds. The name never says which ordering it used,
-    so the scheme stays 'unknown' and only the numbers and the token itself are recorded."""
-    m = EPISODE_TOKEN.search(os.path.splitext(name)[0])
-    if not m:
-        return None
-    if m.group(1) is not None:
-        season, episode, end = int(m.group(1)), int(m.group(2)), m.group(3) or m.group(4)
-    else:
-        season, episode, end = int(m.group(5)), int(m.group(6)), None
-    return {"scheme": "unknown", "seasonNumber": season, "episodeNumber": episode,
-            "episodeEnd": int(end) if end else None, "raw": m.group(0)}
+    """How the file's own name numbered what it holds, read as the catalog's scanner reads it: a file of
+    several episodes from its first to its last, episodeEnd the last. The name never says which ordering it
+    used, so the scheme stays 'unknown' and only the numbers and the token itself are recorded."""
+    stem = os.path.splitext(name)[0]
+    tok, nxn = episode_range(stem), EPISODE_NXN.search(stem)
+    if tok and not (nxn and nxn.start() < tok[0]):
+        start, end, season, first, last = tok
+        return {"scheme": "unknown", "seasonNumber": season, "episodeNumber": first,
+                "episodeEnd": last if last != first else None, "raw": stem[start:end]}
+    if nxn:
+        return {"scheme": "unknown", "seasonNumber": int(nxn.group(1)), "episodeNumber": int(nxn.group(2)),
+                "episodeEnd": None, "raw": nxn.group(0)}
+    return None
 
 
 # ---------------------------------------------------------------- the names the library gives
@@ -857,7 +901,7 @@ def sidecar_entry(source_id, n, path, arrival_name, language=None, forced=False)
 
 
 def source_record(source_id, name, size_bytes, *, taken_at, taken_by, library_path, qh1=None, mtime=None,
-                  probe=None, probe_version=None, sidecars=(), note=None):
+                  probe=None, probe_version=None, sidecars=(), note=None, covers=()):
     """sources/<sourceId>/source.json for one original, and the bytes of the ffprobe.json written
     beside it (None without a probe). Returns (record, probe bytes).
 
@@ -868,9 +912,17 @@ def source_record(source_id, name, size_bytes, *, taken_at, taken_by, library_pa
     streams, fidelity, essence — the record carries, and which is kept beside it with the two edits
     scrub_probe() makes. Without one the record carries the file's size and fixity alone, and
     probe.note says why. Without qh1 — an original already gone, so nothing could fingerprint it —
-    the record has no fixity, which only a note that says why may excuse."""
+    the record has no fixity, which only a note that says why may excuse.
+
+    covers, for a file that holds several episodes, is the item ids of the episodes it holds in
+    episode order, the holder first — the episode whose folder keeps this source — as the database
+    linked them; empty, as it is by default, for a file of one episode. It is written as given: the
+    record logic does not read it from the name, whose numbering is only what the release claimed."""
     if qh1 is None and not text(note):
         raise ValueError("a source record without the original's fixity needs a note that says why it has none")
+    covers = [str(c) for c in covers or ()]
+    if covers and (len(set(covers)) != len(covers) or not all(UUID_RE.match(c) for c in covers)):
+        raise ValueError(f"a file covers episodes by their item ids, each once: {covers!r}")
     folder = os.path.dirname(library_path.replace("\\", "/"))
     file = {"name": library_original_name(name), "kind": "stream-container", "sizeBytes": size_bytes}
     if mtime:
@@ -888,14 +940,14 @@ def source_record(source_id, name, size_bytes, *, taken_at, taken_by, library_pa
         facts = probed(probe)
         raw = json_bytes(scrub_probe(probe, file["name"]))
         rec.update(container=facts["container"], fidelity=facts["fidelity"], streams=facts["streams"],
-                   sidecars=list(sidecars), covers=[], essence=facts["essence"],
+                   sidecars=list(sidecars), covers=covers, essence=facts["essence"],
                    probe={"tool": "ffprobe", "version": probe_version, "at": taken_at,
                           "file": f"sources/{source_id}/ffprobe.json", "sha256": sha_bytes(raw), "note": text(note)})
     else:
         rec.update(container={"format": "", "durationMs": None, "bitrate": None, "title": None, "muxingApp": None,
                               "writingApp": None, "creationTime": None, "tags": {}},
                    fidelity={"class": "unknown", "fingerprint": None, "evidence": []}, streams=[],
-                   sidecars=list(sidecars), covers=[], essence={},
+                   sidecars=list(sidecars), covers=covers, essence={},
                    probe={"tool": "ffprobe", "version": None, "at": None, "file": None, "sha256": None,
                           "note": text(note) or "ffprobe was not available where this record was written; the "
                                                 "original's streams, fidelity and essence are unknown"})
