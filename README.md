@@ -163,10 +163,14 @@ DVB stay sidecar-only because HLS can't carry them. The source's PGS and
 text tracks are written in one ffmpeg run over it, an output per track,
 so the file is read once however many tracks it has; when that run
 fails, each track is extracted in a run of its own, as before, and a
-track ffmpeg can't extract costs that track only. VobSub and DVB tracks
-keep their own attempts, which fail as ffmpeg sets them up (it has no
-muxer for a VobSub `.idx`/`.sub` pair or a `.dvb` file): such tracks are
-not in the package today, and the failure is logged. The subtitle files
+track ffmpeg can't extract costs that track only. VobSub tracks are
+written by mkvextract as `subs/N.idx` + `subs/N.sub` (FFmpeg has no
+muxer for the pair), all of a title's in one more read of the source, a
+Matroska one only; a track mkvmerge can't match to the probe's stream
+(by its id, codec and language) is not extracted, logged. DVB tracks
+keep their own attempt, which fails as ffmpeg sets it up (it has no
+format for a `.dvb` file): such tracks are not in the package today,
+and the failure is logged. The subtitle files
 next to the source (`subtitleFiles`) follow the source's own tracks:
 each is decoded (by its byte order mark, else as UTF-8, else in the
 legacy code page of its language, e.g. Windows-1251 for Russian, else

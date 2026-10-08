@@ -1928,7 +1928,8 @@ class _Sidecar:
 # default), and FFmpeg has no muxer for a VobSub .idx/.sub pair or a .dvb
 # file. Their extraction fails while ffmpeg sets its outputs up, before
 # it reads the source, so each keeps its own attempt, outside the pass
-# with the others, which it would otherwise fail.
+# with the others, which it would otherwise fail. VobSub is mkvextract's
+# instead (_extract_vobsubs).
 _SETUP_FAILS = frozenset({"dvd_subtitle", "dvb_subtitle", "xsub", "dvb_teletext"})
 
 
@@ -1943,9 +1944,10 @@ def _sidecar(index: int, codec: str) -> _Sidecar:
         return _Sidecar(index, f"{index}.sup", "pgs", ("-c:s", "copy", "-f", "sup"), True)
     if codec == "dvd_subtitle":
         # VobSub — a .sub + .idx pair (.idx is the palette + index, .sub
-        # the bitmap stream), were ffmpeg to write format=vobsub.
-        return _Sidecar(index, f"{index}.idx", "vobsub", ("-c:s", "copy", "-f", "vobsub"),
-                        False)
+        # the bitmap stream). FFmpeg has no muxer for it: mkvextract
+        # writes the pair, for every VobSub track of a Matroska source in
+        # one read of it (_extract_vobsubs).
+        return _Sidecar(index, f"{index}.idx", "vobsub", (), False)
     if codec == "dvb_subtitle":
         # DVB bitmap subs — rare outside broadcast recordings: a raw .dvb
         # file, for the same renderer-on-the-client story as PGS.
@@ -1975,8 +1977,9 @@ def _extract_subtitles(
     When that run fails, each track is extracted alone, as before, so a
     track ffmpeg can't extract costs that track only. A track of a codec
     that fails while ffmpeg sets its outputs up keeps an attempt of its
-    own (_SETUP_FAILS): VobSub and DVB tracks so are never extracted, as
-    ffmpeg can write neither.
+    own (_SETUP_FAILS): DVB tracks so are never extracted, as ffmpeg can't
+    write them. VobSub tracks are mkvextract's, all of them in one more
+    read of the source (_extract_vobsubs), a Matroska one only.
 
     Returns the list of subtitle entries for the manifest. Each
     entry carries `format` so the catalog (and downstream clients)
@@ -1998,8 +2001,11 @@ def _extract_subtitles(
     written = _extract_together(src, subs_dir, together) if len(together) > 1 else None
     if written is None:
         written = {c.index for c in together if _extract_alone(src, subs_dir, c, codecs[c.index])}
+    written |= _extract_vobsubs(src, subs_dir, [c for c in sidecars if c.format == "vobsub"],
+                                probe.subtitles)
     written |= {c.index for c in sidecars
-                if not c.one_pass and _extract_alone(src, subs_dir, c, codecs[c.index])}
+                if not c.one_pass and c.format != "vobsub"
+                and _extract_alone(src, subs_dir, c, codecs[c.index])}
     out: list[dict[str, Any]] = []
     for c, s in zip(sidecars, probe.subtitles, strict=True):
         if c.index not in written:
@@ -2053,6 +2059,79 @@ def _extract_together(src: Path, subs_dir: Path, sidecars: list[_Sidecar]) -> se
     for c in sidecars:
         (subs_dir / c.name).unlink(missing_ok=True)
     return None
+
+
+def _extract_vobsubs(src: Path, subs_dir: Path, cs: list[_Sidecar],
+                     streams: list[dict[str, Any]]) -> set[int]:
+    """Write each VobSub sidecar in `cs` as the .idx + .sub pair its name
+    says, in one mkvextract run: the source is read once for all of them.
+    FFmpeg has no VobSub muxer, and only a Matroska source holds tracks
+    mkvextract takes. A sidecar's track is the one mkvmerge -J gives the
+    id of its stream's index (`streams`, the probe's subtitle streams):
+    both count a Matroska file's tracks in their order, and mkvmerge
+    leaves out one it can't read without counting the rest again. A track
+    it doesn't list, one no VobSub to it, or one of another language than
+    ffprobe says, is not extracted. Returns the indices written; a track
+    not written is logged as an ffmpeg extraction that fails is, and costs
+    that track only."""
+    if not cs:
+        return set()
+
+    def failed(c: _Sidecar, error: str) -> None:
+        log.warning("packager.subs.failed", idx=c.index, codec="dvd_subtitle", error=error[:500])
+
+    if not (shutil.which("mkvmerge") and shutil.which("mkvextract")):
+        for c in cs:
+            failed(c, "mkvextract is not installed")
+        return set()
+    try:
+        ident = json.loads(subprocess.run(["mkvmerge", "-J", str(src)], check=True,
+                                          capture_output=True, text=True).stdout)
+    except (subprocess.CalledProcessError, ValueError) as e:
+        for c in cs:
+            failed(c, f"mkvmerge -J: {e}")
+        return set()
+    container = ident.get("container") or {}
+    if not container.get("recognized") or container.get("type") not in ("Matroska", "WebM"):
+        for c in cs:
+            failed(c, "VobSub is extracted from a Matroska source only, "
+                      f"not {container.get('type')}")
+        return set()
+    tracks = {t["id"]: t for t in ident.get("tracks") or [] if isinstance(t.get("id"), int)}
+    attempted: list[tuple[_Sidecar, list[Path]]] = []
+    specs: list[str] = []
+    for c in cs:
+        stream = streams[c.index].get("index")
+        t = tracks.get(stream) if isinstance(stream, int) else None
+        props = (t or {}).get("properties") or {}
+        language = ((streams[c.index].get("tags") or {}).get("language") or "").lower()
+        if t is None:
+            failed(c, f"mkvmerge lists no track {stream}")
+            continue
+        if props.get("codec_id") != "S_VOBSUB":
+            codec = props.get("codec_id") or t.get("codec")
+            failed(c, f"track {stream} is {codec} to mkvmerge, no VobSub")
+            continue
+        if language and props.get("language") and props["language"].lower() != language:
+            failed(c, f"track {stream} is {props['language']} to mkvmerge, {language} to ffprobe")
+            continue
+        idx = subs_dir / c.name
+        attempted.append((c, [idx, idx.with_suffix(".sub")]))
+        specs.append(f"{stream}:{idx.with_suffix('.sub')}")
+    if not specs:
+        return set()
+    # Exit code 1 is mkvextract's warning: what it wrote is checked below.
+    run = subprocess.run(["mkvextract", str(src), "tracks", *specs],
+                         capture_output=True, text=True)
+    out: set[int] = set()
+    for c, pair in attempted:
+        if all(p.is_file() and p.stat().st_size > 0 for p in pair):
+            out.add(c.index)
+            continue
+        failed(c, f"mkvextract exited {run.returncode}: {(run.stdout + run.stderr).strip()[-300:]}")
+        for p in pair:
+            p.unlink(missing_ok=True)
+    return out
 
 
 def _extract_alone(src: Path, subs_dir: Path, c: _Sidecar, codec: str) -> bool:

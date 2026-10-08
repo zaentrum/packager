@@ -9,12 +9,14 @@ both ways."""
 
 from __future__ import annotations
 
+import json
 import shutil
 import struct
 import subprocess
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
 from packager import packager as pk
 
@@ -87,10 +89,12 @@ def test_every_text_and_pgs_track_is_one_run_over_the_source(
 def test_a_track_ffmpeg_cant_write_keeps_its_own_attempt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    # VobSub (no muxer for .idx/.sub), DVB (no format for .dvb), XSUB and
-    # teletext (bitmaps WebVTT can't be made of) fail as ffmpeg sets its
-    # outputs up: in the one pass they'd fail it for every track.
-    ffmpeg = Ffmpeg(monkeypatch, fails={1, 3, 4, 5})
+    # DVB (no format for .dvb), XSUB and teletext (bitmaps WebVTT can't be
+    # made of) fail as ffmpeg sets its outputs up: in the one pass they'd
+    # fail it for every track. VobSub is no ffmpeg run at all (mkvextract's,
+    # not installed here).
+    monkeypatch.setattr(pk.shutil, "which", lambda _name: None)
+    ffmpeg = Ffmpeg(monkeypatch, fails={3, 4, 5})
     subs = tmp_path / "subs"
     entries = pk._extract_subtitles(
         SRC, _probe("subrip", "dvd_subtitle", "hdmv_pgs_subtitle", "dvb_subtitle", "xsub",
@@ -99,13 +103,121 @@ def test_a_track_ffmpeg_cant_write_keeps_its_own_attempt(
         HEAD + _out(subs, 0, "-c:s", "webvtt", name="0.vtt")
         + _out(subs, 2, "-c:s", "copy", "-f", "sup", name="2.sup"),
         # ... each exactly as the run it always had.
-        HEAD + _out(subs, 1, "-c:s", "copy", "-f", "vobsub", name="1.idx"),
         HEAD + _out(subs, 3, "-c:s", "copy", name="3.dvb"),
         HEAD + _out(subs, 4, "-c:s", "webvtt", name="4.vtt"),
         HEAD + _out(subs, 5, "-c:s", "webvtt", name="5.vtt"),
     ]
     assert [(e["id"], e["path"], e["format"]) for e in entries] == [
         ("sub0", "subs/0.vtt", "webvtt"), ("sub2", "subs/2.sup", "pgs")]
+
+
+# ------------------------------------------------------------- VobSub
+
+def _ident(*codec_ids: str, container: str = "Matroska") -> dict:
+    """mkvmerge -J of a source with a video track and these subtitle tracks."""
+    tracks = [{"id": 0, "type": "video", "codec": "HEVC/H.265/MPEG-H",
+               "properties": {"codec_id": "V_MPEGH/ISO/HEVC"}}]
+    tracks += [{"id": 1 + i, "type": "subtitles", "codec": c.split("/")[-1],
+                "properties": {"codec_id": c}} for i, c in enumerate(codec_ids)]
+    return {"container": {"recognized": True, "type": container}, "tracks": tracks}
+
+
+class Mkvtoolnix:
+    """Stand-in for subprocess.run and shutil.which with mkvtoolnix on PATH
+    (none when not `installed`): mkvmerge -J answers `ident`; mkvextract
+    writes the .idx/.sub pair of every track it is asked for but those whose
+    sidecar index is in `missing`, and exits `code`."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, ident: dict, *, missing=(), code=0,
+                 installed: bool = True) -> None:
+        self.ident, self.missing, self.code = ident, set(missing), code
+        self.runs: list[list[str]] = []
+        monkeypatch.setattr(pk.shutil, "which",
+                            lambda name: f"/usr/bin/{name}" if installed else None)
+        monkeypatch.setattr(pk.subprocess, "run", self)
+
+    def __call__(self, args: list[str], **kw):
+        self.runs.append(args)
+        if args[0] == "mkvmerge":
+            return subprocess.CompletedProcess(args, 0, json.dumps(self.ident), "")
+        assert args[0] == "mkvextract", args
+        for spec in args[3:]:
+            dest = Path(spec.split(":", 1)[1])
+            if int(dest.stem) not in self.missing:
+                dest.write_bytes(b"\x00\x00\x01\xba")
+                dest.with_suffix(".idx").write_text(
+                    "# VobSub index file, v7 (do not modify this line!)\n")
+        return subprocess.CompletedProcess(args, self.code, "", "warning" if self.code else "")
+
+
+def test_vobsub_tracks_are_one_mkvextract_run_over_the_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # The sidecars' indices are the tracks' places among the subtitle
+    # tracks; mkvextract takes Matroska track ids (here one more, after
+    # the video).
+    tools = Mkvtoolnix(monkeypatch, _ident("S_VOBSUB", "S_VOBSUB", "S_VOBSUB"))
+    subs = tmp_path / "subs"
+    entries = pk._extract_subtitles(
+        SRC, _probe("dvd_subtitle", "dvd_subtitle", "dvd_subtitle"), subs)
+    assert tools.runs == [
+        ["mkvmerge", "-J", str(SRC)],
+        ["mkvextract", str(SRC), "tracks",
+         f"1:{subs / '0.sub'}", f"2:{subs / '1.sub'}", f"3:{subs / '2.sub'}"],
+    ]
+    assert [(e["id"], e["path"], e["format"], e["forced"]) for e in entries] == [
+        ("sub0", "subs/0.idx", "vobsub", False), ("sub1", "subs/1.idx", "vobsub", True),
+        ("sub2", "subs/2.idx", "vobsub", False)]
+    assert sorted(p.name for p in subs.iterdir()) == [
+        "0.idx", "0.sub", "1.idx", "1.sub", "2.idx", "2.sub"]
+
+
+@pytest.mark.parametrize(("ident", "said"), [
+    (_ident("S_VOBSUB", container="MPEG transport stream"),
+     "VobSub is extracted from a Matroska source only, not MPEG transport stream"),
+    ({"container": {"recognized": True, "type": "Matroska"}, "tracks": []},
+     "mkvmerge lists no track 1"),
+    (_ident("S_HDMV/PGS"), "track 1 is S_HDMV/PGS to mkvmerge, no VobSub"),
+    ({**_ident(), "tracks": [*_ident()["tracks"], {"id": 1, "type": "subtitles", "codec": "VobSub",
+                                                   "properties": {"codec_id": "S_VOBSUB",
+                                                                  "language": "ger"}}]},
+     "track 1 is ger to mkvmerge, eng to ffprobe"),
+])
+def test_a_vobsub_track_mkvextract_cant_be_matched_to_is_not_extracted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ident: dict, said: str,
+) -> None:
+    tools = Mkvtoolnix(monkeypatch, ident)
+    subs = tmp_path / "subs"
+    with capture_logs() as logs:
+        entries = pk._extract_subtitles(SRC, _probe("dvd_subtitle"), subs)
+    assert entries == []
+    assert tools.runs == [["mkvmerge", "-J", str(SRC)]]
+    assert [(e["event"], e["idx"], e["error"]) for e in logs
+            if e["event"] == "packager.subs.failed"] == [("packager.subs.failed", 0, said)]
+
+
+def test_a_vobsub_track_mkvextract_did_not_write_costs_that_track_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    tools = Mkvtoolnix(monkeypatch, _ident("S_VOBSUB", "S_VOBSUB"), missing={1}, code=1)
+    subs = tmp_path / "subs"
+    with capture_logs() as logs:
+        entries = pk._extract_subtitles(SRC, _probe("dvd_subtitle", "dvd_subtitle"), subs)
+    assert len(tools.runs) == 2
+    assert [(e["id"], e["path"]) for e in entries] == [("sub0", "subs/0.idx")]
+    assert sorted(p.name for p in subs.iterdir()) == ["0.idx", "0.sub"]
+    assert [e["idx"] for e in logs if e["event"] == "packager.subs.failed"] == [1]
+
+
+def test_without_mkvtoolnix_a_vobsub_track_is_said_to_be_lost(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    tools = Mkvtoolnix(monkeypatch, _ident("S_VOBSUB"), installed=False)
+    with capture_logs() as logs:
+        assert pk._extract_subtitles(SRC, _probe("dvd_subtitle"), tmp_path / "subs") == []
+    assert tools.runs == []
+    assert [e["error"] for e in logs if e["event"] == "packager.subs.failed"] == [
+        "mkvextract is not installed"]
 
 
 def test_a_one_pass_that_fails_extracts_every_track_alone(
@@ -257,16 +369,18 @@ def test_one_pass_writes_what_a_run_per_track_wrote(
         return real(args, **kw)
 
     monkeypatch.setattr(pk.subprocess, "run", run)
+    # VobSub is mkvextract's (test_mkvextract_writes_the_vobsub_pair).
+    monkeypatch.setattr(pk.shutil, "which", lambda _name: None)
     one = pk._extract_subtitles(tracks, probe, tmp_path / "one")
-    # The source is read once for its PGS and text tracks; VobSub and DVB
-    # keep their attempts, which fail as ffmpeg sets them up, as always.
-    assert runs == [4, 1, 1]
+    # The source is read once for its PGS and text tracks; DVB keeps its
+    # attempt, which fails as ffmpeg sets it up, as always.
+    assert runs == [4, 1]
 
     # As before the one pass: every track in a run of its own.
     monkeypatch.setattr(pk, "_extract_together", lambda *_a: None)
     runs.clear()
     alone = pk._extract_subtitles(tracks, probe, tmp_path / "alone")
-    assert runs == [1] * 6
+    assert runs == [1] * 5
     assert one == alone
     assert [(e["path"], e["format"], e["forced"]) for e in one] == [
         ("subs/0.vtt", "webvtt", False), ("subs/1.vtt", "webvtt", False),
@@ -276,3 +390,23 @@ def test_one_pass_writes_what_a_run_per_track_wrote(
     files = _files(tmp_path / "one")
     assert b"Hello." in files["0.vtt"] and b"Welt" in files["1.vtt"]
     assert files["2.sup"].startswith(b"PG") and files["2.sup"].count(b"PG") >= 8
+
+
+needs_mkvtoolnix = pytest.mark.skipif(
+    shutil.which("mkvmerge") is None or shutil.which("mkvextract") is None,
+    reason="needs mkvmerge and mkvextract on PATH")
+
+
+@needs_ffmpeg
+@needs_mkvtoolnix
+def test_mkvextract_writes_the_vobsub_pair(tmp_path: Path, tracks: Path) -> None:
+    probe = pk._ffprobe(tracks)
+    entries = pk._extract_subtitles(tracks, probe, tmp_path / "subs")
+    assert [(e["id"], e["path"], e["format"], e["language"]) for e in entries
+            if e["format"] == "vobsub"] == [("sub3", "subs/3.idx", "vobsub", "fre")]
+    idx = (tmp_path / "subs" / "3.idx").read_text()
+    assert idx.startswith("# VobSub index file") and "timestamp: " in idx
+    # .sub is an MPEG program stream: a pack header first
+    assert (tmp_path / "subs" / "3.sub").read_bytes()[:4] == b"\x00\x00\x01\xba"
+    assert sorted(p.name for p in (tmp_path / "subs").iterdir()) == [
+        "0.vtt", "1.vtt", "2.sup", "3.idx", "3.sub", "5.vtt"]

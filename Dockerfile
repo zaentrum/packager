@@ -17,13 +17,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 # ffmpeg / ffprobe: source-side transmux + per-stream probe + trickplay
-# sprite generation. curl + ca-certificates: fetch the shaka-packager
-# binary at build time and validate TLS to katalog at runtime.
+# sprite generation. mkvtoolnix (mkvmerge, mkvextract): a VobSub track's
+# .idx + .sub sidecar, which FFmpeg has no muxer for. curl +
+# ca-certificates: fetch the shaka-packager binary at build time and
+# validate TLS to katalog at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg \
+      mkvtoolnix \
       ca-certificates \
       curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && mkvextract --version
 
 # shaka-packager: Google's CMAF/HLS/DASH packager. Pinned to the same
 # version used historically by the analyzer pod so package layout
