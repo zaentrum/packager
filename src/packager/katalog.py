@@ -10,7 +10,8 @@ polls a claim endpoint; the itemId arrives on the
     statuses for the idempotency guard (skip work if package has
     already finished).
   * `PUT  /api/analyze/items/{id}/steps/package` — flip the step to
-    in_progress / done / failed as the worker progresses.
+    in_progress / done / failed as the worker progresses
+    (`steps/takein` for a takein job of the library v2 layout).
   * `POST /api/items/{id}/packaging-complete` — mirror the on-disk
     manifest into the catalog DB after a successful package, with a
     `source` block (codec, width, height, durationMs, bitRate) the
@@ -63,14 +64,30 @@ TOKEN_REFRESH_LEAD_SECONDS = 30
 # A worker record carries a `library` block when the catalog's setting
 # library.layout is v2 (contract platform-library/1): the folders of the
 # title's record in the library tree, which the packager writes into
-# (library.py), and the version it builds. Without the block the packager
-# works as it always has, into the package store. Every path in it is the
+# (library.py), and the version it builds, how (its mode) and under which
+# name its original goes into it. Without the block the packager works as
+# it always has, into the package store. Every path and name in it is the
 # catalog's: the packager never works one out itself.
 
 LIBRARY_CONTRACT = 1
 
+# What a run of a version does (library.build.mode), as the catalog decides
+# it: `establish` builds a source's first version, its package and its
+# original; `takein` a version that keeps its original and has no package;
+# `add` builds the package of a version that holds only its original;
+# `repackage` a new version of a source whose version has a package, with
+# no original. A record without a mode is a run as before the catalog knew
+# them, which builds as `repackage` does.
+ESTABLISH, TAKEIN, ADD, REPACKAGE = "establish", "takein", "add", "repackage"
+BUILD_MODES = (ESTABLISH, TAKEIN, ADD, REPACKAGE)
+# The modes that rename the original into the version folder they build.
+MOVES_ORIGINAL = frozenset({ESTABLISH, TAKEIN})
+
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _QH1 = re.compile(r"sha256:[0-9a-f]{64}")
+# The name an original gets in its version folder: original.<ext>, or
+# original-<n>.<ext> for a part of a version split into several.
+_ORIGINAL_NAME = re.compile(r"original(-[1-9][0-9]*)?\.[a-z0-9]{1,8}")
 
 
 class LibraryRecordError(ValueError):
@@ -96,7 +113,9 @@ class LibrarySource:
 @dataclass(frozen=True)
 class LibraryBuild:
     """library.build: the version this run builds. Its id stays the same
-    across retries until a package for it is recorded complete."""
+    across retries until a package for it is recorded complete. For an
+    `add`, the version folder is the one there already, which holds the
+    original."""
     version_id: str
     staging_dir: str          # <workRoot>/staging/<versionId>
     version_dir: str          # <itemDir>/versions/<versionId>
@@ -104,6 +123,11 @@ class LibraryBuild:
     chapters: list[dict[str, Any]]
     chapters_from: str | None
     segments: list[dict[str, Any]]
+    # One of BUILD_MODES; None in a record from before the catalog named one.
+    mode: str | None = None
+    # The name the original gets in the version folder (original.mkv), for
+    # a mode that renames it there (MOVES_ORIGINAL); None for the others.
+    original_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -208,6 +232,23 @@ def _marks(value: Any, where: str) -> list[dict[str, Any]]:
     return [m for m in value if isinstance(m, dict)]
 
 
+def _mode(value: Any) -> str | None:
+    if value is None or value in BUILD_MODES:
+        return value
+    raise LibraryRecordError(f"worker record: library.build.mode is not one of "
+                             f"{', '.join(BUILD_MODES)}: {value!r}")
+
+
+def _original_name(value: Any) -> str:
+    """The name the catalog gives the original in its version folder,
+    checked, never made up: the packager renames the original to it."""
+    if not isinstance(value, str) or not _ORIGINAL_NAME.fullmatch(value):
+        raise LibraryRecordError(f"worker record: library.build.originalName is not the name "
+                                 f"of an original in its version folder (original.<ext>): "
+                                 f"{value!r}")
+    return value
+
+
 def parse_item_library(raw: Any) -> ItemLibrary:
     """An item record's library block. Raises LibraryRecordError when it
     can't be worked from — and with the catalog's own words when it says
@@ -236,6 +277,7 @@ def parse_item_library(raw: Any) -> ItemLibrary:
         "library.source.recordDir")
     b = _block(lib.get("build"), "library.build")
     chapters_from = b.get("chaptersFrom")
+    mode = _mode(b.get("mode"))
     build = LibraryBuild(
         version_id=_uuid(b, "versionId", "library.build"),
         staging_dir=_abs_path(b, "stagingDir", "library.build"),
@@ -244,6 +286,8 @@ def parse_item_library(raw: Any) -> ItemLibrary:
         chapters=_marks(b.get("chapters"), "library.build.chapters"),
         chapters_from=chapters_from if isinstance(chapters_from, str) else None,
         segments=_marks(b.get("segments"), "library.build.segments"),
+        mode=mode,
+        original_name=_original_name(b.get("originalName")) if mode in MOVES_ORIGINAL else None,
     )
     _in(build.version_dir, os.path.join(item_dir, "versions"), build.version_id,
         "library.build.versionDir")
@@ -533,8 +577,10 @@ class KatalogClient:
         *,
         error: str | None = None,
         details: str | None = None,
+        step: str = "package",
     ) -> None:
-        """Move the package step to `status`. Best-effort; failures
+        """Move the package step — or `step`, the takein step of a takein
+        job — to `status`. Best-effort; failures
         are logged and swallowed so a flaky bookkeeping call doesn't
         crash an otherwise-successful packaging job. The endpoint is
         idempotent via ON CONFLICT (item_id, step)."""
@@ -546,13 +592,14 @@ class KatalogClient:
         try:
             resp = self._request(
                 "PUT",
-                f"/api/analyze/items/{item_id}/steps/package",
+                f"/api/analyze/items/{item_id}/steps/{step}",
                 json=body,
             )
             if resp.status_code >= 400:
                 log.warning(
                     "package.step.upsert_failed",
                     item_id=item_id,
+                    step=step,
                     status=status,
                     http=resp.status_code,
                     body=resp.text[:300],
@@ -561,6 +608,7 @@ class KatalogClient:
             log.warning(
                 "package.step.upsert_exception",
                 item_id=item_id,
+                step=step,
                 status=status,
                 error=str(e)[:200],
             )

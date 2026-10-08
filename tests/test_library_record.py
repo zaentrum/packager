@@ -139,6 +139,48 @@ def test_a_library_block_that_cant_be_worked_from(change: dict, says: str) -> No
     assert item.library_error is not None and says in item.library_error
 
 
+def test_a_build_without_a_mode_is_one_from_before_the_modes() -> None:
+    lib = parse_item_library(item_library())
+    assert (lib.build.mode, lib.build.original_name) == (None, None)
+
+
+@pytest.mark.parametrize(("mode", "name"), [
+    ("establish", "original.mkv"), ("takein", "original.mkv"), ("takein", "original-2.m2ts"),
+    ("add", None), ("repackage", None)])
+def test_a_builds_mode_and_its_originals_name(mode: str, name: str | None) -> None:
+    lib = parse_item_library(item_library(
+        build={**item_library()["build"], "mode": mode, "originalName": name}))
+    assert (lib.build.mode, lib.build.original_name) == (mode, name)
+
+
+@pytest.mark.parametrize("mode", ["add", "repackage"])
+def test_a_mode_that_moves_no_original_takes_no_name_for_it(mode: str) -> None:
+    # The original stays where it is: a name sent all the same is not used.
+    lib = parse_item_library(item_library(
+        build={**item_library()["build"], "mode": mode, "originalName": "original.mkv"}))
+    assert (lib.build.mode, lib.build.original_name) == (mode, None)
+
+
+@pytest.mark.parametrize(("change", "says"), [
+    ({"mode": "move"}, "library.build.mode is not one of establish, takein, add, repackage: "
+                       "'move'"),
+    ({"mode": "Establish"}, "library.build.mode is not one of"),
+    ({"mode": "establish"}, "library.build.originalName is not the name of an original in its "
+                            "version folder (original.<ext>): None"),
+    ({"mode": "takein", "originalName": "Sintel (2010).mkv"}, "library.build.originalName"),
+    ({"mode": "establish", "originalName": "original.MKV"}, "library.build.originalName"),
+    ({"mode": "establish", "originalName": "../original.mkv"}, "library.build.originalName"),
+    ({"mode": "establish", "originalName": "original-0.mkv"}, "library.build.originalName"),
+    ({"mode": "establish", "originalName": "original"}, "library.build.originalName"),
+    ({"mode": "takein", "originalName": "version.json"}, "library.build.originalName"),
+])
+def test_a_mode_or_an_originals_name_that_cant_be_worked_from(change: dict, says: str) -> None:
+    item = ClaimedItem.from_json(item_record(library=item_library(
+        build={**item_library()["build"], **change})))
+    assert item.library is None
+    assert item.library_error is not None and says in item.library_error
+
+
 @pytest.mark.parametrize(("part", "change", "says"), [
     ("source", {"sourceId": SOURCE.upper()}, "library.source.sourceId is not a lower-case UUID"),
     ("source", {"recordDir": f"{ITEM_DIR}/sources/other"}, "library.source.recordDir"),
@@ -248,6 +290,24 @@ def test_a_handover_the_catalog_refuses(respond, status: int, says: str) -> None
     got = _client(respond).packaging_complete_v2(ITEM, {})
     assert (got.taken, got.status) == (False, status)
     assert got.error is not None and got.error.startswith(says)
+
+
+@pytest.mark.parametrize(("step", "path"), [
+    (None, f"/api/analyze/items/{ITEM}/steps/package"),
+    ("takein", f"/api/analyze/items/{ITEM}/steps/takein")])
+def test_a_step_is_written_to_its_own_path(step: str | None, path: str) -> None:
+    sent: list[tuple[str, str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={})
+
+    client = _client(handler)
+    if step is None:
+        client.upsert_step(ITEM, "done", details="v=hvc1")
+    else:
+        client.upsert_step(ITEM, "done", details="v=hvc1", step=step)
+    assert sent == [("PUT", path, {"status": "done", "details": "v=hvc1"})]
 
 
 def test_a_handover_without_an_answer() -> None:
