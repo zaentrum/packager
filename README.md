@@ -122,6 +122,12 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   "(forced)". NAMEs are unique within a group: a second "English" is
   "English (2)".
 
+**Metadata.** A package carries none of the original's global metadata:
+the remuxes shaka-packager packages from leave out the container's title,
+its other tags and its chapters (a library v2 version keeps its chapters
+in `version.json`). The streams' own metadata, their languages, still
+names the renditions.
+
 **Languages.** Every track is packaged. One in a language outside the
 `packager.language_whitelist` setting is marked `visible: false` in the
 manifest, so the clients leave it out of their menus; when that would
@@ -361,18 +367,36 @@ fails the step with those words.
 
 ```
 <itemDir>/sources/<sourceId>/    source.json  ffprobe.json  <sidecar copies>  checksums.sha256
-<itemDir>/versions/<versionId>/  version.json  hls/  subs/  trickplay/
+<itemDir>/versions/<versionId>/  version.json  original.<ext>  hls/  subs/  trickplay/
                                  checksums.sha256  package.json  .complete
 <itemDir>/extras/<extraId>/      extra.json  hls/  subs/  checksums.sha256  package.json  .complete
-<workRoot>/staging/<versionId>/       .packaging  source/  version/      a run, until its handover
+<workRoot>/staging/<versionId>/       .packaging  .original  source/  version/   a run, until its handover
 <workRoot>/staging/extra-<extraId>/   .packaging  extra/
 ```
+
+A version folder is the one place its media lives: its original, the
+package made from it, or both. What a run writes there is the record's
+`build.mode`, which the catalog decides:
+
+| mode | when | the version folder |
+| --- | --- | --- |
+| `establish` | a source's first version, the pipeline's | `version.json`, the package and its chain, the original renamed in as `build.originalName` (`original.mkv`) |
+| `takein` | a title that gets no package now (a takein job, below) | `version.json` and the original: no package, and so no chain |
+| `add` | a version that holds only its original gets its package | the version folder there already (`build.versionDir`): the package and its chain added |
+| `repackage` | a title whose version has a package | a new version folder, `version.json` (no original) with the package and its chain; the original stays where it is |
+
+A record without a mode is a run from before the catalog named them,
+built as a `repackage` is. The packager reads the original where the
+record's `path` says — its arrival before its version is established, the
+version folder's `original.<ext>` after — and names it by the record's
+`build.originalName`: it never makes up a path or a name.
 
 Each folder is written once, built in staging and renamed into place in
 one step, so a reader sees all of it or nothing. A run:
 
 1. removes what an earlier run of the version left in its staging folder
-   and writes the sentinel `.packaging` (`{startedAt, pid, host}`);
+   (an original in it goes back to its arrival first, below) and writes
+   the sentinel `.packaging` (`{startedAt, pid, host}`);
 2. builds the package in `version/`, as above (`hls/`, `subs/`,
    `trickplay/`);
 3. unless the source is recorded already, builds `source/`: the
@@ -382,32 +406,73 @@ one step, so a reader sees all of it or nothing. A run:
    … before its extension), `source.json`, and `checksums.sha256` last;
 4. writes `version.json`: the catalog's chapters (else the original's
    own) and detected ranges, the edition the file name claims, the
-   presentation and runtime the probe says, no original kept;
+   presentation and runtime the probe says, and the original it keeps
+   (`originalFiles`), for an establish or a takein;
 5. closes the chain: `checksums.sha256` over `version.json` and every
-   package file, `package.json` with the checksums file's hash, then
+   package file — never the original, whose fixity is its source
+   record's — `package.json` with the checksums file's hash, then
    `.complete` with `sha256:<hex of package.json>`; then checks that the
    package is whole (as above) and that the chain holds;
 6. renames `source/` into `sources/<sourceId>/` (one there with its
-   checksums stays as it is; one there without them fails the run), then
+   checksums stays as it is; one there without them fails the run), then,
+   for an establish or a takein, the original into `version/`, last, then
    `version/` into `versions/<versionId>/`;
 7. hands the version to the catalog (`POST /api/items/{id}/packaging-complete`
    with `layout: v2`: the version and package ids, `versionDir`, the
    `.complete` value, `package.json` as written, the source id, the
    sidecars — each subtitle file's catalog id mapped to the rendition made
-   from it — and the source block). Only a 2xx makes the step `done`;
-   then the staging folder and the handoff go. A refusal (409: a stale
-   version; 422: a broken chain) fails the step and leaves the version
-   where it is.
+   from it — the source block, and `original: {path, name}` when the run
+   renamed the original into the version folder, for the catalog to move
+   the item's path there as it records the version). Only a 2xx makes the
+   step `done`; then the staging folder and the handoff go. A refusal
+   (409: a stale version; 422: a broken chain) fails the step and leaves
+   the version where it is.
+
+A **takein** writes steps 1, 3, 4 and 6 only, and hands over the version
+with `takenIn: true` and no package (no `packageId`, `complete` or
+`package`). An **add** reads the version folder's `version.json` and
+never writes it again: it builds the package in `version/` beside a copy
+of it, closes the chain over the two, then renames `hls/`, `subs/` and
+`trickplay/` into the version folder, then `checksums.sha256`,
+`package.json` and `.complete`, in that order, and checks the chain there;
+a rename that fails moves back what it moved. The version folder must be
+the one that keeps the original the record names, and hold nothing else.
+
+**The original** is renamed, never copied: from its arrival into the
+staged version folder as the last step before that folder is renamed into
+the record, so the record gets the version and its original in one step.
+The arrivals must be on the library's share, where the packager may
+rename. Before the rename the run notes where the original came from
+(`.original`, in the staging folder); a run that fails after it puts the
+original back there, and so do the next run of the version and the
+startup sweep for a run that died. A staging folder that still holds an
+original — one that can't be put back, as its arrival path is taken —
+is never removed: the run fails, and the folder stays for an operator. A
+package is `derived` when its version folder keeps the original beside it
+(an establish, an add) and `canonical` when it is the only copy (a
+repackage, an extra).
 
 A run that fails removes its staging folder; one that dies leaves it, and
 the next run of the version starts clean. A run that died between the two
 renames finds the source in place and builds only the version. A version
 folder already in place and whole is the work of a run whose handover was
 lost: the next run hands it over again as it is, without building
-anything. Nothing in the record is ever written over: a version or extra
-folder that is there but not whole fails the run. The original must be
-the file the catalog recorded at its arrival (its size and `qh1`), else
-the run fails.
+anything — with the original's new place, for an establish or a takein,
+though the record still names its arrival. An add that died between its
+renames is completed from what it left in staging, when that is the rest
+of its package and the chain then holds. Nothing in the record is ever
+written over: a version or extra folder that is there but not whole fails
+the run. The original must be the file the catalog recorded at its arrival
+(its size and `qh1`), else the run fails.
+
+**Takein jobs** come on the item topic too, the envelope's `step`
+`"takein"`, for a title the catalog takes in without a package: its
+transcode refused, its transcode or package out of attempts, an admin's
+word. Their step is `takein` (`PUT /api/analyze/items/{id}/steps/takein`),
+and so is their guard: a finished takein is only acked. A takein has no
+transcode, so no takein job is a stale handover. A package job whose
+record says `takein`, and a takein job whose record says another mode, are
+only acked: the catalog sends the job its record names.
 
 **The records' contents** are the schemas repository's record logic,
 `src/packager/libv2_records.py`, vendored byte for byte (the migration
@@ -417,10 +482,8 @@ packager's own records against the golden ones of the same commit. To take
 a new copy, copy `tools/libv2_records.py` and `tools/testdata/libv2_records/`
 from the schemas repository at one commit and update the test's values.
 The packager adds what only it knows: which stream of the original each
-rendition was made from. Every package is `canonical`: no original is
-kept beside it, and the catalog deletes the original once the package is
-recorded. A subtitle made from a file next to the original names its copy
-(`fromSidecar: "sources/<sourceId>/<name>"`). No subtitle is `default` in
+rendition was made from. A subtitle made from a file next to the original
+names its copy (`fromSidecar: "sources/<sourceId>/<name>"`). No subtitle is `default` in
 `package.json`, as no subtitle is DEFAULT=YES in the master: the record
 forbids a forced track flagged default, which `manifest.json` uses to say
 "show it by itself".
@@ -433,7 +496,10 @@ a lower rung in another is left out.
 it left in the package store's `_inbox/<itemId>/` (`_inbox/extra-<extraId>/`)
 for a transcode that finished before the layout switched; else the
 original — but never while the item's transcode step says `done`: its
-handoff is gone, and the run fails.
+handoff is gone, and the run fails. The subtitle files the record names
+are taken beside the original or in its source record's folder, which
+keeps a copy of each that came with it: where they are once the original
+is in a version folder.
 
 **Extras** go into their title's `extras/<extraId>/` the same way, built
 in `extra/` of their staging folder: `extra.json` (what the catalog took
@@ -444,7 +510,9 @@ handover is `POST /api/extras/{id}/packaging-complete` with `layout: v2`.
 
 **Startup sweep.** Besides the package store, the sweep at startup walks
 `<WORK_ROOT>/staging/` only — never the library — and removes the entries
-of runs that started more than a day ago.
+of runs that started more than a day ago, once the original such a run
+left in one is back at its arrival; one that still holds an original
+stays.
 
 ## Layout
 
@@ -498,7 +566,8 @@ repository's `validate-library-v2.py --check-checksums` when a checkout
 of it is beside this one (or `ZAENTRUM_SCHEMAS` names one) whose schemas
 know the platform's additive package and extra fields, and a Python with
 `jsonschema` and `referencing` can run it (this one, or
-`LIBRARY_V2_PYTHON`).
+`LIBRARY_V2_PYTHON`). `tests/test_library_modes_real.py` runs each build
+mode on such a clip, a takein with `ffmpeg` and `ffprobe` alone.
 
 ## Build the container
 
