@@ -145,7 +145,10 @@ def test_retry_of_a_finished_package_is_only_acked(
 
 
 @pytest.mark.parametrize("steps", [{}, {"package": "pending"}, {"package": "failed"},
-                                   {"package": "in_progress"}])
+                                   {"package": "in_progress"},
+                                   {"transcode": "done", "package": "pending"},
+                                   {"transcode": "not_applicable", "package": "pending"},
+                                   {"transcode": "skipped", "package": "failed"}])
 @pytest.mark.parametrize("make", [event, retry])
 def test_unfinished_package_is_packaged(
     monkeypatch: pytest.MonkeyPatch, steps: dict[str, str], make,
@@ -153,6 +156,53 @@ def test_unfinished_package_is_packaged(
     broker, _catalog, packaged = run(monkeypatch, [make()], steps)
     assert packaged == [ITEM]
     assert broker.committed == [0]
+
+
+@pytest.mark.parametrize("transcode", ["pending", "in_progress", "failed"])
+@pytest.mark.parametrize("make", [event, retry])
+def test_a_handover_sent_before_its_transcode_was_reset_is_only_acked(
+    monkeypatch: pytest.MonkeyPatch, transcode: str, make,
+) -> None:
+    # A pause left the transcoder's handover unconsumed, and a re-encode
+    # reset both steps since: packaging it now would package the old
+    # handoff and finish the package step, so the new encode's handover
+    # would find it done. It packages nothing and writes nothing.
+    with capture_logs() as logs:
+        broker, catalog, packaged = run(
+            monkeypatch, [make()], {"transcode": transcode, "package": "pending"})
+    assert packaged == []
+    assert catalog.writes == []
+    assert broker.committed == [0]
+    said = [e for e in logs if e.get("item_id") == ITEM]
+    assert [(e["event"], e["transcode"]) for e in said] == [
+        ("packager.item.stale_handover", transcode)]
+
+
+def test_the_handover_of_the_run_that_finished_the_transcode_is_packaged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The stale handover first, while the re-encode runs; then the new
+    # run's own, once its transcode is done: only that one packages.
+    stop = threading.Event()
+    broker = Broker([event(), event(eventId="e2")], stop)
+    catalog = Catalog({"transcode": "in_progress", "package": "pending"})
+    packaged: list[str] = []
+
+    def poll(_timeout: float) -> Message | None:
+        if broker.committed == [0]:
+            catalog.steps["transcode"] = "done"
+        return Broker.poll(broker, _timeout)
+
+    broker.poll = poll  # type: ignore[method-assign]
+    monkeypatch.setattr(worker, "build_consumer", lambda **_kw: broker)
+    monkeypatch.setattr(worker, "_process_one",
+                        lambda item, _client, _options=None: packaged.append(item.id))
+    client = KatalogClient(BASE, f"{BASE}/token", "worker", "not-a-secret")
+    client._http = httpx.Client(transport=httpx.MockTransport(catalog))
+    worker.run_worker(client, "broker.test:9092", "packager-workers",
+                      "stube.catalog.item.transcoded", "PLAINTEXT", 0.0, stop)
+    assert packaged == [ITEM]
+    assert broker.committed == [0, 1]
 
 
 def test_consumer_keeps_its_partition_through_a_long_package(

@@ -10,7 +10,9 @@ Lifecycle contract (mirrors the analyzer + transcoder consumers):
   * Per message: parse envelope → itemId → get_item detail →
     idempotency guard on the `package` step (finished: done,
     not_applicable or skipped — nothing to do, also for a retry the
-    catalog sent before the step finished) → run the EXISTING packaging
+    catalog sent before the step finished) → a handover whose transcode
+    is not finished is stale (sent before a re-encode reset the step; the
+    run now waiting sends its own) and only acked → run the EXISTING packaging
     body (unchanged) with all its katalog HTTP writes → commit the
     offset. The offset is committed ONLY after the item is fully
     processed (or definitively failed), so a crash mid-work reprocesses
@@ -378,7 +380,8 @@ def _handle_message(
     #    the trigger again for a failed or silent step) finds its step
     #    finished when the run the reaper took for dead reported done
     #    after all: one log line, nothing else.
-    status = client.get_steps(item_id).get(PACKAGE_STEP)
+    steps = client.get_steps(item_id)
+    status = steps.get(PACKAGE_STEP)
     if status in FINISHED_STATUSES:
         if retry:
             log.info("packager.retry.already_finished", item_id=item_id, status=status)
@@ -386,7 +389,20 @@ def _handle_message(
             log.info("packager.item.already_done", item_id=item_id, status=status)
         return
 
-    # 3. Run the packaging body with all its katalog HTTP writes
+    # 3. A stale handover: the transcoder writes its step's end before it
+    #    sends `transcoded`, so an event whose transcode is not finished
+    #    was sent before that step was reset — a re-encode, or package
+    #    now, after a pause left the event unconsumed. Packaging it would
+    #    package the old handoff (or the original) and finish the package
+    #    step, and the handover of the run now waiting would find it done:
+    #    the new encode would never be packaged. That run sends its own.
+    transcode = steps.get(TRANSCODE_STEP)
+    if transcode is not None and transcode not in FINISHED_STATUSES:
+        log.info("packager.item.stale_handover", item_id=item_id,
+                 transcode=transcode, retry=retry)
+        return
+
+    # 4. Run the packaging body with all its katalog HTTP writes
     #    (upsert_step, packaging_complete).
     _process_one(item, client, options)
 
