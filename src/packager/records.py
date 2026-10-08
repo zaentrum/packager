@@ -62,12 +62,15 @@ def source_record(
     under, and where it sat among the arrivals, for what they claim (its
     labels, its numbering) and keeps neither: it names the file as the
     library does (file.name, original.<ext>), and the probe it returns for
-    ffprobe.json names it so too, with no container title."""
+    ffprobe.json names it so too, with no container title. A file that
+    holds several episodes covers them as the worker record lists them,
+    this item, their holder, first."""
     doc, probe_bytes = rec.source_record(
         lib.source.source_id, original.name, original.stat().st_size, taken_at=now,
         taken_by="packager", library_path=lib.source.library_path or original.name,
         qh1=fixity_qh1, mtime=rec.ts_of_mtime(str(original)),
-        probe=probe.raw, probe_version=probe.version, sidecars=sidecars)
+        probe=probe.raw, probe_version=probe.version, sidecars=sidecars,
+        covers=list(lib.source.covers))
     return doc, probe_bytes
 
 

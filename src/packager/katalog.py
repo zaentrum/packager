@@ -107,6 +107,10 @@ class LibrarySource:
     library_path: str         # relative to the arrivals root
     size_bytes: int | None
     qh1: str | None
+    # For a file that holds several episodes, the item ids of those it
+    # holds, in episode order, this item — their holder — first, as the
+    # catalog linked them; empty for a file of one episode.
+    covers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -250,10 +254,36 @@ def _original_name(value: Any) -> str:
     return value
 
 
-def parse_item_library(raw: Any) -> ItemLibrary:
-    """An item record's library block. Raises LibraryRecordError when it
-    can't be worked from — and with the catalog's own words when it says
-    the item can't be recorded yet (`blocked`)."""
+def _covers(value: Any, item_id: str, item_type: str | None) -> tuple[str, ...]:
+    """library.source.covers: the episodes a file of several holds, by
+    their item ids — lower-case UUIDs, each once, the item's own first, as
+    its holder; only an episode's file covers any. None or none at all
+    for a file of one episode."""
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise LibraryRecordError(f"worker record: library.source.covers is not a list: {value!r}")
+    bad = [c for c in value if not isinstance(c, str) or not _UUID.fullmatch(c)]
+    if bad:
+        raise LibraryRecordError(f"worker record: library.source.covers names {bad[0]!r}, which "
+                                 f"is not an episode's id (a lower-case UUID)")
+    if len(set(value)) != len(value):
+        raise LibraryRecordError(f"worker record: library.source.covers names an episode more "
+                                 f"than once: {value!r}")
+    if value and value[0] != item_id:
+        raise LibraryRecordError(f"worker record: library.source.covers begins with {value[0]}, "
+                                 f"not with this item, {item_id}: a file's holder is listed first")
+    if value and item_type not in (None, "episode"):
+        raise LibraryRecordError(f"worker record: library.source.covers names episodes, and the "
+                                 f"file of a {item_type} holds none")
+    return tuple(value)
+
+
+def parse_item_library(raw: Any, item_id: str, item_type: str | None = None) -> ItemLibrary:
+    """The library block of item `item_id`'s record (of `item_type`, when
+    it is known). Raises LibraryRecordError when it can't be worked from —
+    and with the catalog's own words when it says the item can't be
+    recorded yet (`blocked`)."""
     lib = _block(raw, "library")
     _contract(lib)
     blocked = lib.get("blocked")
@@ -273,6 +303,7 @@ def parse_item_library(raw: Any) -> ItemLibrary:
         library_path=src.get("libraryPath") if isinstance(src.get("libraryPath"), str) else "",
         size_bytes=_size(src.get("sizeBytes"), "library.source.sizeBytes"),
         qh1=_qh1(src.get("qh1"), "library.source.qh1"),
+        covers=_covers(src.get("covers"), item_id, item_type),
     )
     _in(source.record_dir, os.path.join(item_dir, "sources"), source.source_id,
         "library.source.recordDir")
@@ -378,7 +409,7 @@ class ClaimedItem:
         library, library_error = None, None
         if body.get("library") is not None:
             try:
-                library = parse_item_library(body["library"])
+                library = parse_item_library(body["library"], body["id"], body.get("type"))
             except LibraryRecordError as e:
                 library_error = str(e)
         return cls(

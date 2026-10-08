@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 from test_library_flow import (
     ASSET,
+    ITEM,
     NEXT_VERSION,
     SOURCE,
     SOURCE_BLOCK,
@@ -38,6 +39,8 @@ from packager.katalog import ClaimedItem
 from packager.renditions import PackageInputs, VideoInput
 
 NAME = "original.mkv"
+# The next episode a file of two holds.
+COVERED = "c0ce0000-1111-4222-8333-444444444444"
 
 
 @pytest.fixture
@@ -438,6 +441,28 @@ def test_a_link_is_never_taken_in_for_its_original(
     assert "is a link: a version folder keeps the file itself" in catalog.error
     assert binaries.builds == 0 and not share.item_dir.exists()
     assert share.original.is_symlink() and kept_at.exists()
+
+
+@pytest.mark.parametrize("mode", ["establish", "takein"])
+def test_the_source_of_a_file_of_several_episodes_covers_them(
+    binaries: Binaries, share: Share, mode: str,
+) -> None:
+    body = record(share, mode, type="episode", seasonNumber=1, episodeNumber=1,
+                  seriesTitle="Sintel")
+    body["library"]["source"]["covers"] = [ITEM, COVERED]
+    catalog = Catalog()
+    go(body, catalog)
+    assert catalog.statuses == ["in_progress", "done"]
+    source = json.loads((share.source_dir / "source.json").read_text())
+    assert source["covers"] == [ITEM, COVERED]
+
+
+@pytest.mark.parametrize("mode", ["establish", "takein", None])
+def test_the_source_of_a_file_of_one_episode_covers_none(
+    binaries: Binaries, share: Share, mode: str | None,
+) -> None:
+    go(record(share, mode, name=None if mode is None else NAME), Catalog())
+    assert json.loads((share.source_dir / "source.json").read_text())["covers"] == []
 
 
 # ------------------------------------------------------------- takein

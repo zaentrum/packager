@@ -28,6 +28,8 @@ TITLE = "ea886f9b-0d06-4f0f-babb-d2a1162f9b01"
 LIB = "/var/lib/katalog"
 ITEM_DIR = f"{LIB}/movies/f0/{ITEM}"
 QH1 = "sha256:" + "ab" * 32
+COVERED = "c0ce0000-1111-4222-8333-444444444444"
+NEXT = "c0ce0000-2222-4222-8333-444444444444"
 BASE = "http://catalog.test"
 
 
@@ -107,7 +109,8 @@ def test_a_block_without_marks_or_fixity() -> None:
     lib = parse_item_library(item_library(
         build={**item_library()["build"], "chapters": None, "chaptersFrom": None,
                "segments": None},
-        source={**item_library()["source"], "sizeBytes": None, "qh1": None, "recorded": True}))
+        source={**item_library()["source"], "sizeBytes": None, "qh1": None, "recorded": True}),
+        ITEM)
     assert (lib.build.chapters, lib.build.chapters_from, lib.build.segments) == ([], None, [])
     assert (lib.source.size_bytes, lib.source.qh1, lib.source.recorded) == (None, None, True)
 
@@ -140,7 +143,7 @@ def test_a_library_block_that_cant_be_worked_from(change: dict, says: str) -> No
 
 
 def test_a_build_without_a_mode_is_one_from_before_the_modes() -> None:
-    lib = parse_item_library(item_library())
+    lib = parse_item_library(item_library(), ITEM)
     assert (lib.build.mode, lib.build.original_name) == (None, None)
 
 
@@ -149,7 +152,7 @@ def test_a_build_without_a_mode_is_one_from_before_the_modes() -> None:
     ("add", None), ("repackage", None)])
 def test_a_builds_mode_and_its_originals_name(mode: str, name: str | None) -> None:
     lib = parse_item_library(item_library(
-        build={**item_library()["build"], "mode": mode, "originalName": name}))
+        build={**item_library()["build"], "mode": mode, "originalName": name}), ITEM)
     assert (lib.build.mode, lib.build.original_name) == (mode, name)
 
 
@@ -157,7 +160,7 @@ def test_a_builds_mode_and_its_originals_name(mode: str, name: str | None) -> No
 def test_a_mode_that_moves_no_original_takes_no_name_for_it(mode: str) -> None:
     # The original stays where it is: a name sent all the same is not used.
     lib = parse_item_library(item_library(
-        build={**item_library()["build"], "mode": mode, "originalName": "original.mkv"}))
+        build={**item_library()["build"], "mode": mode, "originalName": "original.mkv"}), ITEM)
     assert (lib.build.mode, lib.build.original_name) == (mode, None)
 
 
@@ -182,6 +185,39 @@ def test_a_mode_or_an_originals_name_that_cant_be_worked_from(change: dict, says
     assert item.library_error is not None and says in item.library_error
 
 
+@pytest.mark.parametrize("covers", [None, [], "absent"])
+def test_a_file_of_one_episode_covers_none(covers) -> None:
+    source = {**item_library()["source"]}
+    if covers != "absent":
+        source["covers"] = covers
+    lib = parse_item_library(item_library(source=source), ITEM, "episode")
+    assert lib.source.covers == ()
+
+
+def test_a_file_of_several_episodes_covers_them_its_holder_first() -> None:
+    lib = parse_item_library(item_library(
+        source={**item_library()["source"], "covers": [ITEM, COVERED, NEXT]}), ITEM, "episode")
+    assert lib.source.covers == (ITEM, COVERED, NEXT)
+
+
+@pytest.mark.parametrize(("covers", "kind", "says"), [
+    (ITEM, "episode", "library.source.covers is not a list"),
+    ([ITEM, COVERED.upper()], "episode", f"library.source.covers names {COVERED.upper()!r}, which "
+                                         f"is not an episode's id"),
+    ([ITEM, 7], "episode", "library.source.covers names 7, which is not an episode's id"),
+    ([ITEM, COVERED, COVERED], "episode", "library.source.covers names an episode more than once"),
+    ([COVERED, ITEM], "episode", f"library.source.covers begins with {COVERED}, not with this "
+                                 f"item, {ITEM}: a file's holder is listed first"),
+    ([ITEM, COVERED], "movie", "library.source.covers names episodes, and the file of a movie "
+                               "holds none"),
+])
+def test_covers_that_cant_be_worked_from_fail_the_step(covers, kind: str, says: str) -> None:
+    item = ClaimedItem.from_json(item_record(type=kind, library=item_library(
+        source={**item_library()["source"], "covers": covers})))
+    assert item.library is None
+    assert item.library_error is not None and says in item.library_error
+
+
 @pytest.mark.parametrize(("part", "change", "says"), [
     ("source", {"sourceId": SOURCE.upper()}, "library.source.sourceId is not a lower-case UUID"),
     ("source", {"recordDir": f"{ITEM_DIR}/sources/other"}, "library.source.recordDir"),
@@ -201,7 +237,7 @@ def test_paths_the_contracts_rule_does_not_give_are_refused(
     block = item_library()
     block[part] = {**block[part], **change}
     with pytest.raises(LibraryRecordError, match="^worker record: ") as e:
-        parse_item_library(block)
+        parse_item_library(block, ITEM)
     assert says in str(e.value)
 
 
