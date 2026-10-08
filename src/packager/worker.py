@@ -299,12 +299,24 @@ def _process_library(
     the catalog (contract section 2.5). The step is done only once the
     catalog has taken it, a 2xx; until then the staging folder and the
     handoff stay. A version in the record the catalog refused (a stale
-    version, a broken chain) stays as it is, and the step fails."""
+    version, a broken chain) stays as it is, and the step fails.
+
+    An original a run that died left in its staging folder goes back where
+    it came from first. A run whose mode renamed the original into its
+    version folder finds it there once that folder is in the record (its
+    handover was lost: library.original_at), and its handover names the
+    original's place there."""
     lib = item.library
     assert lib is not None
+    staging = Path(lib.build.staging_dir)
+    if not library.restore_original(staging):
+        log.error("packager.item.original_in_staging", item_id=item.id, staging=str(staging))
+        client.upsert_step(item.id, "failed", error=library.kept(staging)[:500])
+        return
+    original = library.original_at(item)
     legacy_inbox = _INBOX_ROOT / item.id
     try:
-        inputs, inbox = library.handoff(lib.inbox_dir, legacy_inbox, item.path)
+        inputs, inbox = library.handoff(lib.inbox_dir, legacy_inbox, original)
     except ContractError as e:
         log.warning("packager.item.bad_handoff", item_id=item.id, error=str(e))
         client.upsert_step(item.id, "failed", error=f"transcoder handoff: {e}"[:500])
@@ -339,7 +351,8 @@ def _process_library(
         return
     seconds = round(time.monotonic() - t0, 2)
 
-    payload = library.version_payload(lib, placed, _source_block(inputs, item.path))
+    payload = library.version_payload(
+        lib, placed, _source_block(inputs, str(placed.original or original)))
     handed = client.packaging_complete_v2(item.id, payload)
     if not handed.taken:
         # In the record, unknown to the catalog: nothing plays it. The

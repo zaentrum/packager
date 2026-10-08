@@ -82,6 +82,132 @@ def test_the_sweep_of_a_work_tree_that_isnt_there(tmp_path: Path) -> None:
     assert library.sweep_staging(tmp_path / "no-such-work-root") == 0
 
 
+# ------------------------------------------------- an original in staging
+
+def _staged_original(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A run's staging folder whose original has been renamed into its
+    staged version folder, and the arrival it came from."""
+    arrival = tmp_path / ".work" / "incoming" / "Clip (2024)" / "Clip (2024).mkv"
+    arrival.parent.mkdir(parents=True)
+    arrival.write_bytes(b"the original's bytes")
+    staging = tmp_path / ".work" / "staging" / VERSION
+    library.open_staging(staging)
+    (staging / "version").mkdir()
+    staged = staging / "version" / "original.mkv"
+    library.move_original_in(arrival, staged, staging)
+    return arrival, staging, staged
+
+
+def test_an_original_is_noted_before_it_is_renamed_into_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list = []
+    real = os.rename
+
+    def rename(src, dst):
+        note = Path(dst).parent.parent / library.ORIGINAL_NOTE
+        seen.append(json.loads(note.read_text()) if note.exists() else None)
+        real(src, dst)
+
+    monkeypatch.setattr(os, "rename", rename)
+    arrival, staging, staged = _staged_original(tmp_path)
+    assert seen == [{"from": str(arrival), "to": str(staged)}]
+    assert not arrival.exists() and staged.read_bytes() == b"the original's bytes"
+    assert sorted(p.name for p in staging.iterdir()) == [
+        library.ORIGINAL_NOTE, pk.SENTINEL, "version"]
+
+
+def test_an_original_left_in_staging_goes_back_where_it_came_from(tmp_path: Path) -> None:
+    arrival, staging, staged = _staged_original(tmp_path)
+    ino = staged.stat().st_ino
+    assert library.restore_original(staging) is True
+    assert arrival.read_bytes() == b"the original's bytes" and arrival.stat().st_ino == ino
+    assert not staged.exists() and not (staging / library.ORIGINAL_NOTE).exists()
+    assert library.restore_original(staging) is True                 # nothing left to do
+
+
+def test_an_original_that_went_into_the_record_stays_there(tmp_path: Path) -> None:
+    arrival, staging, staged = _staged_original(tmp_path)
+    vdir = tmp_path / "movies" / "f0" / "f001" / "versions" / VERSION
+    assert library.place(staging / "version", vdir)
+    assert library.restore_original(staging) is True
+    assert (vdir / "original.mkv").exists() and not arrival.exists()
+    assert not (staging / library.ORIGINAL_NOTE).exists()
+
+
+@pytest.mark.parametrize("remove", [library.remove_staging, lambda s: library.finish(str(s))])
+def test_a_staging_folder_goes_only_once_its_original_is_back(tmp_path: Path, remove) -> None:
+    arrival, staging, _staged = _staged_original(tmp_path)
+    remove(staging)
+    assert not staging.exists() and arrival.read_bytes() == b"the original's bytes"
+
+
+def test_a_run_opens_its_staging_folder_with_the_original_put_back(tmp_path: Path) -> None:
+    arrival, staging, _staged = _staged_original(tmp_path)
+    library.open_staging(staging)
+    assert [p.name for p in staging.iterdir()] == [pk.SENTINEL]
+    assert arrival.read_bytes() == b"the original's bytes"
+
+
+@pytest.mark.parametrize("why", ["taken", "note", "elsewhere", "no note"])
+def test_a_staging_folder_whose_original_cant_be_put_back_stays(tmp_path: Path, why: str) -> None:
+    arrival, staging, staged = _staged_original(tmp_path)
+    note = staging / library.ORIGINAL_NOTE
+    if why == "taken":                       # another file at the arrival path meanwhile
+        arrival.write_bytes(b"another file")
+    elif why == "note":
+        note.write_text("{not json")
+    elif why == "elsewhere":                 # a note that names a file outside the staged version
+        note.write_bytes(rec.json_bytes({"from": str(arrival), "to": str(tmp_path / "x.mkv")}))
+    else:                                    # an original there without its note
+        note.unlink()
+    before = sorted(p.relative_to(staging).as_posix() for p in staging.rglob("*"))
+    assert library.releasable(staging) is False
+    library.remove_staging(staging)
+    with pytest.raises(pk.PackageError, match="holds an original that can't be put back"):
+        library.open_staging(staging)
+    _two_days_ago(staging / pk.SENTINEL)
+    assert library.sweep_staging(tmp_path / ".work") == 0
+    assert sorted(p.relative_to(staging).as_posix() for p in staging.rglob("*")) == before
+    assert staged.read_bytes() == b"the original's bytes"
+    if why == "taken":
+        assert arrival.read_bytes() == b"another file"
+
+
+def test_the_sweep_puts_a_dead_runs_original_back(tmp_path: Path) -> None:
+    arrival, staging, _staged = _staged_original(tmp_path)
+    arrival.parent.rmdir()                   # its arrival folder went meanwhile
+    _two_days_ago(staging / pk.SENTINEL)
+    assert library.sweep_staging(tmp_path / ".work") == 1
+    assert not staging.exists() and arrival.read_bytes() == b"the original's bytes"
+
+
+def test_an_original_is_renamed_never_linked_copied_or_written_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging = tmp_path / "staging" / VERSION
+    library.open_staging(staging)
+    (staging / "version").mkdir()
+    target = tmp_path / "Clip.mkv"
+    target.write_bytes(b"x")
+    link = tmp_path / "link.mkv"
+    link.symlink_to(target)
+    with pytest.raises(pk.PackageError, match="is a link: a version folder keeps the file itself"):
+        library.move_original_in(link, staging / "version" / "original.mkv", staging)
+    (staging / "version" / "original.mkv").write_bytes(b"y")
+    with pytest.raises(pk.PackageError, match="is there already"):
+        library.move_original_in(target, staging / "version" / "original.mkv", staging)
+    (staging / "version" / "original.mkv").unlink()
+
+    def rename(_src, _dst):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "rename", rename)
+    with pytest.raises(pk.PackageError, match="the arrivals must be on the library's share"):
+        library.move_original_in(target, staging / "version" / "original.mkv", staging)
+    assert target.read_bytes() == b"x" and not (staging / library.ORIGINAL_NOTE).exists()
+
+
 def test_the_work_root(monkeypatch: pytest.MonkeyPatch) -> None:
     for key, value in {"KATALOG_API_URL": "http://katalog-app",
                        "OIDC_TOKEN_URL": "https://sso.example/token",
