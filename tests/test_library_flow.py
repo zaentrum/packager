@@ -794,6 +794,23 @@ def test_an_extra_goes_into_its_titles_folder(binaries: Binaries, share: Share) 
                        "package": package, "source": SOURCE_BLOCK}
 
 
+@pytest.mark.parametrize(("kind", "recorded", "title"), [
+    ("trailer", "trailer", "Trailer"),
+    ("behind-the-scenes", "behind-the-scenes", "Behind the scenes"),
+    ("unboxing", "other", "Extra")])
+def test_an_extra_the_catalog_gives_no_title_is_called_what_it_is(
+    binaries: Binaries, share: Share, kind: str, recorded: str, title: str,
+) -> None:
+    # Never by the name of the file it came as.
+    x = ExtraShare(share)
+    record = x.record()
+    record["library"]["record"].update(kind=kind, title=None)
+    run_extra(record, Catalog())
+    doc = json.loads((x.extra_dir / "extra.json").read_text())
+    assert (doc["kind"], doc["title"]) == (recorded, title)
+    assert "trailer.mov" not in (x.extra_dir / "extra.json").read_text()
+
+
 def test_an_extra_in_place_already_is_reported_again(binaries: Binaries, share: Share) -> None:
     x = ExtraShare(share)
     catalog = Catalog(status=500)

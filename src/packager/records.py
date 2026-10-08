@@ -165,17 +165,27 @@ def package_record(
 
 # ---------------------------------------------------------------- extras
 
+def _kind_title(kind: str) -> str:
+    """The title of an extra the catalog gives none: what kind of extra it
+    is, in a word ("Behind the scenes", "Trailer"); "Extra" for other."""
+    return "Extra" if kind == "other" else kind.replace("-", " ").capitalize()
+
+
 def extra_record(
     extra_id: str, lib: ExtraLibrary, original: Path, original_name: str, fixity_qh1: str,
     probe: OriginalProbe, now: str,
 ) -> dict[str, Any]:
     """extras/<xid>/extra.json (contract section 6): what the catalog took
     the extra in as (library.record), what the packager's probe of its
-    original says, and that original — never kept in the folder — named in
-    packagedFrom. A value the record can't hold is left out (a kind it
-    doesn't know is 'other'), never written as it came."""
+    original says, and that original — never kept in the folder — in
+    packagedFrom, which the record logic names as the library names an
+    original, whatever `original_name` it is given. A value the record
+    can't hold is left out (a kind it doesn't know is 'other'), never
+    written as it came; a title the catalog gives none of is its kind's
+    word, never a file's name."""
     record = lib.record
     kind = str(record.get("kind") or "").strip().lower()
+    kind = kind if kind in EXTRA_KINDS else "other"
     titles = record.get("localizedTitles")
     origin = record.get("origin")
     if isinstance(origin, dict) and origin.get("kind") == "link":
@@ -194,8 +204,8 @@ def extra_record(
         extra_id,
         created_at=created_at if rec.is_moment(created_at) else now,
         created_by=rec.text(record.get("createdBy")) or "packager",
-        kind=kind if kind in EXTRA_KINDS else "other",
-        title=rec.text(record.get("title")) or Path(original_name).stem or "Extra",
+        kind=kind,
+        title=rec.text(record.get("title")) or _kind_title(kind),
         localized_titles={k: rec.text(v) for k, v in titles.items()
                           if isinstance(k, str) and rec.LANGUAGE_RE.match(k) and rec.text(v)}
         if isinstance(titles, dict) else {},
