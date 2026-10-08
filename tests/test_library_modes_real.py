@@ -9,11 +9,13 @@ worker as a v2 worker record of each mode hands it over: an establish
 renames it into the version folder it packages, a takein into one with no
 package, an add puts a package beside it there, and a repackage builds a
 new version and leaves it where it is. Every package's chain holds, every
-file's digest included, and it plays; nothing in a version folder but the
-original carries the arrival's name or its container's title (but for the
-names of the source record's copies, which are the record logic's). Each
-run, run again as after a lost handover, hands the same version over again
-and writes nothing."""
+file's digest included, and it plays; nothing in the title's folder but
+the originals its versions keep — no record, no copy, no name — and
+nothing in a handover carries the arrival's name or its container's
+title. Each run, run again as after a lost handover, hands the same
+version over again and writes nothing. When the schemas repository's
+validator can run (test_library_real._validator), each tree validates;
+without it, the rest of a test stands."""
 
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from test_library_real import Catalog, _share
+from test_library_real import Catalog, _catalogs_part, _share, _validator
 
 from packager import libv2_records as rec
 from packager import packager as pk
@@ -52,8 +54,12 @@ VERSION = "7e510000-0000-4000-8000-0000000000b3"
 NEXT_VERSION = "7e510000-1111-4000-8000-0000000000b3"
 ASSET = "5ab70000-0000-4000-8000-0000000000b3"
 NAME = "original.mkv"
-# What only the arrival and the original's container say.
-LEAKS = (b"Clip (2024)", b"Container Title Of The Arrival", b"Container Comment Of The Arrival")
+# What only the arrival's name and the original's container title say: in
+# no record, no copy, no name and no handover.
+LEAKS = (b"Clip (2024)", b"Container Title Of The Arrival")
+# The container's other global tags: a source record keeps them as the probe
+# found them, and no package carries them.
+GLOBAL_TAGS = (b"Container Comment Of The Arrival",)
 
 
 def _ff(*args: str) -> None:
@@ -155,22 +161,35 @@ def _again(body: dict, first: Catalog, vdir: Path) -> None:
     assert {p: p.stat().st_mtime_ns for p in vdir.rglob("*")} == before
 
 
-def _leaks(vdir: Path) -> list[tuple[str, bytes]]:
-    """What in a version folder, but its original, says what only the
-    arrival's name and the original's container say. The names package.json
-    gives the copies in the source record a subtitle was made from
-    (fromSidecar) are the record logic's, as the copies' are, and are not
-    looked at here."""
+def _leaks(t: Tree, *handovers: dict) -> list[tuple[str, bytes]]:
+    """What in the title's folder — a file's name or its bytes, but for
+    the originals its versions keep — or in a handover says what only the
+    arrival's name and the original's container title say, and what in a
+    package says what the container's other tags do."""
     out = []
-    for p in sorted(vdir.rglob("*")):
-        if not p.is_file() or p.name == NAME:
+    for p in sorted(t.item_dir.rglob("*")):
+        rel = p.relative_to(t.item_dir).as_posix()
+        if p.parent.parent.name == "versions" and rec.ORIGINAL_NAME_RE.fullmatch(p.name):
             continue
-        data = p.read_bytes()
-        if p.name == "package.json":
-            for s in json.loads(data)["subtitles"]:
-                data = data.replace(str(s.get("fromSidecar") or "").encode(), b"")
-        out += [(p.relative_to(vdir).as_posix(), s) for s in LEAKS if s in data]
+        data = rel.encode() + (p.read_bytes() if p.is_file() else b"")
+        said = LEAKS + (GLOBAL_TAGS if rel.startswith("versions/") else ())
+        out += [(rel, s) for s in said if s in data]
+    for payload in handovers:
+        data = json.dumps(payload, ensure_ascii=False).encode()
+        out += [("the handover", s) for s in LEAKS if s in data]
     return out
+
+
+def _valid(t: Tree) -> None:
+    """The library tree validates, the catalog's part of the title's
+    folder added, when the schemas repository's validator can run."""
+    cmd = _validator(extras=False)
+    if cmd is None:
+        return
+    _catalogs_part(t.item_dir)
+    out = subprocess.run([*cmd, "--check-checksums", str(t.lib)], capture_output=True, text=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.stdout.rstrip().endswith("OK"), out.stdout
 
 
 def _whole(vdir: Path) -> dict:
@@ -212,9 +231,12 @@ def test_an_establish_renames_the_original_into_the_version_it_packages(
     assert "takenIn" not in payload and payload["source"]["codec"] == "hevc"
     assert payload["sidecars"] == [{"subtitleAssetId": ASSET, "rendition": "sub1",
                                     "path": "subs/1.vtt"}]
-    assert _leaks(vdir) == []
+    assert [x.get("fromSidecar") for x in package["subtitles"]] == [
+        None, f"sources/{SOURCE}/subtitle-1.de.srt"]
+    assert _leaks(t, payload) == []
     assert not (t.work / "staging" / VERSION).exists()
     _again(body, catalog, vdir)
+    _valid(t)
 
 
 def test_a_takein_renames_the_original_into_a_version_with_no_package(
@@ -249,9 +271,10 @@ def test_a_takein_renames_the_original_into_a_version_with_no_package(
     assert not {"packageId", "complete", "package"} & set(payload)
     assert (payload["source"]["codec"], payload["source"]["width"],
             payload["source"]["height"]) == ("hevc", 640, 360)
-    assert _leaks(vdir) == []
+    assert _leaks(t, payload) == []
     assert not (t.work / "staging" / VERSION).exists()
     _again(body, catalog, vdir)
+    _valid(t)
 
 
 @packages
@@ -280,9 +303,10 @@ def test_an_add_puts_a_package_beside_the_original_in_its_version(
     assert payload["package"] == package and payload["versionDir"] == str(vdir)
     assert payload["sidecars"] == [{"subtitleAssetId": ASSET, "rendition": "sub1",
                                     "path": "subs/1.vtt"}]
-    assert _leaks(vdir) == []
+    assert _leaks(t, payload) == []
     assert not (t.work / "staging" / VERSION).exists()
     _again(body, catalog, vdir)
+    _valid(t)
 
 
 @packages
@@ -291,7 +315,8 @@ def test_a_repackage_builds_a_new_version_and_leaves_the_original_where_it_is(
 ) -> None:
     t = Tree(tmp_path, clip)
     first = t.version_dir()
-    _go(t.record("establish"), Catalog())
+    established = Catalog()
+    _go(t.record("establish"), established)
     kept = {p: p.stat().st_mtime_ns for p in first.rglob("*")}
     body = t.record("repackage", version=NEXT_VERSION, path=first / NAME, copies=True)
     catalog = Catalog()
@@ -307,5 +332,8 @@ def test_a_repackage_builds_a_new_version_and_leaves_the_original_where_it_is(
     assert {p: p.stat().st_mtime_ns for p in first.rglob("*")} == kept
     [payload] = catalog.handovers
     assert payload["versionId"] == NEXT_VERSION and "original" not in payload
-    assert _leaks(second) == []
+    assert payload["sidecars"] == [{"subtitleAssetId": ASSET, "rendition": "sub1",
+                                    "path": "subs/1.vtt"}]
+    assert _leaks(t, *established.handovers, payload) == []
     _again(body, catalog, second)
+    _valid(t)
