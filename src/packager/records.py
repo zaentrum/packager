@@ -58,10 +58,14 @@ def source_record(
 ) -> tuple[dict[str, Any], bytes]:
     """sources/<sid>/source.json and the bytes of its ffprobe.json
     (contract section 3.3): taken in by the packager, from the arrivals
-    (origin.takenBy import), with the fixity the catalog recorded."""
+    (origin.takenBy import), with the fixity the catalog recorded. The
+    file is named as the library keeps it: by the name the worker record
+    gives it in its version folder, for a run that renames it there, else
+    by its own."""
+    name = lib.build.original_name or original.name
     doc, probe_bytes = rec.source_record(
-        lib.source.source_id, original.name, original.stat().st_size, taken_at=now,
-        taken_by="packager", library_path=lib.source.library_path or original.name,
+        lib.source.source_id, name, original.stat().st_size, taken_at=now,
+        taken_by="packager", library_path=lib.source.library_path or name,
         qh1=fixity_qh1, mtime=rec.ts_of_mtime(str(original)), origin_taken_by="import",
         probe=probe.raw, probe_version=probe.version, sidecars=sidecars)
     return doc, probe_bytes
@@ -74,8 +78,9 @@ def version_record(
 ) -> dict[str, Any]:
     """versions/<vid>/version.json (contract section 3.3): the catalog's
     marks for the version, the original's own chapters when the catalog
-    has none (a version keeps the chapters its original carries), no
-    original kept."""
+    has none (a version keeps the chapters its original carries), and the
+    original it keeps, by the name the worker record gives it there, for a
+    run that renames it into the version folder (none for any other)."""
     build = lib.build
     chapters = rec.chapter_marks(build.chapters)
     chapters_from = (build.chapters_from if build.chapters_from in CHAPTERS_FROM
@@ -90,7 +95,8 @@ def version_record(
         if isinstance(rec.num(s.get("startMs")), int)])
     return rec.version_record(
         build.version_id, source, created_at=now, created_by=build.created_by or "packager",
-        chapters=chapters, chapters_from=chapters_from, segments=segments)
+        chapters=chapters, chapters_from=chapters_from, segments=segments,
+        original_files=[build.original_name] if build.original_name else [])
 
 
 # ---------------------------------------------------------------- packages
@@ -137,17 +143,20 @@ def for_record(built: Built, probe: OriginalProbe, now: str) -> dict[str, Any]:
 def package_record(
     package_id: str, built: Built, listed: list[tuple[str, str, int]], source: dict[str, Any],
     probe: OriginalProbe, sidecars: dict[str, str], peak_bandwidth_bps: int | None, now: str,
+    *, beside_original: bool = False,
 ) -> dict[str, Any]:
     """package.json of a version or an extra: the package `built` as the
     record logic describes it, its losses measured against `source` (the
     source record, or the probed extra record), `listed` what the
     checksums written below it list, `sidecars` the copy in the source
     folder each subtitle made from a file next to the original was made
-    from. Always canonical: no original is ever kept beside a package.
-    What the record logic normalised (a forced subtitle is never the
-    default) is logged."""
+    from. Its role is what it is as it is written: `derived` beside the
+    original its version folder keeps (beside_original), else
+    `canonical`, the only copy. What the record logic normalised (a forced
+    subtitle is never the default) is logged."""
     doc, notes = rec.package_record(
-        package_id, for_record(built, probe, now), listed, source=source, role="canonical",
+        package_id, for_record(built, probe, now), listed, source=source,
+        role="derived" if beside_original else "canonical",
         created_at=now, peak_bandwidth_bps=peak_bandwidth_bps, sidecars=sidecars)
     for note in notes:
         log.info("packager.library.package_note", package_id=package_id, note=note)
