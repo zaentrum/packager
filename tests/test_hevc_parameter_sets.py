@@ -172,3 +172,6 @@ def test_a_lower_rung_is_copied_the_same_way(
     copy = args[args.index("-c:v"):args.index("-an")]
     assert copy == ["-c:v", "copy", *(["-bsf:v", "hevc_mp4toannexb"] if bsf else []),
                     "-tag:v", "hvc1"]
+    # Nothing but the video: no global metadata, no chapters.
+    assert args[args.index("-an"):args.index("-movflags")] == [
+        "-an", "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1"]

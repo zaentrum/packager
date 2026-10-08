@@ -1265,6 +1265,15 @@ def _pick_default_surround(
     return min(plan, key=rank).source_index
 
 
+# What the remuxes shaka-packager packages from leave out of the original:
+# its global metadata (the container's title and its other tags) and its
+# chapters, so nothing of them can reach a package's media, whatever
+# shaka-packager would carry over. The streams' own metadata is copied as
+# before: the languages the renditions are named by. ffmpeg writes its own
+# muxer tags (encoder), which say nothing of the original.
+NO_GLOBAL_METADATA = ("-map_metadata", "-1", "-map_chapters", "-1")
+
+
 def _timeline_input_args(timeline: str) -> list[str]:
     """`keep` / `offset` inputs are on the contract's shared timeline (or
     moved onto it): don't let ffmpeg renormalise them per file."""
@@ -1372,8 +1381,9 @@ def _prepare_source(
         out += 1
 
     # No subtitle / data streams in the intermediate — subtitles are
-    # extracted separately to sidecar files.
-    args += ["-sn", "-dn", *_timeline_output_args(timeline, ts_offset),
+    # extracted separately to sidecar files — and none of the original's
+    # global metadata (NO_GLOBAL_METADATA).
+    args += ["-sn", "-dn", *NO_GLOBAL_METADATA, *_timeline_output_args(timeline, ts_offset),
              "-movflags", "+faststart", str(transmuxed)]
     _run_ffmpeg_capturing("transmux", args)
 
@@ -1440,7 +1450,7 @@ def _remux_video(
         "-map", vmap, "-c:v", "copy",
         *([*_hevc_copy_args(rung.path, probe.video_index), "-tag:v", "hvc1"]
           if codec == "hevc" else []),
-        "-an", "-sn", "-dn",
+        "-an", "-sn", "-dn", *NO_GLOBAL_METADATA,
         *_timeline_output_args(rung.timeline, ts_offset),
         "-movflags", "+faststart", str(target),
     ]

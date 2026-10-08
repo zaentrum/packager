@@ -179,7 +179,9 @@ def test_prepare_source_command(monkeypatch, tmp_path: Path) -> None:
         "-map", "[s2]", "-c:a:2", "aac", "-b:a:2", "192k", "-metadata:s:a:2", "language=eng",
         "-map", "[m0]", "-c:a:3", "eac3", "-b:a:3", "448k", "-metadata:s:a:3", "language=eng",
         "-map", "0:a:1", "-c:a:4", "copy", "-metadata:s:a:4", "language=ger",
-        "-sn", "-dn", "-output_ts_offset", "0.021000",
+        # The original's global metadata and chapters stay out of the package.
+        "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1",
+        "-output_ts_offset", "0.021000",
         "-movflags", "+faststart", str(tmp_path / "transmux.mp4"),
     ]
     assert mp4 == tmp_path / "transmux.mp4"

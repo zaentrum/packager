@@ -385,6 +385,41 @@ def test_single_rendition_without_handoff(tmp_path: Path, monkeypatch, handoff) 
     assert (root / ".complete").exists()
 
 
+def test_a_package_carries_none_of_the_originals_global_metadata(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    # The original's container title, its other global tags and its
+    # chapters' titles reach neither the remux shaka packages from nor any
+    # file of the package; its streams' own metadata still names them.
+    meta = tmp_path / "metadata.txt"
+    meta.write_text(";FFMETADATA1\ntitle=Arrival Title 2024 TAG\ncomment=Arrival Comment\n"
+                    "[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=6000\ntitle=Arrival Chapter\n")
+    src = tmp_path / "titled.mkv"
+    _ff("-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+        "-i", str(meta), "-map", "0:v", "-map", "1:a", "-map_metadata", "2", "-map_chapters", "2",
+        "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "ac3",
+        "-metadata:s:a:0", "language=ger", str(src))
+    leaks = (b"Arrival Title", b"Arrival Comment", b"Arrival Chapter")
+
+    probe = pk._ffprobe(src)
+    assert (probe.audio[0].get("tags") or {}).get("language") == "ger"
+    mp4, _meta, _surround = pk._prepare_source(src, probe, tmp_path)
+    remuxed = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams",
+         "-show_chapters", str(mp4)], capture_output=True, text=True, check=True).stdout)
+    assert {k.lower() for k in remuxed["format"].get("tags") or {}} <= {
+        "major_brand", "minor_version", "compatible_brands", "encoder"}
+    assert remuxed["chapters"] == []
+    assert [s["tags"]["language"] for s in remuxed["streams"]] == ["und", "ger"]
+    assert not [s for s in leaks if s in mp4.read_bytes()]
+
+    manifest, root = _package(tmp_path, monkeypatch, src, None, surround_codec="off")
+    assert [a["language"] for a in manifest["renditions"]["audio"]] == ["ger"]
+    assert 'LANGUAGE="de"' in (root / "hls" / "master.m3u8").read_text()
+    assert [(rel, s) for rel, body in _tree(root).items() for s in leaks if s in body] == []
+
+
 _CUE = re.compile(r"^(\d+):(\d\d):(\d\d)\.(\d{3}) --> ")
 _MAP = re.compile(r"^X-TIMESTAMP-MAP=(.*)$")
 
