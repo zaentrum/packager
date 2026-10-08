@@ -41,6 +41,14 @@ from the record's inboxDir, else from a handoff left in
 from the original while the transcode step says done and its handoff is
 gone. Its packaging-complete takes the v2 payload, and the step is done
 only once the catalog has taken it.
+
+Takein jobs (library v2): the catalog sends them on the same topic, the
+envelope's `step` "takein", for a title whose original goes into its
+version folder with no package (library.take_in). Their guard is the
+`takein` step's, as the package step's is a package job's; a takein has
+no transcode, so no handover of one is stale. A package job whose record's
+mode is takein, or a takein job whose record's mode is another, is only
+acked: the catalog sends the job its record names.
 """
 
 from __future__ import annotations
@@ -55,8 +63,8 @@ from typing import Any
 import structlog
 
 from . import library
-from .events import build_consumer, is_retry, parse_envelope, parse_item_id
-from .katalog import ClaimedItem, KatalogClient
+from .events import build_consumer, is_retry, is_takein, parse_envelope, parse_item_id
+from .katalog import TAKEIN, ClaimedItem, KatalogClient
 from .packager import PACKAGES_ROOT, PackageOptions, package_item, probe_source
 from .renditions import ContractError, PackageInputs, resolve_inputs
 
@@ -65,6 +73,9 @@ log = structlog.get_logger(__name__)
 # The owning step for this worker. If it's already finished on a
 # redelivered event we skip the (expensive) packaging work.
 PACKAGE_STEP = "package"
+# A takein job's step (library v2): the original into its version folder,
+# no package.
+TAKEIN_STEP = "takein"
 # The transcoder's step: done means it left a handoff.
 TRANSCODE_STEP = "transcode"
 
@@ -103,15 +114,16 @@ def _cleanup_inbox(item_id: str) -> None:
 SOURCE_KEYS = ("codec", "width", "height", "durationMs", "bitRate")
 
 
-def _source_block(inputs: PackageInputs, original: str) -> dict[str, Any]:
+def _source_block(inputs: PackageInputs | None, original: str) -> dict[str, Any]:
     """The source block of the packaging-complete call: renditions.json's
     `source` (the transcoder's probe of the original), completed by a
     probe of the original for whatever it doesn't say — all of it when
-    there is no handoff (a source that needed no encode), the duration and
-    bit rate when the transcoder predates them. The package's own probe
-    can't stand in: for an encoded v0 it reads the encode. Only the
-    catalog gets this; the on-disk manifest (v2) keeps no source block."""
-    raw = inputs.contract.get("source")
+    there is no handoff (a source that needed no encode, a takein: no
+    inputs), the duration and bit rate when the transcoder predates them.
+    The package's own probe can't stand in: for an encoded v0 it reads the
+    encode. Only the catalog gets this; the on-disk manifest (v2) keeps no
+    source block."""
+    raw = inputs.contract.get("source") if inputs is not None else None
     # null is unknown, and so is a 0 / "" for one of the five (a size the
     # transcoder's probe didn't get); other keys (hdr: false) pass as they are.
     block = {k: v for k, v in raw.items()
@@ -308,6 +320,12 @@ def _process_library(
     original's place there."""
     lib = item.library
     assert lib is not None
+    if lib.build.mode == TAKEIN:
+        # The catalog takes this title in with no package: the takein job
+        # it sends for that does it, and reports its own step.
+        log.warning("packager.item.takein_record", item_id=item.id,
+                    version_id=lib.build.version_id)
+        return
     staging = Path(lib.build.staging_dir)
     if not library.restore_original(staging):
         log.error("packager.item.original_in_staging", item_id=item.id, staging=str(staging))
@@ -368,38 +386,102 @@ def _process_library(
              superseded=handed.answer.get("superseded"))
 
 
+def _process_takein(item: ClaimedItem, client: KatalogClient) -> None:
+    """Take an item's original into its version folder with no package
+    (library.take_in) and hand the version to the catalog: the takein
+    step, done only once the catalog has taken it (a 2xx). A takein has
+    no transcode and no handoff. A record whose block can't be worked from
+    fails the step; one whose mode is not takein is another job's — the
+    catalog sends the job its record names — and is only acked."""
+    if item.library_error is not None:
+        log.warning("packager.takein.library_refused", item_id=item.id, error=item.library_error)
+        client.upsert_step(item.id, "failed", error=item.library_error[:500], step=TAKEIN_STEP)
+        return
+    lib = item.library
+    if lib is None or lib.build.mode != TAKEIN:
+        log.warning("packager.takein.not_a_takein", item_id=item.id,
+                    mode=lib.build.mode if lib is not None else None)
+        return
+    staging = Path(lib.build.staging_dir)
+    if not library.restore_original(staging):
+        log.error("packager.item.original_in_staging", item_id=item.id, staging=str(staging))
+        client.upsert_step(item.id, "failed", error=library.kept(staging)[:500], step=TAKEIN_STEP)
+        return
+    original = library.original_at(item)
+    log.info("packager.takein.start", item_id=item.id, title=item.title, type=item.type,
+             path=original, version_id=lib.build.version_id)
+    if not os.path.exists(original):
+        log.warning("packager.item.missing_file", item_id=item.id, path=original)
+        client.upsert_step(item.id, "failed", error=f"source file missing: {original}",
+                           step=TAKEIN_STEP)
+        return
+
+    client.upsert_step(item.id, "in_progress", step=TAKEIN_STEP)
+    t0 = time.monotonic()
+    try:
+        placed = library.take_in(item)
+    except Exception as e:
+        log.exception("packager.takein.failed", item_id=item.id, error=str(e)[:300])
+        client.upsert_step(item.id, "failed", error=str(e)[:500], step=TAKEIN_STEP)
+        return
+    seconds = round(time.monotonic() - t0, 2)
+    payload = library.version_payload(lib, placed,
+                                      _source_block(None, str(placed.original or original)))
+    handed = client.packaging_complete_v2(item.id, payload)
+    if not handed.taken:
+        client.upsert_step(item.id, "failed", error=f"packaging-complete: {handed.error}"[:500],
+                           step=TAKEIN_STEP)
+        return
+    name = placed.original.name if placed.original is not None else None
+    client.upsert_step(item.id, "done", details=f"original={name} dur_s={seconds}",
+                       step=TAKEIN_STEP)
+    library.finish(lib.build.staging_dir)
+    log.info("packager.takein.done", item_id=item.id, title=item.title, seconds=seconds,
+             version_id=lib.build.version_id, original=str(placed.original),
+             reported_again=placed.reported_again or None)
+
+
 def _handle_message(
     item_id: str,
     client: KatalogClient,
     options: PackageOptions | None = None,
     *,
     retry: bool = False,
+    takein: bool = False,
 ) -> None:
-    """Resolve, guard, and package a single item. Any error that the
-    packaging body owns is already attributed to the `package` step by
-    `_process_one`; this wrapper only owns the resolve + idempotency
-    guard, and it never lets an exception escape (the caller commits the
-    offset regardless to avoid a poison loop)."""
+    """Resolve, guard, and package a single item — or take it in, for a
+    takein job. Any error that the packaging body owns is already
+    attributed to the `package` step by `_process_one` (to the `takein`
+    step by `_process_takein`); this wrapper only owns the resolve +
+    idempotency guard, and it never lets an exception escape (the caller
+    commits the offset regardless to avoid a poison loop)."""
     # 1. Resolve the full item detail from the itemId on the event.
     item = client.get_item(item_id)
     if item is None:
         log.warning("packager.item.unknown", item_id=item_id)
         return
 
-    # 2. Idempotency guard: on a redelivered event whose package step has
-    #    already finished, skip the expensive work. The packager is
+    # 2. Idempotency guard: on a redelivered event whose package step (a
+    #    takein job's takein step) has already finished, skip the
+    #    expensive work. The packager is
     #    TERMINAL, so there is nothing downstream to re-emit — just
     #    return and let the caller commit. A `retry` (the catalog sent
     #    the trigger again for a failed or silent step) finds its step
     #    finished when the run the reaper took for dead reported done
     #    after all: one log line, nothing else.
+    step = TAKEIN_STEP if takein else PACKAGE_STEP
     steps = client.get_steps(item_id)
-    status = steps.get(PACKAGE_STEP)
+    status = steps.get(step)
     if status in FINISHED_STATUSES:
         if retry:
-            log.info("packager.retry.already_finished", item_id=item_id, status=status)
+            log.info("packager.retry.already_finished", item_id=item_id, status=status, step=step)
         else:
-            log.info("packager.item.already_done", item_id=item_id, status=status)
+            log.info("packager.item.already_done", item_id=item_id, status=status, step=step)
+        return
+    if takein:
+        # A takein has no transcode, so its job is no handover of one: the
+        # stale-handover guard below is the package job's.
+        _process_takein(item, client)
         return
 
     # 3. A stale handover: the transcoder writes its step's end before it
@@ -471,9 +553,10 @@ def run_worker(
                 consumer.commit(message=msg)
                 continue
 
+            envelope = parse_envelope(msg.value())
             try:
                 _handle_message(item_id, client, options,
-                                retry=is_retry(parse_envelope(msg.value())))
+                                retry=is_retry(envelope), takein=is_takein(envelope))
             except Exception as e:
                 # _process_one already attributed any packaging error to
                 # the package step; anything that escapes is a bug in the

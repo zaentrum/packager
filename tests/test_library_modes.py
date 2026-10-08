@@ -31,7 +31,7 @@ from test_library_flow import (
     run,
 )
 
-from packager import library
+from packager import library, worker
 from packager import libv2_records as rec
 from packager import packager as pk
 from packager.katalog import ClaimedItem
@@ -60,6 +60,15 @@ def record(share: Share, mode: str | None, *, name: str | None = NAME, **fields)
     if name is not None:
         build["originalName"] = name
     return body
+
+
+def go(body: dict, catalog: Catalog) -> None:
+    """The job a record's mode is run as: a takein job, or a package job."""
+    item = ClaimedItem.from_json(body)
+    if body["library"]["build"].get("mode") == "takein":
+        worker._process_takein(item, catalog)  # type: ignore[arg-type]
+    else:
+        run(body, catalog)
 
 
 def _ino(path: Path) -> int:
@@ -200,7 +209,7 @@ def _dies_with_the_original_staged(
     monkeypatch.setattr(library, "place", place)
     catalog = Catalog()
     with pytest.raises(_Killed):
-        run(body or record(share, "establish"), catalog)
+        go(body or record(share, "establish"), catalog)
     monkeypatch.setattr(library, "place", real)
     assert catalog.statuses == ["in_progress"] and catalog.handovers == []
     assert not share.original.exists() and not share.version_dir.exists()
@@ -209,46 +218,50 @@ def _dies_with_the_original_staged(
         "from": str(share.original), "to": str(share.staging / "version" / NAME)}
 
 
+@pytest.mark.parametrize("mode", ["establish", "takein"])
 def test_the_next_run_puts_back_an_original_a_dead_run_left_in_staging(
-    binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch,
+    binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch, mode: str,
 ) -> None:
     ino = _ino(share.original)
-    body = record(share, "establish")
+    body = record(share, mode)
     _handoff(share.inbox)          # its v0 is the original: the inputs need it where it was
     _dies_with_the_original_staged(share, monkeypatch, body)
     catalog = Catalog(steps={"transcode": "done"})
-    run(body, catalog)
+    go(body, catalog)
     assert catalog.statuses == ["in_progress", "done"]
-    assert binaries.builds == 2
+    assert binaries.builds == (2 if mode == "establish" else 0)
     assert _ino(share.version_dir / NAME) == ino
     assert catalog.handovers[0]["original"] == {"path": str(share.version_dir / NAME),
                                                 "name": NAME}
     assert not share.staging.exists() and _left(share) == []
 
 
+@pytest.mark.parametrize("mode", ["establish", "takein"])
 def test_the_startup_sweep_puts_back_an_original_a_dead_run_left_in_staging(
-    binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch,
+    binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch, mode: str,
 ) -> None:
     ino = _ino(share.original)
-    _dies_with_the_original_staged(share, monkeypatch)
+    _dies_with_the_original_staged(share, monkeypatch, record(share, mode))
     t = time.time() - 2 * 86400
     os.utime(share.staging / pk.SENTINEL, (t, t))
     assert library.sweep_staging(share.work) == 1
     assert _ino(share.original) == ino and not share.staging.exists()
 
 
+@pytest.mark.parametrize("mode", ["establish", "takein"])
 def test_a_run_never_starts_over_an_original_it_cant_put_back(
-    binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch,
+    binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch, mode: str,
 ) -> None:
-    body = record(share, "establish")
+    body = record(share, mode)
     _dies_with_the_original_staged(share, monkeypatch, body)
     share.original.write_bytes(b"another file, by the original's old name")
     before = share.tree(share.staging)
     catalog = Catalog()
-    run(body, catalog)
+    go(body, catalog)
     assert catalog.statuses == ["failed"]
     assert "holds an original that can't be put back where it came from" in catalog.error
-    assert share.tree(share.staging) == before and binaries.builds == 1
+    assert share.tree(share.staging) == before
+    assert binaries.builds == (1 if mode == "establish" else 0)
 
 
 @pytest.mark.parametrize("handoff", [False, True])
@@ -378,6 +391,146 @@ def test_an_establish_takes_its_original_from_its_arrival_only(
     assert catalog.statuses == ["in_progress", "failed"]
     assert "is in the title's record already" in catalog.error
     assert inside.exists() and binaries.builds == 0
+
+
+# ------------------------------------------------------------- takein
+
+def test_a_takein_renames_the_original_into_a_version_with_no_package(
+    binaries: Binaries, share: Share,
+) -> None:
+    ino = _ino(share.original)
+    catalog = Catalog()
+    go(record(share, "takein"), catalog)
+    assert catalog.statuses == ["in_progress", "done"]
+    assert {kw.get("step") for _status, kw in catalog.written} == {"takein"}
+    assert catalog.written[-1][1]["details"].startswith(f"original={NAME} dur_s=")
+    assert binaries.builds == 0
+
+    vdir = share.version_dir
+    # No package, and so no chain: version.json and the original only.
+    assert sorted(p.name for p in vdir.iterdir()) == [NAME, "version.json"]
+    assert _ino(vdir / NAME) == ino and not share.original.exists()
+    version = json.loads((vdir / "version.json").read_text())
+    assert (version["versionId"], version["sourceIds"], version["originalFiles"]) == (
+        VERSION, [SOURCE], [NAME])
+    assert [(c["startMs"], c["title"]) for c in version["chapters"]] == [(0, "Opening")]
+    source = json.loads((share.source_dir / "source.json").read_text())
+    assert source["file"]["name"] == NAME
+    assert sorted(p.name for p in share.source_dir.iterdir()) == [
+        "Sintel (2010).en.srt", "Sintel (2010).nfo", "checksums.sha256", "ffprobe.json",
+        "source.json"]
+
+    [payload] = catalog.handovers
+    assert payload == {
+        "layout": "v2", "versionId": VERSION, "versionDir": str(vdir),
+        "sourceId": SOURCE, "sourceRecorded": True, "takenIn": True, "sidecars": [],
+        "source": SOURCE_BLOCK, "original": {"path": str(vdir / NAME), "name": NAME},
+    }
+    assert not share.staging.exists() and _left(share) == []
+
+
+def test_a_takein_whose_handover_was_lost_is_reported_again(
+    binaries: Binaries, share: Share,
+) -> None:
+    body = record(share, "takein")
+    catalog = Catalog()
+
+    def dies(_payload: dict) -> None:
+        raise _Killed
+
+    catalog.on_handover = dies
+    with pytest.raises(_Killed):
+        go(body, catalog)
+    first = catalog.handovers[0]
+    placed = share.tree(share.item_dir)
+    catalog = Catalog()
+    go(body, catalog)
+    assert catalog.statuses == ["in_progress", "done"]
+    assert catalog.handovers == [first]
+    assert share.tree(share.item_dir) == placed
+    assert not share.staging.exists() and _left(share) == []
+
+
+@pytest.mark.parametrize("status", [409, 500])
+def test_a_refused_takein_keeps_its_version_and_reports_it_again(
+    binaries: Binaries, share: Share, status: int,
+) -> None:
+    body = record(share, "takein")
+    catalog = Catalog(status=status)
+    go(body, catalog)
+    assert catalog.statuses == ["in_progress", "failed"]
+    assert catalog.error.startswith(f"packaging-complete: the catalog answered {status}")
+    assert (share.version_dir / NAME).exists()
+    catalog = Catalog()
+    go(body, catalog)
+    assert catalog.statuses == ["in_progress", "done"]
+    assert catalog.handovers[0]["takenIn"] is True
+
+
+@pytest.mark.parametrize("left", ["a package", "another file", "no original"])
+def test_a_version_folder_that_is_not_a_takeins_is_never_written_over(
+    binaries: Binaries, share: Share, left: str,
+) -> None:
+    body = record(share, "takein")
+    go(body, Catalog(status=500))
+    vdir = share.version_dir
+    if left == "a package":
+        (vdir / "hls").mkdir()
+    elif left == "another file":
+        (vdir / "notes.txt").write_text("x")
+    else:
+        (vdir / NAME).rename(share.original)      # back at its arrival
+    before = share.tree(vdir)
+    catalog = Catalog()
+    go(body, catalog)
+    assert catalog.statuses[-1] == "failed" and catalog.handovers == []
+    says = f"versions/{VERSION} is there but not the version a takein leaves (it holds "
+    assert says in catalog.error
+    if left == "no original":
+        assert f"{says}version.json)" in catalog.error
+    assert share.tree(vdir) == before
+
+
+def test_a_takein_record_on_a_package_job_is_only_acked(
+    binaries: Binaries, share: Share,
+) -> None:
+    catalog = Catalog()
+    run(record(share, "takein"), catalog)
+    assert catalog.written == [] and catalog.handovers == []
+    assert share.original.exists() and not share.item_dir.exists()
+
+
+@pytest.mark.parametrize("mode", ["establish", "add", "repackage", None])
+def test_a_takein_job_whose_record_is_another_jobs_is_only_acked(
+    binaries: Binaries, share: Share, mode: str | None,
+) -> None:
+    body = record(share, mode)
+    catalog = Catalog()
+    worker._process_takein(ClaimedItem.from_json(body), catalog)  # type: ignore[arg-type]
+    del body["library"]
+    worker._process_takein(ClaimedItem.from_json(body), catalog)  # type: ignore[arg-type]
+    assert catalog.written == [] and catalog.handovers == [] and binaries.builds == 0
+    assert share.original.exists() and not share.item_dir.exists()
+
+
+def test_a_takein_job_whose_block_cant_be_worked_from_fails_its_step(
+    binaries: Binaries, share: Share,
+) -> None:
+    body = record(share, "takein", name="Sintel (2010).mkv")
+    catalog = Catalog()
+    worker._process_takein(ClaimedItem.from_json(body), catalog)  # type: ignore[arg-type]
+    assert [(s, kw.get("step")) for s, kw in catalog.written] == [("failed", "takein")]
+    assert "library.build.originalName" in catalog.error
+    assert share.original.exists()
+
+
+def test_a_takein_is_never_packaged(binaries: Binaries, share: Share) -> None:
+    item = ClaimedItem.from_json(record(share, "takein"))
+    with pytest.raises(pk.PackageError, match="a takein is taken in, never packaged"):
+        library.package_version(item, PackageInputs([VideoInput("v0", share.original)],
+                                                    "original"), options=pk.PackageOptions())
+    with pytest.raises(pk.PackageError, match="build mode is 'establish', not takein"):
+        library.take_in(ClaimedItem.from_json(record(share, "establish")))
 
 
 # ------------------------------------------------------------- repackage

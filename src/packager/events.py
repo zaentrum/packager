@@ -22,7 +22,9 @@ Go hub exactly):
          "step": <str>, "status": <str>, "occurredAt": <RFC3339>,
          "source": <str>}
     Consumers REQUIRE only `itemId`; every other field is tolerated /
-    ignored so the schema can grow without a lock-step deploy.
+    ignored so the schema can grow without a lock-step deploy. A takein
+    job (library v2) comes on the same topic with `"step": "takein"`
+    (is_takein); any other event is a package job.
 
   * The extras of a title (extras.py) have a chain of their own, on
     `<prefix>catalog.extra.transcoded`, keyed by extraId. Their envelope
@@ -111,6 +113,15 @@ def parse_envelope(raw_value: bytes | str | None) -> dict[str, Any]:
     except (ValueError, UnicodeDecodeError):
         return {}
     return envelope if isinstance(envelope, dict) else {}
+
+
+def is_takein(envelope: dict[str, Any]) -> bool:
+    """True for a takein job (library v2): the catalog sends it on the
+    `transcoded` topic too, with "step": "takein", for a title whose
+    original goes into its version folder with no package — its transcode
+    refused, its transcode or package out of attempts, an admin's word.
+    It has no transcode, so no handoff."""
+    return envelope.get("step") == "takein"
 
 
 def is_retry(envelope: dict[str, Any]) -> bool:

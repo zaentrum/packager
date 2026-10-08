@@ -1,6 +1,7 @@
 """The consumer loop against a fake broker and a fake catalog API: which
 `transcoded` events package the item, and which the worker only acks —
-a redelivery, or a retry the catalog sent before the step finished.
+a redelivery, or a retry the catalog sent before the step finished — and
+which takein jobs, sent on the same topic, take the item in.
 
 The real KatalogClient talks to the fake catalog through an httpx mock
 transport, so the guard reads the step statuses exactly as it does in
@@ -18,7 +19,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from packager import events, worker
-from packager.events import is_retry, parse_envelope
+from packager.events import is_retry, is_takein, parse_envelope
 from packager.katalog import KatalogClient
 
 ITEM = "7a1c0de0-0000-4000-8000-000000000002"
@@ -101,6 +102,15 @@ def retry() -> dict:
     return event(status="retry", source="retry")
 
 
+def takein() -> dict:
+    """A takein job, as the catalog sends it on the same topic."""
+    return event(step="takein", status="pending", source="katalog-manager")
+
+
+def takein_retry() -> dict:
+    return event(step="takein", status="retry", source="retry")
+
+
 def run(monkeypatch: pytest.MonkeyPatch, events: list[dict],
         steps: dict[str, str]) -> tuple[Broker, Catalog, list[str]]:
     stop = threading.Event()
@@ -110,6 +120,8 @@ def run(monkeypatch: pytest.MonkeyPatch, events: list[dict],
     monkeypatch.setattr(worker, "build_consumer", lambda **_kw: broker)
     monkeypatch.setattr(worker, "_process_one",
                         lambda item, _client, _options=None: packaged.append(item.id))
+    monkeypatch.setattr(worker, "_process_takein",
+                        lambda item, _client: packaged.append(f"takein:{item.id}"))
     client = KatalogClient(BASE, f"{BASE}/token", "worker", "not-a-secret")
     client._http = httpx.Client(transport=httpx.MockTransport(catalog))
     worker.run_worker(client, "broker.test:9092", "packager-workers",
@@ -205,6 +217,52 @@ def test_the_handover_of_the_run_that_finished_the_transcode_is_packaged(
     assert broker.committed == [0, 1]
 
 
+@pytest.mark.parametrize("status", ["done", "not_applicable", "skipped"])
+@pytest.mark.parametrize("make", [takein, takein_retry])
+def test_a_finished_takein_is_not_taken_in_again(
+    monkeypatch: pytest.MonkeyPatch, status: str, make,
+) -> None:
+    # Its guard is the takein step's, whatever the package step says.
+    with capture_logs() as logs:
+        broker, catalog, packaged = run(monkeypatch, [make()],
+                                        {"takein": status, "package": "failed"})
+    assert packaged == []
+    assert catalog.writes == []
+    assert broker.committed == [0]
+    said = [e for e in logs if e.get("item_id") == ITEM]
+    assert [(e["event"], e["status"], e["step"]) for e in said] == [
+        ("packager.retry.already_finished" if make is takein_retry
+         else "packager.item.already_done", status, "takein")]
+
+
+@pytest.mark.parametrize("steps", [
+    {}, {"takein": "pending"}, {"takein": "failed"}, {"takein": "in_progress"},
+    # A takein has no transcode: no handover of one is stale.
+    {"transcode": "failed", "takein": "pending"}, {"transcode": "pending"},
+    {"transcode": "in_progress", "takein": "failed"},
+    # The package step is a package job's.
+    {"package": "done", "takein": "pending"}])
+@pytest.mark.parametrize("make", [takein, takein_retry])
+def test_an_unfinished_takein_is_taken_in(
+    monkeypatch: pytest.MonkeyPatch, steps: dict[str, str], make,
+) -> None:
+    broker, _catalog, packaged = run(monkeypatch, [make()], steps)
+    assert packaged == [f"takein:{ITEM}"]
+    assert broker.committed == [0]
+
+
+@pytest.mark.parametrize(("steps", "packaged"), [
+    ({"takein": "done", "package": "pending"}, [ITEM]),
+    ({"takein": "pending", "package": "done"}, []),
+    ({"takein": "done", "transcode": "in_progress", "package": "pending"}, [])])
+def test_a_package_job_keeps_its_own_guards(
+    monkeypatch: pytest.MonkeyPatch, steps: dict[str, str], packaged: list[str],
+) -> None:
+    broker, _catalog, got = run(monkeypatch, [event()], steps)
+    assert got == packaged
+    assert broker.committed == [0]
+
+
 def test_consumer_keeps_its_partition_through_a_long_package(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -223,6 +281,10 @@ def test_consumer_keeps_its_partition_through_a_long_package(
 def test_retry_marker() -> None:
     assert is_retry(parse_envelope(json.dumps(retry()).encode()))
     assert not is_retry(parse_envelope(json.dumps(event()).encode()))
+    assert is_takein(parse_envelope(json.dumps(takein()).encode()))
+    assert is_retry(parse_envelope(json.dumps(takein_retry()).encode()))
+    assert not is_takein(parse_envelope(json.dumps(event()).encode()))
+    assert not is_takein(parse_envelope(json.dumps(event(step="takein ")).encode()))
     assert parse_envelope(b"not json") == {}
     assert parse_envelope(b"[1, 2]") == {}
     assert parse_envelope(None) == {}

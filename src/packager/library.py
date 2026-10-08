@@ -20,8 +20,9 @@ package made from it, or both. What a run writes there is its worker
 record's build mode (katalog.BUILD_MODES): `establish` a version with its
 package and its original, which is renamed into the staged folder last,
 under the name the record gives it, before that folder is renamed into
-place; `repackage` — and a record without a mode — a version with a
-package and no original, which stays where it is.
+place; `takein` a version with its original and no package, and so no
+chain (take_in); `repackage` — and a record without a mode — a version
+with a package and no original, which stays where it is.
 
 A package closes one chain, bottom up: checksums.sha256 lists the record
 (version.json, extra.json) and every package file, package.json holds the
@@ -326,18 +327,19 @@ class Placed:
     named mapped to the rendition made from it. reported_again: the folder
     was in place already, from a run whose handover was lost. original:
     where the original is in the version folder, when the run renamed it
-    there."""
+    there. A version taken in has no package: no body, no package."""
     folder: Path
-    body: bytes
-    package: dict[str, Any]
+    body: bytes | None
+    package: dict[str, Any] | None
     sidecars: list[dict[str, Any]]
     reported_again: bool = False
     original: Path | None = None
 
     @property
-    def complete(self) -> str:
-        """What .complete holds: sha256:<hex of package.json>."""
-        return rec.sha_bytes(self.body)
+    def complete(self) -> str | None:
+        """What .complete holds: sha256:<hex of package.json>; None for a
+        version taken in."""
+        return rec.sha_bytes(self.body) if self.body is not None else None
 
 
 @dataclass(frozen=True)
@@ -716,20 +718,112 @@ def version_payload(lib: ItemLibrary, placed: Placed, source: dict[str, Any]) ->
     """POST /api/items/{id}/packaging-complete, v2 (contract section 2.5),
     with the original's place in the version folder ({path, name}) when the
     run renamed it there: the catalog moves the item's path to it as it
-    records the version."""
-    payload = {
-        "layout": "v2",
-        "versionId": lib.build.version_id, "packageId": placed.package.get("packageId"),
-        "versionDir": lib.build.version_dir,
-        "complete": placed.complete,
-        "sourceId": lib.source.source_id, "sourceRecorded": True,
-        "package": placed.package,
-        "sidecars": placed.sidecars,
-        "source": source,
-    }
+    records the version. A version taken in (takenIn) names no package:
+    the catalog records it without one, and the item plays from its
+    original."""
+    if placed.package is None:
+        payload: dict[str, Any] = {
+            "layout": "v2",
+            "versionId": lib.build.version_id, "versionDir": lib.build.version_dir,
+            "sourceId": lib.source.source_id, "sourceRecorded": True,
+            "takenIn": True,
+            "sidecars": [],
+            "source": source,
+        }
+    else:
+        payload = {
+            "layout": "v2",
+            "versionId": lib.build.version_id, "packageId": placed.package.get("packageId"),
+            "versionDir": lib.build.version_dir,
+            "complete": placed.complete,
+            "sourceId": lib.source.source_id, "sourceRecorded": True,
+            "package": placed.package,
+            "sidecars": placed.sidecars,
+            "source": source,
+        }
     if placed.original is not None:
         payload["original"] = {"path": str(placed.original), "name": placed.original.name}
     return payload
+
+
+# ---------------------------------------------------------------- takein
+
+def take_in(item: ClaimedItem) -> Placed:
+    """Take an item's original into a version folder of its own, with no
+    package (build mode takein), in package_version's steps but those of
+    the package: the staging folder; the source record in
+    <stagingDir>/source/ unless the source is recorded already;
+    version.json in <stagingDir>/version/; the source renamed into the
+    record, the original into the staged version folder, last, under the
+    name the worker record gives it, and that folder into the record.
+
+    A version taken in has no chain — no checksums.sha256, no
+    package.json, no .complete: nothing covers its version.json until a
+    package is added to it, and the original's fixity is its source
+    record's. A version folder already there as a takein leaves it is the
+    work of a run whose handover was lost, and is reported again; any
+    other fails the run, and is never written over."""
+    lib = _library(item)
+    if lib.build.mode != TAKEIN:
+        raise PackageError(f"the worker record's build mode is {lib.build.mode!r}, not takein")
+    vdir = Path(lib.build.version_dir)
+    sdir = Path(lib.source.record_dir)
+    staging = Path(lib.build.staging_dir)
+    if not restore_original(staging):
+        raise PackageError(kept(staging))
+    if os.path.lexists(vdir):
+        return _taken_in_there(item)
+    if os.path.lexists(sdir) and not (sdir / SUMS).is_file():
+        raise PackageError(_unfinished(lib))
+    original = Path(item.path)
+    _outside_the_record(original, lib)
+    fixity = _check_original(original, lib.source.size_bytes, lib.source.qh1, "the original")
+    open_staging(staging)
+    try:
+        (staging / "version").mkdir()
+        probe = records.probe_original(original)
+        now = utc_now()
+        source, _copies, staged_source = _source_of(item, lib, staging, probe, fixity, now)
+        (staging / "version" / VERSION_RECORD).write_bytes(
+            rec.json_bytes(records.version_record(lib, source, probe, now)))
+        if not _into_the_record(item, lib, staging, staged_source):
+            return _taken_in_there(item)
+    except Exception:
+        remove_staging(staging)
+        raise
+    log.info("packager.library.taken_in", item_id=item.id, version_id=lib.build.version_id,
+             source_recorded_now=staged_source, original=lib.build.original_name)
+    return Placed(vdir, None, None, [], original=vdir / str(lib.build.original_name))
+
+
+def _taken_in_there(item: ClaimedItem) -> Placed:
+    """A version folder in place already, for a takein: reported again as
+    it is when it holds this version's record and the original it keeps,
+    the file the catalog recorded, and nothing else; else the run fails.
+    Never written over."""
+    lib = _library(item)
+    vid, sid = lib.build.version_id, lib.source.source_id
+    vdir = Path(lib.build.version_dir)
+    try:
+        version = json.loads((vdir / VERSION_RECORD).read_text())
+        entries = sorted(os.listdir(vdir))
+    except (OSError, ValueError) as e:
+        raise PackageError(f"versions/{vid} is there but can't be read: {e}") from e
+    if not isinstance(version, dict) or version.get("versionId") != vid \
+            or sid not in (version.get("sourceIds") or []):
+        raise PackageError(f"versions/{vid} holds the record of another version or source")
+    if entries != sorted([VERSION_RECORD, str(lib.build.original_name)]):
+        raise PackageError(f"versions/{vid} is there but not the version a takein leaves "
+                           f"(it holds {', '.join(entries) or 'nothing'}): a version folder "
+                           f"is never written over")
+    original = _original_in(vdir, version, lib)
+    if original is None:
+        raise PackageError(f"versions/{vid} keeps no original {lib.build.original_name}: a "
+                           f"version folder is never written over")
+    if not (Path(lib.source.record_dir) / SUMS).is_file():
+        raise PackageError(f"versions/{vid} is there, but its source sources/{sid} is not")
+    log.info("packager.library.reported_again", item_id=item.id, version_id=vid, taken_in=True)
+    return Placed(vdir, None, None, [], reported_again=True, original=original)
 
 
 # ---------------------------------------------------------------- extras
