@@ -4,13 +4,15 @@ renames the original into the version folder it builds, last, and puts
 it back when the run fails after that; a run that dies with the original
 in its staging folder leaves it to the next run, or to the startup sweep,
 which put it back; a handover that was lost is made again from the version
-in the record, the original's new place in it; a repackage builds a new
-version and leaves the original where it is. The real runs are in
-test_library_modes_real.py."""
+in the record, the original's new place in it; an add puts its package
+into the version taken in, beside the subtitles the catalog attached to
+it; a repackage builds a new version and leaves the original where it is.
+The real runs are in test_library_modes_real.py."""
 
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import time
@@ -76,6 +78,34 @@ def go(body: dict, catalog: Catalog) -> None:
 
 def _ino(path: Path) -> int:
     return path.stat().st_ino
+
+
+# Subtitles the catalog attaches to a version, once it is taken in or
+# packaged: each in its subs/, named by its bytes, its language and flags.
+ATTACHED = {"de": "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHallo.\n",
+            "zh-hans.forced.sdh": "WEBVTT\n\n00:00:03.000 --> 00:00:04.000\n[Music]\n"}
+
+
+def _attach(vdir: Path) -> dict[str, tuple[int, int]]:
+    """Attach the subtitles to the version folder vdir as the catalog does.
+    Returns each file's name with its inode and its modification time."""
+    out = {}
+    (vdir / "subs").mkdir(exist_ok=True)
+    for tail, text in ATTACHED.items():
+        data = text.encode()
+        path = vdir / "subs" / f"attached-{hashlib.sha256(data).hexdigest()}.{tail}.vtt"
+        path.write_bytes(data)
+        out[path.name] = (path.stat().st_ino, path.stat().st_mtime_ns)
+    return out
+
+
+def _untouched(vdir: Path, attached: dict[str, tuple[int, int]]) -> None:
+    """The subtitles attached to the version are where they were, as they
+    were, their names their bytes'."""
+    for name, (ino, mtime) in attached.items():
+        path = vdir / "subs" / name
+        assert (path.stat().st_ino, path.stat().st_mtime_ns) == (ino, mtime)
+        assert rec.attached_subtitle(f"subs/{name}") == rec.sha_file(str(path)).split(":", 1)[1]
 
 
 def _left(share: Share) -> list[str]:
@@ -538,7 +568,33 @@ def test_a_refused_takein_keeps_its_version_and_reports_it_again(
     assert catalog.handovers[0]["takenIn"] is True
 
 
-@pytest.mark.parametrize("left", ["a package", "another file", "no original"])
+def test_a_takein_reported_again_finds_its_version_with_the_subtitles_attached_to_it(
+    binaries: Binaries, share: Share,
+) -> None:
+    body = record(share, "takein")
+    catalog = Catalog()
+
+    def dies(_payload: dict) -> None:
+        raise _Killed
+
+    catalog.on_handover = dies
+    with pytest.raises(_Killed):
+        go(body, catalog)
+    first = catalog.handovers[0]
+    # The catalog took the version, and attached subtitles to it, before the
+    # run heard its answer.
+    attached = _attach(share.version_dir)
+    placed = share.tree(share.item_dir)
+    catalog = Catalog()
+    go(body, catalog)
+    assert catalog.statuses == ["in_progress", "done"] and catalog.handovers == [first]
+    assert share.tree(share.item_dir) == placed and binaries.builds == 0
+    assert sorted(p.name for p in (share.version_dir / "subs").iterdir()) == sorted(attached)
+    assert not share.staging.exists() and _left(share) == []
+
+
+@pytest.mark.parametrize("left", ["a package", "another file", "no original",
+                                  "a subtitle no catalog attached"])
 def test_a_version_folder_that_is_not_a_takeins_is_never_written_over(
     binaries: Binaries, share: Share, left: str,
 ) -> None:
@@ -549,6 +605,9 @@ def test_a_version_folder_that_is_not_a_takeins_is_never_written_over(
         (vdir / "hls").mkdir()
     elif left == "another file":
         (vdir / "notes.txt").write_text("x")
+    elif left == "a subtitle no catalog attached":
+        _attach(vdir)
+        (vdir / "subs" / "0.vtt").write_text("WEBVTT\n")
     else:
         (vdir / NAME).rename(share.original)      # back at its arrival
     before = share.tree(vdir)
@@ -781,7 +840,7 @@ def test_an_add_whose_version_record_changes_meanwhile_adds_nothing(
 
 
 @pytest.mark.parametrize("case", ["no folder", "not its original", "another file",
-                                  "another version", "no source"])
+                                  "a subtitle no catalog attached", "another version", "no source"])
 def test_a_package_is_added_only_to_the_version_that_holds_its_original(
     binaries: Binaries, share: Share, case: str,
 ) -> None:
@@ -794,6 +853,9 @@ def test_a_package_is_added_only_to_the_version_that_holds_its_original(
             add["path"] = str(share.original)
         elif case == "another file":
             (share.version_dir / "notes.txt").write_text("x")
+        elif case == "a subtitle no catalog attached":
+            _attach(share.version_dir)
+            (share.version_dir / "subs" / "notes.vtt").write_text("x")
         elif case == "another version":
             add["library"]["build"]["versionId"] = NEXT_VERSION
             add["library"]["build"]["versionDir"] = str(share.version_dir.parent / NEXT_VERSION)
@@ -812,9 +874,141 @@ def test_a_package_is_added_only_to_the_version_that_holds_its_original(
         "not its original": f"the original {share.original} is not one versions/{VERSION} "
                             f"keeps (original.mkv)",
         "another file": f"versions/{VERSION} holds what no version folder does (notes.txt)",
+        "a subtitle no catalog attached": f"versions/{VERSION} holds part of a package (subs) "
+                                          f"and no .complete",
         "another version": f"versions/{NEXT_VERSION} holds the record of another version",
         "no source": f"versions/{VERSION} is there, but its source sources/{SOURCE} is not",
     }[case] in catalog.error
+
+
+def test_an_add_puts_its_package_beside_the_subtitles_attached_to_its_version(
+    binaries: Binaries, share: Share,
+) -> None:
+    add = _taken_in(share)
+    vdir = share.version_dir
+    attached = _attach(vdir)
+    version = (vdir / "version.json").read_bytes()
+    catalog = Catalog()
+    go(add, catalog)
+    assert catalog.statuses == ["in_progress", "done"] and binaries.builds == 1
+    assert sorted(p.name for p in vdir.iterdir()) == [
+        ".complete", "checksums.sha256", "hls", NAME, "package.json", "subs", "trickplay",
+        "version.json"]
+    # The package's subtitle went in beside the attached ones, which are as
+    # they were: no record names them, and no chain lists them.
+    assert sorted(p.name for p in (vdir / "subs").iterdir()) == sorted(["0.vtt", *attached])
+    _untouched(vdir, attached)
+    sums = (vdir / "checksums.sha256").read_text()
+    assert "  subs/0.vtt\n" in sums and not any(name in sums for name in attached)
+    package_text = (vdir / "package.json").read_text()
+    assert not any(name in package_text for name in attached)
+    assert json.loads(package_text)["checksums"]["files"] == len(sums.splitlines())
+    assert (vdir / "version.json").read_bytes() == version
+    # The chain holds with them, in full too.
+    assert library.verify_chain(vdir, "version.json") is None
+    assert rec.chain_problems(str(vdir), "version.json", full=True) == []
+    [payload] = catalog.handovers
+    assert payload["sidecars"] == [{"subtitleAssetId": ASSET, "rendition": "sub0",
+                                    "path": "subs/0.vtt"}]
+    assert not share.staging.exists() and _left(share) == []
+    # Its handover lost, the next run reports the version as it is.
+    catalog = Catalog()
+    go(add, catalog)
+    assert catalog.statuses == ["in_progress", "done"] and catalog.handovers == [payload]
+    assert binaries.builds == 1
+    _untouched(vdir, attached)
+
+
+def test_a_subtitle_of_the_same_name_in_the_version_is_never_written_over(
+    binaries: Binaries, share: Share,
+) -> None:
+    add = _taken_in(share)
+    vdir = share.version_dir
+    attached = _attach(vdir)
+    # A file named as the package's subtitle arrives in the version's subs/
+    # while the package is built.
+    binaries.hooks.append(lambda _out: (vdir / "subs" / "0.vtt").write_text("WEBVTT\n"))
+    catalog = Catalog()
+    go(add, catalog)
+    assert catalog.statuses == ["in_progress", "failed"] and binaries.builds == 1
+    assert (f"versions/{VERSION}/subs/0.vtt is there already: a version folder is never "
+            f"written over") in catalog.error
+    # Nothing of the package stays in the version, nor goes over a file there.
+    assert sorted(p.name for p in vdir.iterdir()) == [NAME, "subs", "version.json"]
+    assert (vdir / "subs" / "0.vtt").read_text() == "WEBVTT\n"
+    _untouched(vdir, attached)
+    # Run again, it finds the file in the version's subs/ a part of a package
+    # its staging folder holds again: refused, the version as it was.
+    binaries.hooks.clear()
+    before = share.tree(vdir)
+    catalog = Catalog()
+    go(add, catalog)
+    assert catalog.statuses == ["in_progress", "failed"] and binaries.builds == 1
+    assert f"versions/{VERSION} holds part of a package (subs) and no .complete" in catalog.error
+    assert share.tree(vdir) == before
+
+
+@pytest.mark.parametrize("fails_at", ["subs/1.vtt", ".complete"])
+def test_an_add_whose_renames_fail_beside_attached_subtitles_moves_back_what_they_moved(
+    binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch, fails_at: str,
+) -> None:
+    add = _taken_in(share)
+    vdir = share.version_dir
+    attached = _attach(vdir)
+    taken_in = share.tree(vdir)
+
+    def second_subtitle(out: Path) -> None:
+        (out / "subs").mkdir(exist_ok=True)
+        (out / "subs" / "1.vtt").write_text("WEBVTT\n\n")
+
+    binaries.hooks.append(second_subtitle)
+    real = _dies_renaming(share, monkeypatch, fails_at, OSError(errno.EIO, "Input/output error"))
+    catalog = Catalog()
+    go(add, catalog)
+    monkeypatch.setattr(os, "rename", real)
+    assert catalog.statuses == ["in_progress", "failed"] and "Input/output error" in catalog.error
+    # The version as the takein left it, with the subtitles attached to it.
+    assert share.tree(vdir) == taken_in
+    _untouched(vdir, attached)
+    assert not share.staging.exists()
+    catalog = Catalog()
+    go(add, catalog)
+    assert catalog.statuses == ["in_progress", "done"] and binaries.builds == 2
+    subs = sorted(p.name for p in (vdir / "subs").iterdir())
+    assert subs == sorted(["0.vtt", "1.vtt", *attached])
+
+
+@pytest.mark.parametrize("dies_at", ["subs/0.vtt", "subs/1.vtt", "trickplay", ".complete"])
+def test_an_add_that_died_putting_its_subtitles_beside_attached_ones_is_completed(
+    binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch, dies_at: str,
+) -> None:
+    add = _taken_in(share)
+    vdir = share.version_dir
+    attached = _attach(vdir)
+    def second_subtitle(out: Path) -> None:
+        """A package of two subtitles, so that a run can die between them."""
+        (out / "subs").mkdir(exist_ok=True)
+        (out / "subs" / "1.vtt").write_text("WEBVTT\n\n")
+
+    binaries.hooks.append(second_subtitle)
+    real = _dies_renaming(share, monkeypatch, dies_at, _Killed())
+    with pytest.raises(_Killed):
+        go(add, Catalog())
+    monkeypatch.setattr(os, "rename", real)
+    assert not (vdir / ".complete").exists()
+    _untouched(vdir, attached)
+    catalog = Catalog()
+    go(add, catalog)
+    assert catalog.statuses == ["in_progress", "done"]
+    assert binaries.builds == 1                         # completed, not built again
+    subs = sorted(p.name for p in (vdir / "subs").iterdir())
+    assert subs == sorted(["0.vtt", "1.vtt", *attached])
+    _untouched(vdir, attached)
+    assert library.verify_chain(vdir, "version.json") is None
+    assert rec.chain_problems(str(vdir), "version.json", full=True) == []
+    [payload] = catalog.handovers
+    assert payload["complete"] == (vdir / ".complete").read_text().strip()
+    assert not share.staging.exists() and _left(share) == []
 
 
 # ------------------------------------------------------------- repackage

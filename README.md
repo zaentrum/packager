@@ -452,7 +452,15 @@ of it, closes the chain over the two, then renames `hls/`, `subs/` and
 `trickplay/` into the version folder, then `checksums.sha256`,
 `package.json` and `.complete`, in that order, and checks the chain there;
 a rename that fails moves back what it moved. The version folder must be
-the one that keeps the original the record names, and hold nothing else.
+the one that keeps the original the record names, and hold nothing else
+but the subtitles the catalog attached to the version since it was taken
+in: each in its `subs/`, named by its bytes
+(`attached-<sha256>.<lang>[.forced][.sdh].vtt`), named by no record and
+listed by no chain. A `subs/` of them alone is no part of a package; the
+package's subtitles go into it one by one, beside them and never over a
+file of the same name, and nothing the packager does moves or removes
+one. A takein reported again finds its version as it left it, or with
+them.
 
 **The original** is renamed, never copied: from its arrival into the
 staged version folder as the last step before that folder is renamed into
