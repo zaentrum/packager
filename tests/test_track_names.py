@@ -91,6 +91,22 @@ def _name(language: str, title: str) -> str:
     ("chi", "Simplified Chinese", "Chinese (Simplified)"),
     ("chi", "繁體中文\uff08台灣\uff09", "Chinese (Traditional, Taiwan)"),
     ("chi", "中文", "Chinese"),
+    # The language's name in itself is the language, never a region of the
+    # same name ("Suomi" is Finnish, not Finland); a part that only names
+    # the language again goes.
+    ("fin", "Suomi", "Finnish"),
+    ("est", "Eesti", "Estonian"),
+    ("tha", "ไทย", "Thai"),
+    ("ind", "Indonesia", "Indonesian"),
+    ("lao", "ລາວ", "Lao"),
+    ("aze", "Azərbaycan", "Azerbaijani"),
+    ("fi-fi", "Suomi", "Finnish (Finland)"),
+    ("fin", "Suomi · Kommentti", "Finnish · Kommentti"),
+    ("fin", "Suomi Kommentti", "Finnish · Kommentti"),
+    ("chi", "Chinese (Simplified) · 中文", "Chinese (Simplified)"),
+    ("zh-Hans", "Chinese (Simplified) · 中文", "Chinese (Simplified)"),
+    ("por", "Portuguese (Brazil) · Português", "Portuguese (Brazil)"),
+    ("ger", "German · Deutsch", "German"),
     # Another region than the tag's stays a word; a region among other
     # words is a word.
     ("es-es", "Latinoamérica", "Spanish (Spain) · Latinoamérica"),
@@ -130,6 +146,8 @@ def test_the_51_group_and_a_forced_subtitle() -> None:
         "Portuguese (Brazil) · Forced"
     assert sub({"language": "chi", "title": "zh-Hans", "forced": False}) == \
         "Chinese (Simplified)"
+    assert sub({"language": "tha", "title": "ไทย (Forced)", "forced": True}) == \
+        "Thai · Forced"
 
 
 @pytest.mark.parametrize(("tag", "script", "region", "name"), [
@@ -175,3 +193,5 @@ def test_the_cldr_tables_name_what_the_clients_name() -> None:
     assert "SV" not in regions.LANGUAGE_REGIONS.get("sv", frozenset())
     assert "CA" not in regions.LANGUAGE_REGIONS.get("ca", frozenset())
     assert regions.DIALECTS["pt"]["brazilian portuguese"] == "BR"
+    assert regions.OWN_NAMES["fi"] == ("suomi",)
+    assert regions.OWN_NAMES["zh"] == ("中文",)

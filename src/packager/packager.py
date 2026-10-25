@@ -1924,8 +1924,8 @@ def _title_words(title: str | None, language: str | None) -> str:
     if not words or _NUMBERED.match(words) or _is_language_code(words, language):
         return ""
     if _lang_key(language) != "und":
-        name = _language_name(language)
-        for said in (name, _ENDONYMS.get(name, "")):
+        names = _names_of(_language_parts(language)[0]) or (_language_name(language),)
+        for said in names:
             head, rest = words[:len(said)], words[len(said):]
             if said and head.casefold() == said.casefold() and _QUALIFIER_START.match(rest):
                 words = _LEADING_SEPARATORS.sub("", rest).strip()
@@ -2003,16 +2003,35 @@ def _folded(text: str) -> str:
     return _ACCENTS.sub("", unicodedata.normalize("NFD", text)).lower().strip()
 
 
+def _names_of(key: str) -> tuple[str, ...]:
+    """What the language `key` is called, the longest first: its English
+    name, and its name in itself as a title is likely to say it
+    (_ENDONYMS) and as CLDR gives it (regions.OWN_NAMES): ('Finnish',
+    'Suomi') for 'fi', ('Bahasa Indonesia', 'Indonesian', 'Indonesia') for
+    'id'. Nothing for a key the table doesn't know."""
+    name = _LANGUAGE_NAMES.get(key)
+    if not name:
+        return ()
+    names: dict[str, str] = {}
+    for said in (name, _ENDONYMS.get(name, ""), *regions.OWN_NAMES.get(key, ())):
+        if said:
+            names.setdefault(_folded(said), said)
+    return tuple(sorted(names.values(), key=len, reverse=True))
+
+
 def _piece_says(piece: str, key: str, bracketed: bool) -> tuple[str, str] | None:
     """The script and the region a whole piece of a title - a part, or a
     bracket - names of the language `key`, each '' where it names none
-    (("", "") for a piece that is only a code of the language: "eng",
-    "pt"); None for a piece that names neither. As the clients read one
-    (chino-web's pieceSays): a code of the language ("PT-BR", "zh-Hans",
-    "es-419"); in brackets, a region's code that is one of the language's
-    regions ("Português (BR)": regions.LANGUAGE_REGIONS; "English (BD)"
-    names none); words that name a region or a script (_words_say), alone
-    or with the language's name ("Español Latino", "Chinese Simplified")."""
+    (("", "") for a piece that only names the language again: a code of
+    it, "eng", "pt", or its name, "English", "Suomi", "中文"); None for a
+    piece that names neither. As the clients read one (chino-web's
+    pieceSays): a code of the language ("PT-BR", "zh-Hans", "es-419"); in
+    brackets, a region's code that is one of the language's regions
+    ("Português (BR)": regions.LANGUAGE_REGIONS; "English (BD)" names
+    none); the language's name (_names_of), before any region, so
+    "Suomi" on a Finnish track is the language, not Finland; words that
+    name a region or a script (_words_say), alone or with the language's
+    name ("Español Latino", "Chinese Simplified")."""
     own_regions = regions.LANGUAGE_REGIONS.get(key, frozenset())
     if bracketed and _BRACKETED_REGION.match(piece) and piece in own_regions:
         return "", piece
@@ -2021,14 +2040,17 @@ def _piece_says(piece: str, key: str, bracketed: bool) -> tuple[str, str] | None
         if said is not None and said[0] == key:
             return said[1], said[2]
     folded = _folded(piece)
+    names = [_folded(name) for name in _names_of(key)]
+    if folded in names:
+        return "", ""
     said = _words_say(folded, key)
-    if said is None and key in _LANGUAGE_NAMES:
-        name = _LANGUAGE_NAMES[key]
-        for own in {_folded(name), _folded(_ENDONYMS.get(name, name))}:
-            if folded.startswith(own + " "):
-                said = said or _words_say(folded[len(own) + 1:], key)
-            if folded.endswith(" " + own):
-                said = said or _words_say(folded[:-len(own) - 1], key)
+    for own in names:
+        if said is not None:
+            break
+        if folded.startswith(own + " "):
+            said = _words_say(folded[len(own) + 1:], key)
+        if said is None and folded.endswith(" " + own):
+            said = _words_say(folded[:-len(own) - 1], key)
     return said
 
 
@@ -2058,8 +2080,9 @@ def _read_title(title: str, language: str | None) -> tuple[str, str, str]:
     "ES-419", "Português (BR)", "Portuguese (Brazil)") goes from the title,
     its script and region taken, where they agree with the track's tag and
     with what the title named before; one that names another stays as it
-    is ("PT-BR" on a 'pt-pt' track). A part or a bracket that is only a
-    code of the language goes too ("Svenska (SV)", "Commentary (eng)"). A
+    is ("PT-BR" on a 'pt-pt' track). A part or a bracket that only names
+    the language again, by a code or a name, goes too ("Svenska (SV)",
+    "Commentary (eng)", "Chinese (Simplified) · 中文", "Suomi"). A
     track of no known language reads nothing. Returns (title, script,
     region): the title as it was where nothing was read."""
     key, own_script, own_region = _language_parts(language)

@@ -131,14 +131,17 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   with: "English · Commentary", "English · SDH", "German · Kommentar", at
   most 40 characters. A title that names a format ("AC3 5.1 @ 640 Kbps",
   "DTS-HD MA"), numbers the track ("Track 0") or repeats the language
-  ("English", "Deutsch", "eng", "Svenska (SV)") adds nothing; one that
-  names another region than the tag's stays ("Portuguese (Portugal) ·
-  PT-BR"); a track of unknown language is called what its title says,
-  else "Unknown". A forced subtitle whose name doesn't say so gets
-  "(forced)". NAMEs are unique within a group: a second "English" is
-  "English (2)". The names of regions and scripts, and which regions are
-  a language's own, are CLDR's as the clients' `Intl.DisplayNames` gives
-  them: `src/packager/regions.py`, written by `node scripts/regions.mjs`.
+  ("English", "Deutsch", "eng", "Svenska (SV)", "Chinese (Simplified) ·
+  中文") adds nothing — the language's name in itself is the language,
+  never a region of the same name ("Suomi" is "Finnish", not "Finnish
+  (Finland)"); one that names another region than the tag's stays
+  ("Portuguese (Portugal) · PT-BR"); a track of unknown language is
+  called what its title says, else "Unknown". A forced subtitle whose
+  name doesn't say so gets "(forced)". NAMEs are unique within a group: a
+  second "English" is "English (2)". The names of regions, scripts and
+  languages, and which regions are a language's own, are CLDR's as the
+  clients' `Intl.DisplayNames` gives them: `src/packager/regions.py`,
+  written by `node scripts/regions.mjs`.
   A package keeps the NAMEs it was made with.
 
 **Metadata.** A package carries none of the original's global metadata:

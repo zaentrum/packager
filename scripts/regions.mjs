@@ -1,8 +1,10 @@
 // Writes src/packager/regions.py: the names a rendition's NAME gives a
-// language's script and region, and the regions that are a language's own,
+// language's script and region, the regions that are a language's own, and
+// the names a title may give a language, a region or a regional form of it,
 // from CLDR as Node's Intl gives them - the data chino-web names tracks by
 // (src/lib/languages.ts: Intl.DisplayNames with languageDisplay 'standard',
-// regionCodesOf). Python has no CLDR, so the packager keeps this copy.
+// regionCodesOf, languageNames, regionsOf, dialectsOf). Python has no CLDR,
+// so the packager keeps this copy.
 //
 //   node scripts/regions.mjs > src/packager/regions.py
 //
@@ -171,6 +173,27 @@ for (const base of bases) {
   if (found.size) own[base] = [...found].sort();
 }
 
+// What each language is called in itself, as Intl names it in the
+// language's own locale ("suomi" for "fi", "Indonesia" for "id", "ไทย" for
+// "th"): a title that is only this names the language again, never a
+// region of the same name (chino-web's namesLanguage, read before any
+// region). None where Intl has no locale for the language, which would
+// name it in the machine's own language instead.
+function localesOf(base) {
+  return (base === 'zh' ? ['zh-Hans', 'zh-Hant'] : [base]).filter(
+    (locale) => Intl.DisplayNames.supportedLocalesOf([locale]).length,
+  );
+}
+const ownNames = {};
+for (const base of bases) {
+  const names = [];
+  for (const locale of localesOf(base)) {
+    const name = intlName(base, locale, 'standard');
+    if (name && !names.includes(name)) names.push(name);
+  }
+  if (names.length) ownNames[base] = names;
+}
+
 // A language's own regions by their names in the language itself, long and
 // short, where the English name is another: "brasil" → "BR" for "pt",
 // "latinoamerica" → "419" for "es", "台灣" → "TW" for "zh".
@@ -201,7 +224,8 @@ const lines = [];
 // CLDR's names hold letters ruff takes for others ("Côte d’Ivoire", Cyrillic).
 lines.push('# ruff: noqa: RUF001');
 lines.push('"""The names a rendition\'s NAME gives a language\'s script and region,');
-lines.push('and the regions that are a language\'s own: CLDR\'s, as the clients\'');
+lines.push('the regions that are a language\'s own, and the names a title may give a');
+lines.push('language, a region or a regional form of it: CLDR\'s, as the clients\'');
 lines.push('Intl.DisplayNames gives them (languageDisplay "standard"), written by');
 lines.push('scripts/regions.mjs. Do not edit by hand.');
 lines.push('');
@@ -238,6 +262,14 @@ lines.push('# short, lower-cased and without accents: "Portuguese (Brazil)", "En
 lines.push('REGION_WORDS = {');
 for (const [name, code] of Object.entries(regionWords).sort(([a], [b]) => (a < b ? -1 : 1))) {
   lines.push(`    ${py(name)}: ${py(code)},`);
+}
+lines.push('}');
+lines.push('');
+lines.push('# What a language is called in itself, by the language\'s key: "suomi",');
+lines.push('# "Indonesia". A title that is only this names the language, not a region.');
+lines.push('OWN_NAMES = {');
+for (const [base, names] of Object.entries(ownNames).sort(([a], [b]) => (a < b ? -1 : 1))) {
+  lines.push(`    ${py(base)}: (${names.map(py).join(', ')},),`);
 }
 lines.push('}');
 lines.push('');
