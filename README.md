@@ -120,16 +120,26 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   visible rendition of each language, so commentary is never
   auto-picked.
 - A rendition's NAME is the English name of its language: "English",
-  "German", "No dialogue" for `zxx`, "Unknown" for `und`; " 5.1" in the
-  5.1 group; then what the source's title says besides, by the rule the
-  clients label tracks with: "English · Commentary", "English · SDH",
-  "German · Kommentar", at most 40 characters. A title that names a
-  format ("AC3 5.1 @ 640 Kbps", "DTS-HD MA"), numbers the track
-  ("Track 0") or repeats the language ("English", "Deutsch", "eng")
-  adds nothing; a track of unknown language is called what its title
-  says, else "Unknown". A forced subtitle whose name doesn't say so gets
+  "German", "No dialogue" for `zxx`, "Unknown" for `und`; with the script
+  and the region its tag or its source title names in brackets, as the
+  clients' spec writes them (docs/chino, subtitles): "Portuguese
+  (Brazil)" for a `pt-BR` track, or a `por` one titled "PT-BR",
+  "Português (BR)" or "Brazilian Portuguese", "Chinese (Simplified)" for
+  "zh-Hans" or "简体中文", "Spanish (Latin America)" for "ES-419" — never
+  "Brazilian Portuguese" or "pt-BR"; " 5.1" in the 5.1 group; then what
+  the source's title says besides, by the rule the clients label tracks
+  with: "English · Commentary", "English · SDH", "German · Kommentar", at
+  most 40 characters. A title that names a format ("AC3 5.1 @ 640 Kbps",
+  "DTS-HD MA"), numbers the track ("Track 0") or repeats the language
+  ("English", "Deutsch", "eng", "Svenska (SV)") adds nothing; one that
+  names another region than the tag's stays ("Portuguese (Portugal) ·
+  PT-BR"); a track of unknown language is called what its title says,
+  else "Unknown". A forced subtitle whose name doesn't say so gets
   "(forced)". NAMEs are unique within a group: a second "English" is
-  "English (2)".
+  "English (2)". The names of regions and scripts, and which regions are
+  a language's own, are CLDR's as the clients' `Intl.DisplayNames` gives
+  them: `src/packager/regions.py`, written by `node scripts/regions.mjs`.
+  A package keeps the NAMEs it was made with.
 
 **Metadata.** A package carries none of the original's global metadata:
 the remuxes shaka-packager packages from leave out the container's title,

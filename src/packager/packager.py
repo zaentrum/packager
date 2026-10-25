@@ -53,6 +53,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,7 +61,7 @@ from typing import Any
 
 import structlog
 
-from . import hls
+from . import hls, regions
 from .renditions import PackageInputs, VideoInput
 
 log = structlog.get_logger("packager")
@@ -1801,10 +1802,80 @@ _ENDONYMS = {
 def _language_name(tag: str | None) -> str:
     """The English name of a track's language: 'eng' -> 'English', 'ger',
     'deu', 'de' and 'de-CH' -> 'German', 'zxx' -> 'No dialogue', 'und' or
-    no tag -> 'Unknown'. A code it doesn't know is named by itself."""
+    no tag -> 'Unknown'. A code it doesn't know is named by itself. The
+    language alone: a NAME says its script and region too
+    (_language_display_name)."""
     code = (tag or "").strip()
     primary = code.lower().replace("_", "-").split("-")[0] or "und"
     return _LANGUAGE_NAMES.get(primary) or code
+
+
+def _parse_language_keys(table: str) -> dict[str, str]:
+    keys: dict[str, str] = {}
+    for row in table.splitlines():
+        one, t, b, _name = row.split(None, 3)
+        keys.update(dict.fromkeys((c for c in (one, t, b) if c != "-"), one if one != "-" else t))
+    return keys
+
+
+# Each language by one key, from every code the table lists for it: its
+# 639-1 code where it has one, else its 639-2/T code ('por', 'pt' -> 'pt';
+# 'fil' -> 'fil'). The key regions.py lists a language's regions by.
+_LANGUAGE_KEYS = _parse_language_keys(_LANGUAGE_TABLE)
+_SUBTAGS = re.compile(r"[-_]")
+_SCRIPT_SUBTAG = re.compile(r"^[A-Za-z]{4}$")
+_REGION_SUBTAG = re.compile(r"^([A-Za-z]{2}|[0-9]{3})$")
+
+
+def _subtags_of(code: str) -> tuple[str, str, str] | None:
+    """The language key, script and region a code spells ('PT-BR' and
+    'por_br' -> ('pt', '', 'BR'), 'zh-hant-tw' -> ('zh', 'Hant', 'TW'),
+    'ES-419' -> ('es', '', '419'), 'eng' -> ('en', '', '')), each script and
+    region one CLDR names (regions.py); what follows a singleton (an
+    extension, a private use: 'en-US-x-custom') names nothing. None for a
+    code with any other subtag ('de-1901', 'eng-sdh', 'pt-XY')."""
+    primary, *rest = _SUBTAGS.split(code.strip())
+    key = _LANGUAGE_KEYS.get(primary.lower(), primary.lower()) or "und"
+    script = region = ""
+    for sub in rest:
+        if len(sub) == 1:
+            break
+        if not script and not region and _SCRIPT_SUBTAG.match(sub) \
+                and sub.title() in regions.SCRIPT_NAMES:
+            script = sub.title()
+        elif not region and _REGION_SUBTAG.match(sub) and sub.upper() in regions.REGION_NAMES:
+            region = sub.upper()
+        else:
+            return None
+    return key, script, region
+
+
+def _language_parts(tag: str | None) -> tuple[str, str, str]:
+    """A track's language as its tag spells it: its key ('pt'; 'und' for
+    none), and the script and the region the tag names ('pt-br' -> ('pt',
+    '', 'BR')), '' where it names none or none _subtags_of reads."""
+    code = (tag or "").strip()
+    parts = _subtags_of(code) if code else None
+    if parts is None:
+        primary = _SUBTAGS.split(code)[0].lower() or "und"
+        return _LANGUAGE_KEYS.get(primary, primary), "", ""
+    return parts
+
+
+def _language_display_name(tag: str | None, script: str = "", region: str = "") -> str:
+    """The name a NAME gives a language: its English name, with its script
+    and its region in brackets, as the clients' word list writes them
+    ("Portuguese (Brazil)", "Chinese (Simplified)", "Chinese (Traditional,
+    Taiwan)", "English (Guam)"; never "Brazilian Portuguese" or "pt-BR").
+    No script or region for a code that names no one language or one the
+    table doesn't know."""
+    name = _language_name(tag)
+    key = _language_parts(tag)[0]
+    said = [regions.SCRIPT_NAMES[s] for s in (script,) if s]
+    said += [regions.REGION_NAMES[r] for r in (region,) if r]
+    if not said or key in _NO_LANGUAGE_CODES or key not in _LANGUAGE_NAMES:
+        return name
+    return f"{name} ({', '.join(said)})"
 
 
 # What a source's title says of a track besides its language, by the rule
@@ -1875,23 +1946,179 @@ def _title_words(title: str | None, language: str | None) -> str:
 
 def _is_language_code(title: str, language: str | None) -> bool:
     """A title that is only a language code: its track's own ('eng' or 'en'
-    on an English track) or one that names no language ('und')."""
+    on an English track), with no script or region its tag doesn't name
+    ('pt-BR' on 'pt-br', not on 'pt-pt'), or one that names no language
+    ('und')."""
     if not _CODE_LIKE.match(title):
         return False
-    primary = title.lower().replace("_", "-").split("-")[0]
-    return primary in _NO_LANGUAGE_CODES or _language_name(title) == _language_name(language)
+    key, script, region = _language_parts(title)
+    if key in _NO_LANGUAGE_CODES:
+        return True
+    own, own_script, own_region = _language_parts(language)
+    return (key == own and script in ("", own_script)
+            and (not region or _same_region(region, own_region)))
+
+
+def _same_region(a: str, b: str) -> bool:
+    """Two region codes CLDR names alike ('GB' and 'UK')."""
+    return bool(a and b) and regions.REGION_NAMES.get(a) == regions.REGION_NAMES.get(b)
+
+
+# What a title may call a language's region other than by an English name
+# (chino-web's REGION_WORDS): "Español Latino" is Spanish (Latin America).
+_REGION_WORDS = {
+    "es": {"latino": "419", "latinoamericano": "419", "latam": "419"},
+    "fr": {"canadien": "CA", "quebecois": "CA", "quebec": "CA"},
+    "pt": {"brasileiro": "BR", "europeu": "PT"},
+}
+# The words a Chinese track's title gives its script in (chino-web's
+# CHINESE_SCRIPTS): the track is named by its script, "Chinese
+# (Simplified)", as a track tagged with it is.
+_CHINESE_SCRIPTS = {
+    **dict.fromkeys(("简体中文", "簡體中文", "简体", "簡體", "简中", "簡中", "chs", "simplified"),
+                    "Hans"),
+    **dict.fromkeys(("繁體中文", "繁体中文", "繁體", "繁体", "繁中", "cht", "traditional"), "Hant"),
+}
+# A bracket in a title: round, square, or a Chinese or Japanese title's
+# full-width round ones.
+_BRACKETED = re.compile(r"\(([^()]*)\)|\[([^\[\]]*)\]|\uff08([^\uff08\uff09]*)\uff09")
+_MASKED_BRACKET = re.compile("\x01(\\d+)\x02")
+# Where a title's parts meet outside a bracket (chino-web's PART_SEPARATOR):
+# "Chinese (Simplified) · 中文", "Portuguese - Brazil", "Commentary: eng".
+_PART_SEPARATOR = re.compile(
+    r"\s*[\u00b7|/\u2013\u2014]\s*|\s+-\s+|\s*:\s+|\s*,\s+")
+# A region's code as a title gives it in brackets: two capitals, or the
+# three digits of one of the world's regions ("419").
+_BRACKETED_REGION = re.compile(r"^([A-Z]{2}|[0-9]{3})$")
+
+
+# The combining accents a fold drops, as the clients' (and
+# scripts/regions.mjs's) fold does: U+0300 to U+036F.
+_ACCENTS = re.compile("[" + chr(0x300) + "-" + chr(0x36F) + "]")
+
+
+def _folded(text: str) -> str:
+    """Lower-cased, without its accents: "Québécois" is "quebecois", the
+    form regions.py keys words by."""
+    return _ACCENTS.sub("", unicodedata.normalize("NFD", text)).lower().strip()
+
+
+def _piece_says(piece: str, key: str, bracketed: bool) -> tuple[str, str] | None:
+    """The script and the region a whole piece of a title - a part, or a
+    bracket - names of the language `key`, each '' where it names none
+    (("", "") for a piece that is only a code of the language: "eng",
+    "pt"); None for a piece that names neither. As the clients read one
+    (chino-web's pieceSays): a code of the language ("PT-BR", "zh-Hans",
+    "es-419"); in brackets, a region's code that is one of the language's
+    regions ("Português (BR)": regions.LANGUAGE_REGIONS; "English (BD)"
+    names none); words that name a region or a script (_words_say), alone
+    or with the language's name ("Español Latino", "Chinese Simplified")."""
+    own_regions = regions.LANGUAGE_REGIONS.get(key, frozenset())
+    if bracketed and _BRACKETED_REGION.match(piece) and piece in own_regions:
+        return "", piece
+    if _CODE_LIKE.match(piece):
+        said = _subtags_of(piece)
+        if said is not None and said[0] == key:
+            return said[1], said[2]
+    folded = _folded(piece)
+    said = _words_say(folded, key)
+    if said is None and key in _LANGUAGE_NAMES:
+        name = _LANGUAGE_NAMES[key]
+        for own in {_folded(name), _folded(_ENDONYMS.get(name, name))}:
+            if folded.startswith(own + " "):
+                said = said or _words_say(folded[len(own) + 1:], key)
+            if folded.endswith(" " + own):
+                said = said or _words_say(folded[:-len(own) - 1], key)
+    return said
+
+
+def _words_say(words: str, key: str) -> tuple[str, str] | None:
+    """The script or the region folded words name for the language `key`:
+    a region by its English name ("brazil", "latin america", "uk"), by its
+    name in the language itself where it is one of the language's own
+    ("brasil", "latinoamerica", "台灣") or by a word the clients read as one
+    ("latino"); a regional form of the language by its English name or
+    adjective ("brazilian portuguese", "brazilian", "flemish"); a Chinese
+    track's script ("简体中文", "simplified"). None for anything else."""
+    if key == "zh" and words in _CHINESE_SCRIPTS:
+        return _CHINESE_SCRIPTS[words], ""
+    region = (regions.REGION_WORDS.get(words)
+              or regions.OWN_REGION_WORDS.get(key, {}).get(words)
+              or _REGION_WORDS.get(key, {}).get(words)
+              or regions.DIALECTS.get(key, {}).get(words))
+    return ("", region) if region else None
+
+
+def _read_title(title: str, language: str | None) -> tuple[str, str, str]:
+    """What a track's source title says of its language's script and
+    region, and the title without it, by the rule the clients read a title
+    with (chino-web's lib/languages.ts readParts), so a NAME reads as their
+    menus do. Each part of the title and each bracket in it that names the
+    track's language's script or region (_piece_says: "PT-BR", "zh-Hans",
+    "ES-419", "Português (BR)", "Portuguese (Brazil)") goes from the title,
+    its script and region taken, where they agree with the track's tag and
+    with what the title named before; one that names another stays as it
+    is ("PT-BR" on a 'pt-pt' track). A part or a bracket that is only a
+    code of the language goes too ("Svenska (SV)", "Commentary (eng)"). A
+    track of no known language reads nothing. Returns (title, script,
+    region): the title as it was where nothing was read."""
+    key, own_script, own_region = _language_parts(language)
+    if not title or key in _NO_LANGUAGE_CODES:
+        return title, "", ""
+    found = {"script": "", "region": ""}
+
+    def takes(script: str, region: str) -> bool:
+        if script and any(s and s != script for s in (own_script, found["script"])):
+            return False
+        if region and any(r and not _same_region(r, region) for r in (own_region, found["region"])):
+            return False
+        found["script"] = found["script"] or script
+        found["region"] = found["region"] or region
+        return True
+
+    brackets: list[str] = []
+
+    def mask(m: re.Match[str]) -> str:
+        brackets.append(next(g for g in m.groups() if g is not None))
+        return f"\x01{len(brackets) - 1}\x02"
+
+    changed = False
+    kept_parts: list[str] = []
+    for part in _PART_SEPARATOR.split(_BRACKETED.sub(mask, title)):
+        inner = [brackets[int(i)] for i in _MASKED_BRACKET.findall(part)]
+        main = _MASKED_BRACKET.sub(" ", part)
+        kept: list[str] = []
+        for text, bracketed in [(main, False), *((b, True) for b in inner)]:
+            piece = " ".join(text.split())
+            if not piece:
+                continue
+            said = _piece_says(piece, key, bracketed)
+            if said is not None and takes(*said):
+                changed = True
+            else:
+                kept.append(piece)
+        if kept:
+            kept_parts.append(" ".join([kept[0], *(f"({k})" for k in kept[1:])]))
+    if not changed:
+        return title, "", ""
+    return " · ".join(kept_parts), found["script"], found["region"]
 
 
 def _track_display_name(language: str | None, title: str | None, *, layout: str = "") -> str:
-    """A rendition's NAME: the name of its language, its layout (" 5.1"),
-    then what its source title says besides ("English · Commentary"). A
-    track of no known language is called what its title says, else
-    "Unknown"; one without dialogue "No dialogue"."""
-    words = _title_words(title, language)
+    """A rendition's NAME: the name of its language, with the script and
+    the region its tag or its source title names in brackets ("Portuguese
+    (Brazil)" for a 'pt-br' track and for a 'por' one titled "PT-BR" or
+    "Português (BR)"), its layout (" 5.1"), then what its source title
+    says besides ("English · Commentary"). A track of no known language is
+    called what its title says, else "Unknown"; one without dialogue "No
+    dialogue"."""
+    rest, script, region = _read_title((title or "").strip(), language)
+    words = _title_words(rest, language)
     if _lang_key(language) == "und" and words:
         return words + layout
-    name = _language_name(language) + layout
-    return f"{name} · {words}" if words else name
+    _, own_script, own_region = _language_parts(language)
+    name = _language_display_name(language, own_script or script, own_region or region)
+    return f"{name}{layout} · {words}" if words else name + layout
 
 
 def _audio_display_name(meta: dict[str, Any], *, surround: bool = False) -> str:
