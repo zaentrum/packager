@@ -717,6 +717,7 @@ REGION_WORDS = {
     "united kingdom": "GB",
     "united states": "US",
     "uruguay": "UY",
+    "us": "US",
     "uzbekistan": "UZ",
     "venezuela": "VE",
     "vietnam": "VN",

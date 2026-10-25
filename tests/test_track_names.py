@@ -79,6 +79,11 @@ def _name(language: str, title: str) -> str:
     ("eng", "British English", "English (United Kingdom)"),
     ("eng", "English (UK)", "English (United Kingdom)"),
     ("eng", "English [American]", "English (United States)"),
+    # "US", whose short name is its code, is a region in words too.
+    ("eng", "English - US", "English (United States)"),
+    ("eng", "US English", "English (United States)"),
+    ("spa", "Spanish (US)", "Spanish (United States)"),
+    ("spa", "Español (US)", "Spanish (United States)"),
     ("dut", "Flemish", "Dutch (Belgium)"),
     ("ger", "German (Austrian)", "German (Austria)"),
     ("spa", "Spanish (Latin America)", "Spanish (Latin America)"),

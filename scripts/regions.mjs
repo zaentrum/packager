@@ -117,13 +117,14 @@ function folded(text) {
 }
 
 // The regions a title may name in words, by their English names, long and
-// short: "brazil" → "BR", "uk" → "GB".
+// short: "brazil" → "BR", "uk" → "GB", and "us" → "US", whose short name is
+// its code (chino-web's regionNamesIn takes every name Intl gives).
 const regionWords = {};
 for (const style of ['long', 'short']) {
   const names = new Intl.DisplayNames(['en'], { type: 'region', style, fallback: 'none' });
   for (const code of REGION_CODES) {
     const name = names.of(code);
-    if (name && name !== code && !(folded(name) in regionWords)) regionWords[folded(name)] = code;
+    if (name && !(folded(name) in regionWords)) regionWords[folded(name)] = code;
   }
 }
 
