@@ -61,6 +61,15 @@ the transcoder README, "Rendition contract"):
 
 The handoff is deleted after a successful package.
 
+Each video rendition in the manifest (and in a library v2 `package.json`)
+records what made its stream as `encoder`: `"copy"` for the original's
+own stream, played as it is (a rung with `"file": null`, or no handoff at
+all), the contract's encoder for an encode (`"h264_nvenc"`), `"transcoder"`
+for an older transcoder's `prepared.mkv`. A rung whose contract names no
+encoder is a copy only when it has no file of its own or its `mode` is
+`"copy"`; any other leaves `encoder` out. chino-stream names only a
+`"copy"` rung "Original".
+
 The item record may carry `trackLanguages`, the catalog's language for
 tracks whose tag is missing or wrong: `[{"kind": "audio" | "subtitle",
 "ordinal": 0, "language": "eng"}]`, `ordinal` counting the source's

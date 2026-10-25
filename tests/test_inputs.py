@@ -64,6 +64,69 @@ def test_contract_with_encoded_top_rung(tmp_path: Path) -> None:
     assert [(v.path.name, v.timeline) for v in inputs.video] == [("prepared.mkv", "keep")]
 
 
+def test_what_made_each_rung(tmp_path: Path) -> None:
+    # Only the original's own stream is a copy; the encoders the contract
+    # names are kept, and a rung with a file of its own whose contract
+    # names none is no copy: chino-stream names a "copy" rung "Original".
+    inbox, original = tmp_path / "inbox", tmp_path / "movie.mkv"
+    original.write_bytes(b"x")
+    rungs = [
+        ({"file": None, "mode": "copy", "encoder": "copy"}, "copy"),
+        ({"file": None}, "copy"),                        # the original, no encoder said
+        ({"file": None, "mode": "copy"}, "copy"),
+        ({"file": "v1.mkv", "mode": "encode", "encoder": "h264_nvenc"}, "h264_nvenc"),
+        ({"file": "v2.mkv", "encoder": " libx265 "}, "libx265"),
+        ({"file": "v3.mkv"}, None),                      # an encode, by what nobody says
+        ({"file": "v4.mkv", "mode": "encode"}, None),
+        ({"file": "v5.mkv", "encoder": ""}, None),
+        ({"file": "v6.mkv", "encoder": None, "mode": "encode"}, None),
+        ({"file": "v7.mkv", "mode": "copy"}, "copy"),    # the contract says it is one
+    ]
+    _contract(inbox, [{"id": f"v{i}", **r} for i, (r, _) in enumerate(rungs)])
+    for i in range(1, len(rungs)):
+        (inbox / f"v{i}.mkv").write_bytes(b"x")
+    inputs = resolve_inputs(inbox, str(original))
+    assert [v.encoder for v in inputs.video] == [want for _, want in rungs]
+
+
+def test_what_made_the_rung_without_a_contract(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    assert resolve_inputs(inbox, "/media/movie.mkv").primary.encoder == "copy"
+    inbox.mkdir()
+    (inbox / "prepared.mkv").write_bytes(b"x")
+    assert resolve_inputs(inbox, "/media/movie.mkv").primary.encoder == "transcoder"
+    _contract(inbox, [{"id": "v0", "file": "prepared.mkv"}])
+    assert resolve_inputs(inbox, "/media/movie.mkv").primary.encoder is None
+
+
+def test_the_manifest_leaves_an_encoder_nobody_named_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from packager import packager as pk
+    from packager.renditions import VideoInput
+
+    def shaka(cmd: list[str], cwd: Path, label: str) -> None:
+        for rid in ("v0", "v1"):
+            d = cwd / "hls" / rid
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "seg-00001.m4s").write_bytes(b"x" * 1000)
+            (d / "playlist.m3u8").write_text(
+                "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg-00001.m4s\n")
+        (cwd / "hls" / ".shaka-master.m3u8").write_text("#EXTM3U\n")
+
+    monkeypatch.setattr(pk, "_run_shaka", shaka)
+    probe = pk._Probe(container="matroska,webm", duration_ms=6_000,
+                      video={"codec_name": "hevc", "width": 1920, "height": 1080},
+                      audio=[], subtitles=[])
+    videos = [pk._StagedVideo(VideoInput("v0", tmp_path / "a.mkv", encoder="copy"),
+                              tmp_path / "v0.mp4", probe),
+              pk._StagedVideo(VideoInput("v1", tmp_path / "b.mkv", label="720p", encoder=None),
+                              tmp_path / "v1.mp4", probe)]
+    video, _, _ = pk._run_shaka_packager(tmp_path / "v0.mp4", videos, [], [], tmp_path)
+    assert video[0]["encoder"] == "copy"
+    assert "encoder" not in video[1]
+
+
 def test_missing_lower_rung_is_skipped_and_ids_stay_contiguous(tmp_path: Path) -> None:
     inbox = tmp_path / "inbox"
     _contract(inbox, [

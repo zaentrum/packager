@@ -42,7 +42,11 @@ class VideoInput:
     id: str               # v0, v1, ... (the HLS rendition dir name)
     path: Path
     label: str = "source"
-    encoder: str = "copy"
+    # What made the rung's stream: "copy" for the original's own stream,
+    # played as it is; an encoder's name ("h264_nvenc", "libx265") or
+    # "transcoder" for an encode; None where nothing says (the manifest
+    # then leaves it out). Only a "copy" is named "Original" downstream.
+    encoder: str | None = "copy"
     # How the packager's remux treats this file's timestamps:
     #   "normalize" — ffmpeg default (shift to start at 0): the legacy path
     #   "keep"      — -copyts: already on the contract's shared timeline
@@ -107,7 +111,7 @@ def _from_contract(path: Path, inbox: Path, original: Path) -> PackageInputs:
             id=f"v{len(inputs)}",
             path=file,
             label=str(rung.get("label") or ("source" if i == 0 else f"v{i}")),
-            encoder=str(rung.get("encoder") or "copy"),
+            encoder=_encoder_of(rung),
             timeline=timeline,
         ))
     seg = contract.get("segmentSeconds")
@@ -118,3 +122,17 @@ def _from_contract(path: Path, inbox: Path, original: Path) -> PackageInputs:
         timestamp_offset=offset,
         contract=contract,
     )
+
+
+def _encoder_of(rung: dict[str, Any]) -> str | None:
+    """What made a contract rung's stream: its `encoder` where the contract
+    names one; else "copy" for a rung with `"file": null`, which is the
+    original's own stream, or for one whose `mode` is "copy"; else None.
+    A rung with a file of its own is an encode unless the contract says it
+    is a copy: a missing encoder never makes it one."""
+    encoder = rung.get("encoder")
+    if isinstance(encoder, str) and encoder.strip():
+        return encoder.strip()
+    if not rung.get("file") or rung.get("mode") == "copy":
+        return "copy"
+    return None

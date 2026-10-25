@@ -2578,6 +2578,8 @@ def _run_shaka_packager(
             uri=uri, codec=codec, width=width, height=height, frame_rate=fps,
             video_range=video_range, stats=stats,
         ))
+        # An encoder nothing names stays out of the record, never "copy".
+        made_by = {"encoder": v.rung.encoder} if v.rung.encoder else {}
         video_meta.append({
             "id": v.rung.id,
             "dir": f"hls/{v.rung.id}",
@@ -2592,7 +2594,7 @@ def _run_shaka_packager(
             "segments": stats.segments,
             "targetDuration": stats.target_duration or segment_seconds,
             "label": v.rung.label,
-            "encoder": v.rung.encoder,
+            **made_by,
         })
 
     # ---- audio (exactly one DEFAULT per group; AUTOSELECT on the first
