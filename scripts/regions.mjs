@@ -128,40 +128,50 @@ for (const style of ['long', 'short']) {
   }
 }
 
+/** Whether Intl has a locale for `locale`: for one it has none for, it
+ *  names things in the machine's own language instead, so the tables say
+ *  nothing of it. */
+function supported(locale) {
+  return Intl.DisplayNames.supportedLocalesOf([locale]).length > 0;
+}
+
+/** The locales a language names regions in: its own (both scripts' for
+ *  Chinese, as chino-web's regionsOf), where Intl has it. */
+function localesOf(base) {
+  return (base === 'zh' ? ['zh-Hans', 'zh-Hant'] : [base]).filter(supported);
+}
+
 /** The name without the word or words `word`. */
 function withoutWords(name, word) {
   return ` ${name} `.replace(` ${word} `, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// The English names CLDR's dialect form gives a language's regional forms
-// ("brazilian portuguese", "flemish"), and each without the language's
-// name, the adjective a title puts in brackets after it ("brazilian").
+// The names CLDR's dialect form gives a language's regional forms, in the
+// language itself and in English ("brazilian portuguese", "flemish",
+// "vlaams", "schweizer hochdeutsch"), and each without the language's name
+// in that locale, the adjective a title puts in brackets after it
+// ("brazilian", "osterreichisches"): chino-web's dialectsOf.
 const dialects = {};
 for (const base of bases) {
-  const ownName = folded(intlName(base, 'en', 'standard'));
   const map = {};
-  for (const region of REGION_CODES) {
-    const tag = `${base}-${region}`;
-    const dialect = intlName(tag, 'en', 'dialect');
-    if (!dialect || dialect === intlName(tag, 'en', 'standard')) continue;
-    const name = folded(dialect);
-    if (!(name in map)) map[name] = region;
-    const adjective = ownName ? withoutWords(name, ownName) : '';
-    if (adjective && adjective !== name && !(adjective in map)) map[adjective] = region;
+  for (const locale of [base, 'en'].filter(supported)) {
+    const ownName = folded(intlName(base, locale, 'standard'));
+    for (const region of REGION_CODES) {
+      const tag = `${base}-${region}`;
+      const dialect = intlName(tag, locale, 'dialect');
+      if (!dialect || dialect === intlName(tag, locale, 'standard')) continue;
+      const name = folded(dialect);
+      if (!(name in map)) map[name] = region;
+      const adjective = ownName ? withoutWords(name, ownName) : '';
+      if (adjective && adjective !== name && !(adjective in map)) map[adjective] = region;
+    }
   }
   if (Object.keys(map).length) dialects[base] = map;
 }
 
 const own = {};
 for (const base of bases) {
-  const found = new Set();
-  for (const locale of [base, 'en']) {
-    for (const region of REGION_CODES) {
-      const tag = `${base}-${region}`;
-      const dialect = intlName(tag, locale, 'dialect');
-      if (dialect && dialect !== intlName(tag, locale, 'standard')) found.add(region);
-    }
-  }
+  const found = new Set(Object.values(dialects[base] ?? {}));
   for (const region of REGION_CODES) {
     let language = '';
     try {
@@ -178,13 +188,7 @@ for (const base of bases) {
 // language's own locale ("suomi" for "fi", "Indonesia" for "id", "ไทย" for
 // "th"): a title that is only this names the language again, never a
 // region of the same name (chino-web's namesLanguage, read before any
-// region). None where Intl has no locale for the language, which would
-// name it in the machine's own language instead.
-function localesOf(base) {
-  return (base === 'zh' ? ['zh-Hans', 'zh-Hant'] : [base]).filter(
-    (locale) => Intl.DisplayNames.supportedLocalesOf([locale]).length,
-  );
-}
+// region).
 const ownNames = {};
 for (const base of bases) {
   const names = [];
@@ -195,29 +199,25 @@ for (const base of bases) {
   if (names.length) ownNames[base] = names;
 }
 
-// A language's own regions by their names in the language itself, long and
-// short, where the English name is another: "brasil" → "BR" for "pt",
-// "latinoamerica" → "419" for "es", "台灣" → "TW" for "zh".
+// Every region a title may name, by its names in the language itself, long
+// and short (chino-web's regionsOf): "brasil" → "BR" for "pt", "belgique"
+// → "BE" for "fr", "estados unidos" → "US" for "es", "台灣" → "TW" for
+// "zh". The first region a name is given to has it, as in the clients; a
+// name English gives the same region is left to regionWords.
 const ownWords = {};
-for (const [base, list] of Object.entries(own)) {
+for (const base of bases) {
   const map = {};
-  for (const locale of base === 'zh' ? ['zh-Hans', 'zh-Hant'] : [base]) {
+  for (const locale of localesOf(base)) {
     for (const style of ['long', 'short']) {
-      let names;
-      try {
-        names = new Intl.DisplayNames([locale], { type: 'region', style, fallback: 'none' });
-      } catch {
-        continue;
-      }
-      for (const code of list) {
+      const names = new Intl.DisplayNames([locale], { type: 'region', style, fallback: 'none' });
+      for (const code of REGION_CODES) {
         const name = names.of(code);
-        if (!name || name === code) continue;
-        const word = folded(name);
-        if (!(word in regionWords) && !(word in map)) map[word] = code;
+        if (name && !(folded(name) in map)) map[folded(name)] = code;
       }
     }
   }
-  if (Object.keys(map).length) ownWords[base] = map;
+  const words = Object.entries(map).filter(([word, code]) => regionWords[word] !== code);
+  if (words.length) ownWords[base] = Object.fromEntries(words);
 }
 
 const py = (s) => JSON.stringify(s);
@@ -274,9 +274,9 @@ for (const [base, names] of Object.entries(ownNames).sort(([a], [b]) => (a < b ?
 }
 lines.push('}');
 lines.push('');
-lines.push('# A language\'s own regions by their names in the language, long and short,');
+lines.push('# The regions a title may name, by their names in the language, long and short,');
 lines.push('# lower-cased and without accents, by the language\'s key, where English names');
-lines.push('# them otherwise: "Português (Brasil)", "Español (Latinoamérica)".');
+lines.push('# them otherwise: "Português (Brasil)", "Français (Belgique)".');
 lines.push('OWN_REGION_WORDS = {');
 for (const [base, map] of Object.entries(ownWords).sort(([a], [b]) => (a < b ? -1 : 1))) {
   lines.push(`    ${py(base)}: {`);
@@ -287,8 +287,9 @@ for (const [base, map] of Object.entries(ownWords).sort(([a], [b]) => (a < b ? -
 }
 lines.push('}');
 lines.push('');
-lines.push('# The English names of a language\'s regional forms and their adjectives, by');
-lines.push('# the language\'s key: "Brazilian Portuguese", "Portuguese (Brazilian)".');
+lines.push('# The names of a language\'s regional forms, in the language and in English, and');
+lines.push('# their adjectives, by the language\'s key: "Brazilian Portuguese", "Portuguese');
+lines.push('# (Brazilian)", "Vlaams".');
 lines.push('DIALECTS = {');
 for (const [base, map] of Object.entries(dialects).sort(([a], [b]) => (a < b ? -1 : 1))) {
   lines.push(`    ${py(base)}: {`);

@@ -125,8 +125,10 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   clients' spec writes them (docs/chino, subtitles): "Portuguese
   (Brazil)" for a `pt-BR` track, or a `por` one titled "PT-BR",
   "Português (BR)" or "Brazilian Portuguese", "Chinese (Simplified)" for
-  "zh-Hans" or "简体中文", "Spanish (Latin America)" for "ES-419" — never
-  "Brazilian Portuguese" or "pt-BR"; " 5.1" in the 5.1 group; then what
+  "zh-Hans" or "简体中文", "Spanish (Latin America)" for "ES-419", and a
+  region or a regional form named in English or in the language itself
+  ("French (Belgium)" for "Français (Belgique)", "Dutch (Belgium)" for
+  "Vlaams") — never "Brazilian Portuguese" or "pt-BR"; " 5.1" in the 5.1 group; then what
   the source's title says besides, by the rule the clients label tracks
   with: "English · Commentary", "English · SDH", "German · Kommentar", at
   most 40 characters. A title that names a format ("AC3 5.1 @ 640 Kbps",

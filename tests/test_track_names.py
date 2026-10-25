@@ -94,6 +94,15 @@ def _name(language: str, title: str) -> str:
     ("chi", "繁體中文", "Chinese (Traditional)"),
     ("chi", "Chinese (Simplified)", "Chinese (Simplified)"),
     ("chi", "Simplified Chinese", "Chinese (Simplified)"),
+    # Any region by its name in the language, and a regional form by its
+    # name in the language, not only in English.
+    ("fre", "Français (Belgique)", "French (Belgium)"),
+    ("ita", "Italiano (Svizzera)", "Italian (Switzerland)"),
+    ("spa", "Español (Estados Unidos)", "Spanish (United States)"),
+    ("chi", "中文\uff08新加坡\uff09", "Chinese (Singapore)"),
+    ("dut", "Vlaams", "Dutch (Belgium)"),
+    ("ger", "Schweizer Hochdeutsch", "German (Switzerland)"),
+    ("ger", "Österreichisches Deutsch", "German (Austria)"),
     ("chi", "繁體中文\uff08台灣\uff09", "Chinese (Traditional, Taiwan)"),
     ("chi", "中文", "Chinese"),
     # The language's name in itself is the language, never a region of the
@@ -200,3 +209,6 @@ def test_the_cldr_tables_name_what_the_clients_name() -> None:
     assert regions.DIALECTS["pt"]["brazilian portuguese"] == "BR"
     assert regions.OWN_NAMES["fi"] == ("suomi",)
     assert regions.OWN_NAMES["zh"] == ("中文",)
+    assert regions.REGION_WORDS["us"] == "US"
+    assert regions.OWN_REGION_WORDS["fr"]["belgique"] == "BE"   # not one of French's own
+    assert regions.DIALECTS["nl"]["vlaams"] == "BE"

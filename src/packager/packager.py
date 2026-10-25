@@ -2056,17 +2056,18 @@ def _piece_says(piece: str, key: str, bracketed: bool) -> tuple[str, str] | None
 
 def _words_say(words: str, key: str) -> tuple[str, str] | None:
     """The script or the region folded words name for the language `key`:
-    a region by its English name ("brazil", "latin america", "uk"), by its
-    name in the language itself where it is one of the language's own
-    ("brasil", "latinoamerica", "台灣") or by a word the clients read as one
-    ("latino"); a regional form of the language by its English name or
-    adjective ("brazilian portuguese", "brazilian", "flemish"); a Chinese
-    track's script ("简体中文", "simplified"). None for anything else."""
+    a region by a word the clients read as one ("latino"), by its name in
+    the language itself ("brasil", "belgique", "estados unidos", "台灣") or
+    by its English name ("brazil", "latin america", "uk", "us"), in that
+    order, as chino-web's regionsOf; a regional form of the language by its
+    name in the language or in English, or its adjective ("vlaams",
+    "brazilian portuguese", "brazilian", "flemish"); a Chinese track's
+    script ("简体中文", "simplified"). None for anything else."""
     if key == "zh" and words in _CHINESE_SCRIPTS:
         return _CHINESE_SCRIPTS[words], ""
-    region = (regions.REGION_WORDS.get(words)
+    region = (_REGION_WORDS.get(key, {}).get(words)
               or regions.OWN_REGION_WORDS.get(key, {}).get(words)
-              or _REGION_WORDS.get(key, {}).get(words)
+              or regions.REGION_WORDS.get(words)
               or regions.DIALECTS.get(key, {}).get(words))
     return ("", region) if region else None
 
