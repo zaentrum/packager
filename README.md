@@ -578,14 +578,16 @@ and a client of its own:
 ```
 PUT /api/analyze/rules/packager
 {"version": "3f2a9c1", "rules": {"surroundAudio": "eac3", "surroundLayout": "5.1",
-  "surroundBitrate": "448k", "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"]}}
+  "surroundBitrate": "448k", "stereoAudio": "aac", "stereoBitrate": "192k",
+  "imageSubtitles": ["pgs", "vobsub"]}}
 ```
 
 Every value is the one the process runs with: `SURROUND_AUDIO` (`off`: no
 5.1 companion), the layout the companion is made in (an encode is asked
 for it, and a source track of it in the target codec is copied),
 `SURROUND_BITRATE` (what an encoded companion is made at;
-an E-AC-3 5.1 is copied as it is), the stereo rendition's 192k, and the
+an E-AC-3 5.1 is copied as it is), the stereo rendition's codec and bit
+rate (AAC at 192k, what its encode is made with), and the
 forms of image subtitles a package carries as they are, as the extraction
 writes them: PGS always, VobSub where `mkvextract` and `mkvmerge` are
 installed (the image has them), from a Matroska file alone. DVB and XSUB
