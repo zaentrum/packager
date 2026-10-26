@@ -31,6 +31,9 @@ packager packages apart from its title:
   * `POST /api/extras/{id}/packaging-complete` — the manifest (and the
     source block) of the extra's package, which makes it playable.
 
+And one call of its own (rules.py): `PUT /api/analyze/rules/packager`,
+the rules this packager runs with, at its start and every ten minutes.
+
 When the catalog runs the library v2 layout, both worker records carry a
 `library` block (the title's folders in the library tree, below) and the
 two packaging-complete calls take the v2 payload instead, which the
@@ -789,6 +792,12 @@ class KatalogClient:
         extras/<extraId>/ (contract section 2.6). Taken only with a 2xx."""
         return self._hand_over(f"/api/extras/{extra_id}/packaging-complete", payload,
                                extra_id=extra_id)
+
+    def put_rules(self, worker: str, payload: dict[str, Any]) -> httpx.Response:
+        """Report the rules `worker` runs with (rules.py), and answer the
+        catalog's response as it is: the reporter tells an older catalog's
+        404 from a refusal. Raises on a transport error."""
+        return self._request("PUT", f"/api/analyze/rules/{worker}", json=payload)
 
     def fail(self, item_id: str, reason: str) -> None:
         """Catastrophic-failure fallback (source file missing, etc.).

@@ -5,6 +5,8 @@
   - at startup, a sweep of what runs that ended uncleanly left in the
     package store's item folders and in the library v2 work tree's
     staging folder (thread)
+  - the report of the rules it runs with to the catalog, at start and
+    every ten minutes (thread, rules.py)
   - a tiny FastAPI server for /healthz and /readyz, so kubelet probes work.
 
 Same shape as katalog-analyzer's main — intentionally — so anyone
@@ -28,6 +30,7 @@ from .extras import run_extras_worker
 from .katalog import KatalogClient
 from .library import sweep_staging
 from .packager import sweep_leftovers
+from .rules import RulesReporter, image_version, rules_payload
 from .worker import run_worker
 
 # Pods run with a random non-root UID in GID 0. Without this, mkdir creates
@@ -96,6 +99,7 @@ def main() -> int:
     # pool, and was written for one thread.
     client = katalog_client()
     extras_client = katalog_client()
+    rules_client = katalog_client()
 
     stop = threading.Event()
 
@@ -146,6 +150,13 @@ def main() -> int:
     )
     extras_thread.start()
 
+    # The rules this packager runs with, which the catalog holds its
+    # library against: reported now and every ten minutes. A catalog that
+    # takes no report, or one that fails, never stops the worker.
+    reporter = RulesReporter(rules_client, rules_payload(cfg.package_options(), image_version()))
+    threading.Thread(target=reporter.run, kwargs={"stop": stop}, daemon=True,
+                     name="packager-rules").start()
+
     app = FastAPI()
 
     @app.get("/healthz")
@@ -161,6 +172,7 @@ def main() -> int:
     stop.set()
     client.close()
     extras_client.close()
+    rules_client.close()
     worker_thread.join(timeout=10)
     extras_thread.join(timeout=10)
     return 0
