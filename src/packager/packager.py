@@ -176,6 +176,9 @@ SUBTITLE_GROUP = "subs"
 VIDEO_CODECS = ("hevc", "h264")
 _CODEC_NAMES = {"hevc": "HEVC", "h264": "H.264"}
 
+# The stereo rendition every audio track gets: its codec (an ffmpeg encoder
+# name) and its bit rate. The rules report names both (rules.py).
+STEREO_CODEC = "aac"
 STEREO_BITRATE = "192k"
 _STEREO_FORMAT = "aformat=sample_rates=48000:channel_layouts=stereo"
 # The surround companion's layout: every one is a 5.1, a copy of a 5.1 of
@@ -1377,7 +1380,7 @@ def _prepare_source(
     for i, stream in enumerate(probe.audio):
         args += [
             "-map", f"[s{i}]",
-            f"-c:a:{out}", "aac", f"-b:a:{out}", STEREO_BITRATE,
+            f"-c:a:{out}", STEREO_CODEC, f"-b:a:{out}", STEREO_BITRATE,
             f"-metadata:s:a:{out}", f"language={_track_language(stream)}",
         ]
         out += 1
@@ -2170,7 +2173,7 @@ def _audio_meta_from_stream(
     disp = stream.get("disposition") or {}
     return {
         "idx": idx,
-        "codec": "aac" if transcoded else stream.get("codec_name", "aac"),
+        "codec": STEREO_CODEC if transcoded else stream.get("codec_name", STEREO_CODEC),
         "language": _track_language(stream),
         "title": tags.get("title") or "",
         # Output channels: always 2 after the stereo downmix in

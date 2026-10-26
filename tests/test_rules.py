@@ -33,7 +33,20 @@ def test_the_payload_is_the_catalogs_contract() -> None:
                         image_subtitles=["pgs", "vobsub"])
     assert got == {"version": "3f2a9c1", "rules": {
         "surroundAudio": "eac3", "surroundLayout": "5.1", "surroundBitrate": "448k",
-        "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"]}}
+        "stereoAudio": "aac", "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"]}}
+
+
+def test_the_stereo_codec_is_the_one_its_encode_is_made_with() -> None:
+    # the report names the codec the stereo rendition's encode asks ffmpeg
+    # for, and its bit rate
+    from packager import packager
+
+    got = rules_payload(options(), None)["rules"]
+    assert got["stereoAudio"] == packager.STEREO_CODEC
+    assert got["stereoBitrate"] == packager.STEREO_BITRATE
+    meta = packager._audio_meta_from_stream(0, {"codec_name": "truehd", "channels": 8},
+                                            transcoded=True)
+    assert meta["codec"] == packager.STEREO_CODEC
 
 
 def test_the_layout_is_the_one_the_companion_is_made_in() -> None:
@@ -54,7 +67,7 @@ def test_the_payload_says_the_values_this_process_runs_with() -> None:
     # the platform's default is no companion; a bit rate set is the one sent
     got = rules_payload(options(surround_bitrate="640k"), None, image_subtitles=["pgs"])["rules"]
     assert got == {"surroundAudio": "off", "surroundLayout": "5.1", "surroundBitrate": "640k",
-                   "stereoBitrate": "192k", "imageSubtitles": ["pgs"]}
+                   "stereoAudio": "aac", "stereoBitrate": "192k", "imageSubtitles": ["pgs"]}
 
 
 @pytest.mark.parametrize(("installed", "forms"), [
