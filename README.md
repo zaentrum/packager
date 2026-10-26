@@ -566,6 +566,35 @@ of runs that started more than a day ago, once the original such a run
 left in one is back at its arrival; one that still holds an original
 stays.
 
+## Rules report
+
+The catalog holds every movie and episode against the rules its workers
+run with now, to find the packages made before a rule came (a source's
+surround left out before the 5.1 companion, image subtitles before they
+were carried), and knows the rules only as a worker reports them. At
+startup and every ten minutes the packager reports its own, on a thread
+and a client of its own:
+
+```
+PUT /api/analyze/rules/packager
+{"version": "3f2a9c1", "rules": {"surroundAudio": "eac3", "surroundBitrate": "448k",
+  "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"]}}
+```
+
+Every value is the one the process runs with: `SURROUND_AUDIO` (`off`: no
+5.1 companion), `SURROUND_BITRATE` (what an encoded companion is made at;
+an E-AC-3 5.1 is copied as it is), the stereo rendition's 192k, and the
+forms of image subtitles a package carries as they are, as the extraction
+writes them: PGS always, VobSub where `mkvextract` and `mkvmerge` are
+installed (the image has them), from a Matroska file alone. DVB and XSUB
+are not carried. `version` is the image's, `IMAGE_VERSION` (the image
+build sets it to the release tag or the commit), else the package's.
+
+A catalog older than the route answers 404 or 405: the packager says so
+once (`packager.rules.unsupported`) and asks again every round. Any other
+failure is logged (`packager.rules.refused`, `packager.rules.report_failed`)
+and never stops the worker.
+
 ## Layout
 
 ```
@@ -573,6 +602,7 @@ src/packager/main.py        # entry point: consumer threads + FastAPI /healthz +
 src/packager/config.py      # env-driven config
 src/packager/events.py      # Kafka consumer factory + envelope parsing
 src/packager/katalog.py     # HTTP client to the katalog API, OIDC auth
+src/packager/rules.py       # the report of the rules it runs with
 src/packager/worker.py      # consumer loop: one item at a time, serial packaging
 src/packager/extras.py      # the extras' consumer loop: trailers and other bonus material
 src/packager/renditions.py  # reads the transcoder handoff (renditions.json)
@@ -600,6 +630,7 @@ Dockerfile
 | `HLS_SUBTITLES` | `false` | Reference the WebVTT renditions from the master |
 | `PREFERRED_LANGUAGES` | (empty) | DEFAULT=YES language order, e.g. `de,en`; empty = whitelist order |
 | `OLD_PACKAGE_GRACE_SECONDS` | `600` | How long a package replaced by a new one stays on disk for the requests that started on it (see "Packaging again"); keep it well above the NFS mounts' attribute cache time |
+| `IMAGE_VERSION` | (the image's) | The version the [rules report](#rules-report) names; the image build sets it, empty = the package's |
 | `WORK_ROOT` | `/var/lib/katalog/.work` | The library v2 work tree, on the library's share: the startup sweep clears dead runs in its `staging/` (see [Library v2](#library-v2)). A run's own paths come from its worker record |
 
 ## Local development
