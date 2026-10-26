@@ -32,15 +32,29 @@ def test_the_payload_is_the_catalogs_contract() -> None:
     got = rules_payload(options(surround_audio="eac3"), "3f2a9c1",
                         image_subtitles=["pgs", "vobsub"])
     assert got == {"version": "3f2a9c1", "rules": {
-        "surroundAudio": "eac3", "surroundBitrate": "448k", "stereoBitrate": "192k",
-        "imageSubtitles": ["pgs", "vobsub"]}}
+        "surroundAudio": "eac3", "surroundLayout": "5.1", "surroundBitrate": "448k",
+        "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"]}}
+
+
+def test_the_layout_is_the_one_the_companion_is_made_in() -> None:
+    # the report names the layout the encode asks ffmpeg for, and a source
+    # track of it in the target codec is copied as it is
+    from packager import packager
+
+    layout = rules_payload(options(surround_audio="eac3"), None)["rules"]["surroundLayout"]
+    assert layout == packager.SURROUND_LAYOUT
+    assert f"channel_layouts={layout}(side)|{layout}" in packager._SURROUND_FORMAT
+    streams = [{"index": 1, "codec_name": "eac3", "channels": packager.SURROUND_CHANNELS},
+               {"index": 2, "codec_name": "truehd", "channels": 8, "tags": {"language": "fre"}}]
+    plan = packager._surround_plan(streams, {0, 1}, options(surround_audio="eac3"))
+    assert [t.mode for t in plan] == ["copy", "encode"]
 
 
 def test_the_payload_says_the_values_this_process_runs_with() -> None:
     # the platform's default is no companion; a bit rate set is the one sent
     got = rules_payload(options(surround_bitrate="640k"), None, image_subtitles=["pgs"])["rules"]
-    assert got == {"surroundAudio": "off", "surroundBitrate": "640k", "stereoBitrate": "192k",
-                   "imageSubtitles": ["pgs"]}
+    assert got == {"surroundAudio": "off", "surroundLayout": "5.1", "surroundBitrate": "640k",
+                   "stereoBitrate": "192k", "imageSubtitles": ["pgs"]}
 
 
 @pytest.mark.parametrize(("installed", "forms"), [

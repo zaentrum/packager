@@ -8,12 +8,14 @@ knows the rules only as a worker reports them, and assumes none:
 `PUT /api/analyze/rules/packager` with
 
     {"version": "<image commit or release>", "rules": {
-      "surroundAudio": "eac3", "surroundBitrate": "448k",
-      "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"]}}
+      "surroundAudio": "eac3", "surroundLayout": "5.1",
+      "surroundBitrate": "448k", "stereoBitrate": "192k",
+      "imageSubtitles": ["pgs", "vobsub"]}}
 
 Every value is the one this process runs with (README "Output", "Audio",
-"Configuration"): the 5.1 companion's codec (`off`: none), the bit rate of
-an encoded companion and of the stereo rendition, and the forms of image
+"Configuration"): the 5.1 companion's codec (`off`: none), the layout it
+is made in (SURROUND_LAYOUT, which the encode asks ffmpeg for), the bit
+rate of an encoded companion and of the stereo rendition, and the forms of image
 subtitles a package carries as they are — what the code really extracts:
 PGS (a `.sup` stream copy) always, VobSub (an `.idx` and `.sub` pair)
 only where mkvextract is installed, and from a Matroska file alone. DVB is
@@ -36,7 +38,7 @@ from typing import Any, Protocol
 import httpx
 import structlog
 
-from .packager import STEREO_BITRATE, PackageOptions
+from .packager import STEREO_BITRATE, SURROUND_LAYOUT, PackageOptions
 
 log = structlog.get_logger(__name__)
 
@@ -80,6 +82,7 @@ def rules_payload(options: PackageOptions, version: str | None,
         "version": version,
         "rules": {
             "surroundAudio": surround,
+            "surroundLayout": SURROUND_LAYOUT,
             "surroundBitrate": options.surround_bitrate,
             "stereoBitrate": STEREO_BITRATE,
             "imageSubtitles": forms,

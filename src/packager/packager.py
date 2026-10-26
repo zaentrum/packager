@@ -178,7 +178,14 @@ _CODEC_NAMES = {"hevc": "HEVC", "h264": "H.264"}
 
 STEREO_BITRATE = "192k"
 _STEREO_FORMAT = "aformat=sample_rates=48000:channel_layouts=stereo"
-_SURROUND_FORMAT = "aformat=sample_rates=48000:channel_layouts=5.1(side)|5.1"
+# The surround companion's layout: every one is a 5.1, a copy of a 5.1 of
+# the target codec or an encode made one (_surround_plan). The rules
+# report names it (rules.py).
+SURROUND_LAYOUT = "5.1"
+SURROUND_CHANNELS = 6
+_SURROUND_FORMAT = (
+    f"aformat=sample_rates=48000:channel_layouts={SURROUND_LAYOUT}(side)|{SURROUND_LAYOUT}"
+)
 _SURROUND_CODECS = {"eac3": "ec-3", "ac3": "ac-3"}
 
 
@@ -1234,7 +1241,7 @@ def _surround_plan(
         if key in seen:
             continue
         seen.add(key)
-        same = (s.get("codec_name") or "").lower() == codec and channels == 6
+        same = (s.get("codec_name") or "").lower() == codec and channels == SURROUND_CHANNELS
         plan.append(_SurroundTrack(i, "copy" if same else "encode", codec,
                                    _SURROUND_CODECS[codec], options.surround_bitrate))
     return plan
@@ -1413,7 +1420,7 @@ def _prepare_source(
             "language": _track_language(stream),
             "title": tags.get("title") or "",
             # Always a 5.1: a copy is one (_surround_plan), an encode is made one.
-            "channels": 6,
+            "channels": SURROUND_CHANNELS,
             "default": s.source_index == surround_default,
             # Shown where its stereo rendition is.
             "visible": audio_visible_indices is None or s.source_index in audio_visible_indices,
@@ -2153,7 +2160,7 @@ def _audio_display_name(meta: dict[str, Any], *, surround: bool = False) -> str:
     whatever the file had. A second track that reads the same is told
     apart by hls.unique_names."""
     return _track_display_name(meta.get("language"), meta.get("title"),
-                               layout=" 5.1" if surround else "")
+                               layout=f" {SURROUND_LAYOUT}" if surround else "")
 
 
 def _audio_meta_from_stream(
