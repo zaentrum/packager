@@ -154,6 +154,24 @@ def test_golden_master() -> None:
     assert text == (GOLDEN / "master.m3u8").read_text()
 
 
+def test_a_subtitle_rendition_for_the_hard_of_hearing_says_so() -> None:
+    # RFC 8216 4.3.4.1: the UTIs of subtitles that transcribe the dialogue
+    # and describe the music and the sounds; none on any other rendition.
+    videos, audio, subs, iframes = _golden_inputs()
+    sdh = hls.SubtitleRendition("s2/playlist.m3u8", "en", "English · SDH", False, False,
+                                _stats(400, 300), characteristics=hls.SDH_CHARACTERISTICS)
+    text = hls.build_master(videos, audio, [*subs, sdh], iframes)
+    lines = [line for line in text.splitlines() if line.startswith("#EXT-X-MEDIA:TYPE=SUBTITLES")]
+    assert [hls.parse_attributes(line.split(":", 1)[1]).get("CHARACTERISTICS")
+            for line in lines] == [
+        None, None, "public.accessibility.transcribes-spoken-dialog,"
+                    "public.accessibility.describes-music-and-sound"]
+    assert lines[2] == (
+        '#EXT-X-MEDIA:TYPE=SUBTITLES,URI="s2/playlist.m3u8",GROUP-ID="subs",LANGUAGE="en",'
+        'NAME="English · SDH",DEFAULT=NO,CHARACTERISTICS="public.accessibility.'
+        'transcribes-spoken-dialog,public.accessibility.describes-music-and-sound"')
+
+
 def test_variant_bandwidth_is_video_plus_largest_audio_plus_subs() -> None:
     videos, audio, subs, iframes = _golden_inputs()
     text = hls.build_master(videos, audio, subs, iframes)

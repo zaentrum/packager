@@ -7,7 +7,8 @@ libv2_records.py, vendored byte for byte (tests/test_libv2_records.py
 guards the copy): the same code the migration writes its records with,
 so the two agree on every byte the deletion gate reads. What only the
 packager knows it adds before handing over: which stream of the original
-each rendition was made from. Where the records are written, and in
+each rendition was made from, and whether that stream of a subtitle is
+for the deaf and hard of hearing. Where the records are written, and in
 which order, is library.py's business."""
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import structlog
 
 from . import libv2_records as rec
 from .katalog import ExtraLibrary, ItemLibrary
-from .packager import Built, PackageError, _source_ordinals
+from .packager import Built, PackageError, _hearing_impaired, _source_ordinals
 
 log = structlog.get_logger(__name__)
 
@@ -112,8 +113,12 @@ def for_record(built: Built, probe: OriginalProbe, now: str) -> dict[str, Any]:
     """The built package's manifest as its record is made of it: completed
     at `now`, the moment its chain closes (the version record's too), and
     each rendition naming the stream of the original it was made from
-    (sourceStreamIndex) and an audio track's channels there
-    (sourceChannels). The transcoder's v0 carries the original's tracks in
+    (sourceStreamIndex), an audio track's channels there (sourceChannels),
+    and a subtitle saying so when that stream is for the deaf and hard of
+    hearing as the source record reads its disposition (hearingImpaired):
+    the record logic makes it sdh, as the source's essence has it, though
+    the transcoder's encode lost a flag Matroska has no word for
+    (captions). The transcoder's v0 carries the original's tracks in
     order, so a track is found by its place among those of its codec
     (packager._source_ordinals)."""
     man = copy.deepcopy(built.manifest)
@@ -140,6 +145,8 @@ def for_record(built: Built, probe: OriginalProbe, now: str) -> dict[str, Any]:
         n = rec.num(str(s.get("id", "")).removeprefix("sub"))
         if n is not None and 0 <= n < len(st) and st[n] < len(subtitles):
             s["sourceStreamIndex"] = subtitles[st[n]]["index"]
+            if _hearing_impaired(subtitles[st[n]]):
+                s["hearingImpaired"] = True
     return man
 
 

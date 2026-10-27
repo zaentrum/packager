@@ -62,6 +62,7 @@ from typing import Any
 import structlog
 
 from . import hls, regions
+from . import libv2_records as rec
 from .renditions import PackageInputs, VideoInput
 
 log = structlog.get_logger("packager")
@@ -2230,6 +2231,15 @@ def _sidecar(index: int, codec: str) -> _Sidecar:
                     codec not in _SETUP_FAILS)
 
 
+def _hearing_impaired(stream: dict[str, Any]) -> bool:
+    """Whether a subtitle stream's disposition says it is for the deaf and
+    hard of hearing: hearing_impaired, or captions (an MP4's captions), as
+    the record logic reads an original's stream (libv2_records'
+    subtitle_purpose: sdh by its disposition)."""
+    disp = stream.get("disposition") or {}
+    return bool(disp.get("hearing_impaired") or disp.get("captions"))
+
+
 def _extract_subtitles(
     src: Path, probe: _Probe, subs_dir: Path,
     *,
@@ -2257,7 +2267,9 @@ def _extract_subtitles(
 
     Returns the list of subtitle entries for the manifest. Each
     entry carries `format` so the catalog (and downstream clients)
-    can distinguish what's on disk.
+    can distinguish what's on disk, and `hearingImpaired` when its
+    stream's disposition says it is for the deaf and hard of hearing
+    (_hearing_impaired): its NAME says so, and its record makes it sdh.
 
     Every track is extracted regardless of the language whitelist
     (we don't lose data). `visible_indices` controls only the
@@ -2299,6 +2311,7 @@ def _extract_subtitles(
             "title": tags.get("title") or "",
             "default": False,
             "forced": bool(disp.get("forced")),
+            **({"hearingImpaired": True} if _hearing_impaired(s) else {}),
             # Client-side visibility hint. None means show every entry
             # (no whitelist configured); a set narrows to the source
             # indices the language filter accepted. We still write the
@@ -2976,22 +2989,44 @@ def _package_text_tracks(
             uri=f"{rid}/playlist.m3u8",
             language=media.get("LANGUAGE", _lang_key(lang) if lang != "und" else ""),
             name=name, forced=forced, autoselect=autoselect, stats=stats,
+            # One for the deaf and hard of hearing says what it is for, as
+            # its record does (sdh).
+            characteristics=hls.SDH_CHARACTERISTICS if _subtitle_purpose(entry) == "sdh" else "",
         ))
     names = hls.unique_names([r.name for r in renditions])
     return [hls.SubtitleRendition(**{**r.__dict__, "name": n})
             for r, n in zip(renditions, names, strict=True)]
 
 
+# The words a title says a subtitle is for the deaf and hard of hearing
+# with, as the record logic reads a title (libv2_records'
+# subtitle_purpose): "SDH", "CC", "Hearing impaired", "Closed captions".
+_SDH_WORDS = re.compile(r"\bsdh\b|\bcc\b|hearing|closed caption", re.IGNORECASE)
+
+
 def _subtitle_display_name(entry: dict[str, Any]) -> str:
     """The NAME of a subtitle rendition: the name of its language, then
-    what its title says besides ("English · SDH"), and "(forced)" for a
-    forced track whose name doesn't say so ("English (forced)"; "English ·
-    Forced" when its title did). A second track that reads the same is
-    told apart by hls.unique_names."""
+    what its title says besides ("English · SDH"), "(forced)" for a forced
+    track whose name doesn't say so ("English (forced)"; "English · Forced"
+    when its title did), and " · SDH" for one its record makes sdh whose
+    name doesn't say so — its stream's disposition said it is for the deaf
+    and hard of hearing (hearingImpaired): "English · SDH", as a title that
+    says so is named. A second track that reads the same is told apart by
+    hls.unique_names."""
     name = _track_display_name(entry.get("language"), entry.get("title"))
     if entry.get("forced") and "forced" not in name.casefold():
         name = f"{name} (forced)"
+    if _subtitle_purpose(entry) == "sdh" and not _SDH_WORDS.search(name):
+        name = f"{name} · SDH"
     return name
+
+
+def _subtitle_purpose(entry: dict[str, Any]) -> str:
+    """What a subtitle track is for, as its record says (package.json's
+    purpose: "sdh", "forced", "dialogue", …): the record logic's reading of
+    its manifest entry, its forced flag first, then its hearingImpaired
+    mark, then its title. A forced track is forced, whatever else it is."""
+    return rec.subtitle_rendition(entry, 0)["purpose"]
 
 
 def _codec_string_for_video(stream: dict[str, Any]) -> str:

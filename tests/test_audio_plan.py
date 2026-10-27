@@ -291,6 +291,24 @@ def test_audio_display_name_in_the_51_group_and_a_long_title() -> None:
     ({"language": "zxx", "title": "", "forced": False}, "No dialogue"),
     ({"language": "und", "title": "Signs & Songs", "forced": False}, "Signs & Songs"),
     ({"language": "und", "title": "", "forced": False}, "Unknown"),  # was "Subtitles 4"
+    # For the deaf and hard of hearing by its disposition alone: named as a
+    # title that says so is, and never twice; a forced one is forced.
+    ({"language": "eng", "title": "", "forced": False, "hearingImpaired": True}, "English · SDH"),
+    ({"language": "eng", "title": "SDH", "forced": False, "hearingImpaired": True},
+     "English · SDH"),
+    ({"language": "eng", "title": "English (CC)", "forced": False, "hearingImpaired": True},
+     "English · CC"),
+    ({"language": "eng", "title": "Hearing impaired", "forced": False, "hearingImpaired": True},
+     "English · Hearing impaired"),
+    ({"language": "eng", "title": "Commentary", "forced": False, "hearingImpaired": True},
+     "English · Commentary · SDH"),
+    ({"language": "ger", "title": "", "forced": True, "hearingImpaired": True}, "German (forced)"),
+    ({"language": "eng", "title": "Forced", "forced": True, "hearingImpaired": True},
+     "English · Forced"),
+    ({"language": "und", "title": "", "forced": False, "hearingImpaired": True}, "Unknown · SDH"),
+    # A title the record reads as SDH, whose words the NAME leaves out (a
+    # code of the language): the NAME says what the record does.
+    ({"language": "eng", "title": "eng-sdh", "forced": False}, "English · SDH"),
 ])
 def test_subtitle_display_name(entry, name) -> None:
     assert pk._subtitle_display_name(entry) == name

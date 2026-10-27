@@ -197,6 +197,16 @@ class SubtitleRendition:
     forced: bool
     autoselect: bool
     stats: PlaylistStats
+    # CHARACTERISTICS: the UTIs that say what the rendition is for, comma-
+    # separated (RFC 8216 4.3.4.1); '' for none.
+    characteristics: str = ""
+
+
+# The CHARACTERISTICS of subtitles for the deaf and hard of hearing (RFC
+# 8216 4.3.4.1, Apple's HLS authoring specification): they transcribe the
+# dialogue and describe the music and the sounds.
+SDH_CHARACTERISTICS = ("public.accessibility.transcribes-spoken-dialog,"
+                       "public.accessibility.describes-music-and-sound")
 
 
 def unique_names(names: list[str]) -> list[str]:
@@ -263,6 +273,8 @@ def build_master(
             attrs.append("AUTOSELECT=YES")
         if s.forced:
             attrs.append("FORCED=YES")
+        if s.characteristics:
+            attrs.append(f"CHARACTERISTICS={quoted(s.characteristics)}")
         out.append("#EXT-X-MEDIA:" + ",".join(attrs))
     if subs:
         out.append("")
