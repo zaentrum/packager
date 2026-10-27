@@ -15,7 +15,8 @@ Design rules:
   audio group, plus one I-frame playlist per rendition. The master is
   assembled by `packager.hls` from shaka's media playlists.
 * Audio: every source track becomes an AAC-LC 48 kHz stereo rendition
-  (group "audio" — what every browser decodes). A source track with
+  (group "audio" — what every browser decodes), one of more than two
+  channels downmixed under full scale (_stereo_filter). A source track with
   more than two channels (with SURROUND_AUDIO) additionally gets a 5.1
   E-AC-3 (or AC-3) rendition, first per language, in group
   "audio-surround", shown or hidden as its stereo rendition is. Exactly
@@ -44,6 +45,7 @@ from __future__ import annotations
 
 import codecs
 import json
+import math
 import os
 import posixpath
 import re
@@ -182,6 +184,44 @@ _CODEC_NAMES = {"hevc": "HEVC", "h264": "H.264"}
 STEREO_CODEC = "aac"
 STEREO_BITRATE = "192k"
 _STEREO_FORMAT = "aformat=sample_rates=48000:channel_layouts=stereo"
+# The stereo downmix of a track of more than two channels (_stereo_filter).
+# Its matrix is the usual one, ffmpeg's default: a front channel into its
+# side as it is, the centre into both sides and a surround into its own at
+# -3 dB, a back centre into both at -6 dB, the LFE left out (ffmpeg 8 takes an
+# AC-3's or E-AC-3's own mix levels instead; these are the same on every
+# version). A side's gains sum to 2.41 from a 5.1 (3.12 from a 7.1), and
+# ffmpeg scales them down for an integer output only, never for the float
+# samples AAC is encoded from: a hot 5.1 mix came out at +3 dBFS, which a
+# player clips as it decodes to 16 bits. So the gains are normalised to sum
+# to 1, which cannot exceed full scale, made up again to 3 dB under the plain
+# matrix (_DOWNMIX_LEVEL; a 2.1, which sums nothing, stays as it is), and held
+# under -3 dBFS by a lookahead limiter (10 ms ahead, 100 ms release, its delay
+# compensated: the timestamps are as before). A programme's coherent peaks
+# reach the limiter now and then; the AAC encode overshoots its input by up
+# to 1.5 dB at a transient (more with 5 ms ahead), so the decoded peaks stay
+# under -1 dBFS.
+_M3DB = math.sqrt(0.5)
+_DOWNMIX_GAINS = {  # (left, right)
+    "FL": (1.0, 0.0), "FR": (0.0, 1.0), "FC": (_M3DB, _M3DB), "LFE": (0.0, 0.0),
+    "BL": (_M3DB, 0.0), "BR": (0.0, _M3DB), "SL": (_M3DB, 0.0), "SR": (0.0, _M3DB),
+    "BC": (0.5, 0.5),
+}
+# The layouts made of those channels, by the names ffprobe gives them (ffmpeg
+# -layouts). Any other layout of more than two channels (a 7.1(wide), a
+# 5.1.2, one ffprobe has no name for) gets ffmpeg's own matrix normalised
+# (rematrix_maxval=1): never over full scale, no make-up, no limiter.
+_DOWNMIX_LAYOUTS = {
+    "2.1": "FL+FR+LFE", "3.0": "FL+FR+FC", "3.0(back)": "FL+FR+BC",
+    "3.1": "FL+FR+FC+LFE", "4.0": "FL+FR+FC+BC", "quad": "FL+FR+BL+BR",
+    "quad(side)": "FL+FR+SL+SR", "4.1": "FL+FR+FC+LFE+BC", "5.0": "FL+FR+FC+BL+BR",
+    "5.0(side)": "FL+FR+FC+SL+SR", "5.1": "FL+FR+FC+LFE+BL+BR",
+    "5.1(side)": "FL+FR+FC+LFE+SL+SR", "6.0": "FL+FR+FC+BC+SL+SR",
+    "hexagonal": "FL+FR+FC+BL+BR+BC", "6.1": "FL+FR+FC+LFE+BC+SL+SR",
+    "6.1(back)": "FL+FR+FC+LFE+BL+BR+BC", "7.0": "FL+FR+FC+BL+BR+SL+SR",
+    "7.1": "FL+FR+FC+LFE+BL+BR+SL+SR", "octagonal": "FL+FR+FC+BL+BR+BC+SL+SR",
+}
+_DOWNMIX_LEVEL = _M3DB
+_DOWNMIX_LIMITER = "alimiter=limit=-3dB:attack=10:release=100:level=disabled:latency=enabled"
 # The surround companion's layout: every one is a 5.1, a copy of a 5.1 of
 # the target codec or an encode made one (_surround_plan). The rules
 # report names it (rules.py).
@@ -1301,6 +1341,32 @@ def _timeline_output_args(timeline: str, ts_offset: float) -> list[str]:
     return []
 
 
+def _stereo_filter(stream: dict[str, Any]) -> str:
+    """The filters that make a source track's stereo rendition, 48 kHz
+    stereo, by the track's channels and channel_layout as ffprobe has them.
+    Mono or stereo: _STEREO_FORMAT, as ever. A layout of _DOWNMIX_LAYOUTS: the
+    normalised matrix (pan), then, where its gains sum to more than the
+    make-up gives back, the resample to 48 kHz (so nothing after the limiter
+    can raise a peak), the make-up to _DOWNMIX_LEVEL under the plain matrix,
+    the limiter. Any other layout: ffmpeg's own matrix, normalised."""
+    channels = int(stream.get("channels") or 0)
+    if channels <= 2:
+        return _STEREO_FORMAT
+    names = _DOWNMIX_LAYOUTS.get(str(stream.get("channel_layout") or ""), "").split("+")
+    if len(names) != channels:
+        return f"aresample=48000:rematrix_maxval=1,{_STEREO_FORMAT}"
+    rows = [[(name, _DOWNMIX_GAINS[name][side]) for name in names if _DOWNMIX_GAINS[name][side]]
+            for side in (0, 1)]
+    total = max(sum(gain for _, gain in row) for row in rows)
+    pan = "pan=stereo|" + "|".join(
+        out + "=" + "+".join(f"{gain / total:.4g}*{name}" for name, gain in row)
+        for out, row in zip(("FL", "FR"), rows, strict=True))
+    makeup = 20 * math.log10(total * _DOWNMIX_LEVEL)
+    if makeup <= 0:
+        return f"{pan},{_STEREO_FORMAT}"
+    return f"{pan},aresample=48000,volume={makeup:.2f}dB,{_DOWNMIX_LIMITER},{_STEREO_FORMAT}"
+
+
 def _prepare_source(
     src: Path, probe: _Probe, tmpdir: Path,
     *,
@@ -1325,8 +1391,9 @@ def _prepare_source(
     sample rate, and known channel layout. 5.1 / 7.1 source audio left
     as-is with channel_layout=unknown is what Chrome's MSE rejects with
     CHUNK_DEMUXER_ERROR_APPEND_FAILED. The channel conversion is done in
-    the filter graph (aformat), never by per-stream `-ac:a:N`, which
-    silently no-ops for channel counts.
+    the filter graph (_stereo_filter: aformat, and for more than two
+    channels a downmix that stays under full scale), never by per-stream
+    `-ac:a:N`, which silently no-ops for channel counts.
 
     Surround: per `_surround_plan`, a stream copy or an E-AC-3/AC-3 5.1
     encode at 48 kHz of the same decoded audio (asplit, one decode). The
@@ -1365,15 +1432,16 @@ def _prepare_source(
 
     encode_surround = {s.source_index for s in surround if s.mode == "encode"}
     chains: list[str] = []
-    for i in range(len(probe.audio)):
+    for i, stream in enumerate(probe.audio):
+        stereo = _stereo_filter(stream)
         if i in encode_surround:
             chains += [
                 f"[0:a:{i}]asplit=2[as{i}][am{i}]",
-                f"[as{i}]{_STEREO_FORMAT}[s{i}]",
+                f"[as{i}]{stereo}[s{i}]",
                 f"[am{i}]{_SURROUND_FORMAT}[m{i}]",
             ]
         else:
-            chains.append(f"[0:a:{i}]{_STEREO_FORMAT}[s{i}]")
+            chains.append(f"[0:a:{i}]{stereo}[s{i}]")
     if chains:
         args += ["-filter_complex", ";".join(chains)]
 

@@ -10,10 +10,20 @@ import pytest
 
 from packager import packager as pk
 
+# The layout ffprobe names a track of so many channels by, as a test track has it.
+_LAYOUTS = {1: "mono", 2: "stereo", 6: "5.1(side)", 8: "7.1"}
+
+# The stereo rendition's filters for a 5.1(side) track: the downmix (test_downmix.py).
+DOWNMIX_5_1 = ("pan=stereo|FL=0.4142*FL+0.2929*FC+0.2929*SL|FR=0.4142*FR+0.2929*FC+0.2929*SR,"
+               "aresample=48000,volume=4.65dB,"
+               "alimiter=limit=-3dB:attack=10:release=100:level=disabled:latency=enabled,"
+               "aformat=sample_rates=48000:channel_layouts=stereo")
+
 
 def _a(lang: str, ch: int = 2, codec: str = "aac", title: str = "", default: bool = False,
        comment: bool = False) -> dict:
     return {"codec_name": codec, "channels": ch,
+            **({"channel_layout": _LAYOUTS[ch]} if ch in _LAYOUTS else {}),
             "tags": {"language": lang, **({"title": title} if title else {})},
             "disposition": {"default": int(default), "comment": int(comment)}}
 
@@ -163,11 +173,13 @@ def test_prepare_source_command(monkeypatch, tmp_path: Path) -> None:
     assert args[:args.index("-i")] == [
         "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning", "-copyts"]
     graph = args[args.index("-filter_complex") + 1]
+    # A 5.1's stereo is the downmix, beside its encoded companion (asplit)
+    # or alone (a copied one); a stereo track's is the format, as ever.
     assert graph == ";".join([
         "[0:a:0]asplit=2[as0][am0]",
-        "[as0]aformat=sample_rates=48000:channel_layouts=stereo[s0]",
+        f"[as0]{DOWNMIX_5_1}[s0]",
         "[am0]aformat=sample_rates=48000:channel_layouts=5.1(side)|5.1[m0]",
-        "[0:a:1]aformat=sample_rates=48000:channel_layouts=stereo[s1]",
+        f"[0:a:1]{DOWNMIX_5_1}[s1]",
         "[0:a:2]aformat=sample_rates=48000:channel_layouts=stereo[s2]",
     ])
     head = args[:args.index("-filter_complex")]
@@ -205,9 +217,11 @@ def test_a_hidden_tracks_companion_is_hidden_too(monkeypatch, tmp_path: Path) ->
     assert [(m["idx"], m["channels"], m["default"], m["visible"], m["mode"])
             for m in surround_meta] == [(0, 6, True, True, "encode"),
                                         (1, 6, False, False, "encode")]
-    # The 7.1 is made a 5.1 like the others: the same filter, a 5.1 layout.
+    # The 7.1 is made a 5.1 like the others: the same filter, a 5.1 layout;
+    # its stereo is the 7.1's downmix.
     graph = calls[0][calls[0].index("-filter_complex") + 1]
     assert "[am1]aformat=sample_rates=48000:channel_layouts=5.1(side)|5.1[m1]" in graph
+    assert "[as1]pan=stereo|FL=0.3204*FL+0.2265*FC+0.2265*BL+0.2265*SL|" in graph
 
 
 def test_prepare_source_legacy_timeline_has_no_copyts(monkeypatch, tmp_path: Path) -> None:
