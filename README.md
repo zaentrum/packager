@@ -192,6 +192,21 @@ match across ISO 639-1/-2 (`de` = `ger` = `deu`). In `manifest.json`,
 with exactly one `default`), so readers that count or list `audio` see
 the same tracks as before.
 
+**Downmix.** A track of more than two channels gets the usual stereo
+matrix (the fronts as they are, the centre and the surrounds at -3 dB, a
+back centre at -6 dB, no LFE), normalised so that neither side can
+exceed full scale, made up again to 3 dB under the plain matrix, and held
+under -3 dBFS by a lookahead limiter (`alimiter`, 10 ms ahead, 100 ms
+release, its delay compensated). The plain matrix, which ffmpeg leaves
+unscaled for the AAC encoder's float input, reached +3 dBFS on a loud 5.1
+and clipped in the players; on loud test mixes the downmix stays under -1
+dBFS as the AAC is decoded (the encode overshoots the ceiling by up to 1.5
+dB at a transient), 3 LU under the plain matrix's loudness. Layouts are
+known by ffprobe's names (2.1 to 7.1, `5.1` and `5.1(side)` alike); any
+other layout of more than two channels gets ffmpeg's own matrix
+normalised (`rematrix_maxval=1`), without make-up. A mono or stereo track
+is converted as before.
+
 **Subtitles.** Sidecars are extracted exactly as before; PGS / VobSub /
 DVB stay sidecar-only because HLS can't carry them. The source's PGS and
 text tracks are written in one ffmpeg run over it, an output per track,
