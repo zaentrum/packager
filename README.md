@@ -139,8 +139,12 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   (Finland)"); one that names another region than the tag's stays
   ("Portuguese (Portugal) · PT-BR"); a track of unknown language is
   called what its title says, else "Unknown". A forced subtitle whose
-  name doesn't say so gets "(forced)". NAMEs are unique within a group: a
-  second "English" is "English (2)". The names of regions, scripts and
+  name doesn't say so gets "(forced)". A subtitle for the deaf and hard
+  of hearing by its stream's disposition alone (`hearing_impaired` or
+  `captions`, no title that says so) is named as a title that says so
+  is, "English · SDH", unless its name says it already (SDH, CC,
+  hearing); a forced one is named as forced. NAMEs are unique within a
+  group: a second "English" is "English (2)". The names of regions, scripts and
   languages, and which regions are a language's own, are CLDR's as the
   clients' `Intl.DisplayNames` gives them: `src/packager/regions.py`,
   written by `node scripts/regions.mjs`.
@@ -215,8 +219,13 @@ index; `subtitles[].hls` in the manifest). Their segments carry no
 default map (`MPEGTS:9000`, the 100 ms it shifts MPEG-TS output by) put
 every cue 100 ms after its frame against our fMP4 media, which start
 at 0. The master references them
-(TYPE=SUBTITLES, DEFAULT=NO, FORCED=YES on forced tracks) only with
-`HLS_SUBTITLES=true`, which is **off by default**. The clients draw the
+(TYPE=SUBTITLES, DEFAULT=NO, FORCED=YES on forced tracks, and on those
+for the deaf and hard of hearing, by their disposition or their title,
+`CHARACTERISTICS="public.accessibility.transcribes-spoken-dialog,public.accessibility.describes-music-and-sound"`)
+only with `HLS_SUBTITLES=true`, which is **off by default**. A track
+whose stream's disposition says it is for the deaf and hard of hearing
+(`hearing_impaired` or `captions`) is `hearingImpaired: true` in the
+manifest. The clients draw the
 sidecars themselves, and the playback API doesn't route `sN/` yet.
 Turning it on changes the master only; the renditions are already on
 disk. In the manifest, at most one subtitle is `default`: a visible
@@ -530,7 +539,13 @@ packager's own records against the golden ones of the same commit. To take
 a new copy, copy `tools/libv2_records.py` and `tools/testdata/libv2_records/`
 from the schemas repository at one commit and update the test's values.
 The packager adds what only it knows: which stream of the original each
-rendition was made from. A subtitle made from a file that came with the
+rendition was made from, and whether a subtitle's stream is for the deaf
+and hard of hearing as the original's disposition says (`hearingImpaired`,
+which the record logic reads as that disposition): such a subtitle is
+`sdh` by `disposition` in `package.json`, its language one of the
+package's `sdhSubtitleLanguages` as it is of the source's, even where the
+transcoder's encode lost the flag (Matroska has none for `captions`). A
+subtitle made from a file that came with the
 original names its copy (`fromSidecar: "sources/<sourceId>/subtitle-<n>…"`):
 the file the copy was made from, or the copy itself, by its path, else a
 copy of the same bytes — never by a name. No subtitle is `default` in
