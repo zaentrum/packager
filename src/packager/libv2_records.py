@@ -71,8 +71,11 @@ import copy, datetime, hashlib, json, os, re, shutil, subprocess, uuid
 # chain_problems() reads such a chain. 5: package_files() and fill_checksums() read several files at a
 # time (jobs). 6: a subtitle attached to a version after its package completed is no file of the
 # package (attached_subtitle): chain_problems() and fill_checksums() leave it out of the chain, and a
-# full check holds its bytes to its name. Every record 5 and 6 write is the one before.
-LIBV2_RECORDS = 6
+# full check holds its bytes to its name. Every record 5 and 6 write is the one before. 7: a subtitle
+# whose manifest entry says the stream it was made from is for the hard of hearing (hearingImpaired:
+# its disposition said hearing_impaired or captions) is sdh by that disposition, as the stream is in
+# its source's essence; a manifest that says nothing of it gives the record it gave.
+LIBV2_RECORDS = 7
 
 NS = uuid.uuid5(uuid.NAMESPACE_URL, "https://zaentrum.github.io/schemas/library")
 PACKAGE_DIRS = ("hls", "subs", "trickplay", "trailers")
@@ -1061,7 +1064,8 @@ def audio_rendition(a, i):
 
 def subtitle_rendition(s, i, from_sidecar=None):
     title = text(s.get("title")) or ""
-    purpose, purpose_from = subtitle_purpose({"disposition": {"forced": bool(s.get("forced"))},
+    purpose, purpose_from = subtitle_purpose({"disposition": {"forced": bool(s.get("forced")),
+                                                              "hearing_impaired": bool(s.get("hearingImpaired"))},
                                               "tags": {"title": title}})
     out = {"id": text(s.get("id")) or f"sub{i}", "path": s.get("path") or f"subs/{i}.vtt",
            "language": rendition_language(s.get("language")), "title": title, "default": bool(s.get("default")),
@@ -1188,7 +1192,10 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
     to be unmeasured. role is derived while the folder keeps the original beside the package, and
     canonical when it keeps none. sidecars maps a subtitle rendition's id to the copy of the subtitle
     file it was made from, as its source's sidecars[] names it (sources/<sourceId>/subtitle-<n>…),
-    relative to the item folder. The playlist flags a reader could
+    relative to the item folder. A subtitle is for what its manifest entry says, read as a source's
+    stream is (subtitle_purpose): its forced flag, whether the stream it was made from is for the hard
+    of hearing (hearingImpaired, as that stream's disposition said), then its title — so a stream sdh
+    by its disposition alone is sdh in both essences. The playlist flags a reader could
     not follow are normalised, each with a note: a second default audio rendition is not one, a
     package with none has its first, a forced subtitle is never the default, and of the rest only
     the first default is one."""
