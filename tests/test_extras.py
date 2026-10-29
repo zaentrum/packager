@@ -564,7 +564,7 @@ def run(monkeypatch: pytest.MonkeyPatch, events: list[dict], catalog: Catalog,
         calls.append((args, kwargs))
         if package:
             return package(*args, **kwargs)
-        kwargs["stereo"].kept = 1  # its one track, as a run at the target says
+        kwargs["stereo"].known, kwargs["stereo"].kept = True, 1  # its one track, at the target
         return MANIFEST
 
     monkeypatch.setattr(extras, "build_consumer", build_consumer)

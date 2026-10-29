@@ -20,7 +20,14 @@ are not contiguous (a container's rounding) is lifted with its timing: a
 stereo one its first sample and its samples, its length to the rounding,
 where the limiter, given those timestamps, puts the rest 10 ms late; a
 downmixed one, whose rendition the limiter has put 10 ms late already, as
-its rendition, packet for packet.
+its rendition, packet for packet. Every rendition of a track that isn't
+lifted, and the one in the remux of a track that is, is what it was
+without the loudness, packet for packet: a loud mono AAC track, a hot
+stereo AAC one at 44.1 kHz, a 2.1 and a stereo FLAC one at 44.1 kHz, a
+quiet mono one. Two quiet tracks a client is offered neither of: the one
+the master makes the default is lifted, and counted. A film whose title tag
+is Latin-1 bytes is packaged, its quiet track lifted; a lift that runs over
+its timeout is killed and leaves nothing behind.
 
 The temp folder's free space is a node's as the guard sees it (this
 machine's disk may be fuller than its floor)."""
@@ -274,8 +281,8 @@ def test_a_lifted_rendition_is_packaged_on_the_segments_it_had(
         roots[label] = tmp_path / label / "movies" / ITEM[:2] / ITEM
         assert not any(k.startswith("_") for a in manifest["renditions"]["audio"] for k in a)
     # What the done step's details say of it: three lifted, the loud one kept.
-    assert stereo == {"before": pk.StereoLoudness(off=True),
-                      "after": pk.StereoLoudness(lifted=3, kept=1, skipped=0)}
+    assert stereo == {"before": pk.StereoLoudness(known=True, off=True),
+                      "after": pk.StereoLoudness(known=True, lifted=3, kept=1, skipped=0)}
     for a in ("a0", "a1", "a2", "a3", "a4", "a5"):
         playlists = [(roots[label] / "hls" / a / "playlist.m3u8").read_text()
                      for label in ("before", "after")]
@@ -354,3 +361,125 @@ def _packets(path: Path) -> list[str]:
     return subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
                            "packet=pts,duration", "-of", "csv=p=0", str(path)],
                           capture_output=True, text=True, check=True).stdout.split()
+
+
+def _framemd5(path: Path, stream: str) -> list[str]:
+    """A stream's packets, as they are (framemd5 of its copy)."""
+    out = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-map", stream,
+                          "-c", "copy", "-f", "framemd5", "-"], capture_output=True, text=True,
+                         check=True).stdout
+    return [line for line in out.splitlines() if not line.startswith("#")]
+
+
+@pytest.fixture(scope="module")
+def loud_film(tmp_path_factory) -> Path:
+    """Loud tracks kept as they are (a mono AAC, a hot stereo AAC at 44.1 kHz,
+    a 2.1 FLAC, a stereo FLAC at 44.1 kHz) and a quiet mono AAC, lifted."""
+    d = tmp_path_factory.mktemp("identity")
+    hot = ("anoisesrc=color=pink:amplitude=0.9:seed={s}:duration=8:sample_rate={r},"
+           "alimiter=limit=0.99:level=disabled,volume=1.5")
+    tracks = [(hot.format(s=1, r=48000), ["-ac", "1", "-c:a", "aac", "-b:a", "128k"]),
+              (hot.format(s=2, r=44100), ["-ac", "2", "-c:a", "aac", "-b:a", "256k"]),
+              ("anoisesrc=color=pink:amplitude=0.5:seed=3:duration=8:sample_rate=48000,"
+               "pan=2.1|FL=c0|FR=c0|LFE=c0", ["-c:a", "flac"]),
+              ("anoisesrc=color=pink:amplitude=0.5:seed=4:duration=8:sample_rate=44100",
+               ["-ac", "2", "-c:a", "flac"]),
+              ("anoisesrc=color=pink:amplitude=0.02:seed=5:duration=8:sample_rate=48000",
+               ["-ac", "1", "-c:a", "aac", "-b:a", "128k"])]
+    args = ["-f", "lavfi", "-i", "color=c=black:s=64x64:r=24:d=8"]
+    for n, (graph, codec) in enumerate(tracks):
+        _ff("-f", "lavfi", "-i", graph, *codec, str(d / f"t{n}.mka"))
+        args += ["-i", str(d / f"t{n}.mka")]
+    _ff(*args, "-map", "0:v", *[a for n in range(len(tracks)) for a in ("-map", f"{n + 1}:a")],
+        "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "copy",
+        *[a for n, lang in enumerate(["eng", "ger", "fre", "ita", "spa"])
+          for a in (f"-metadata:s:a:{n}", f"language={lang}")], str(d / "loud.mkv"))
+    return d / "loud.mkv"
+
+
+def test_every_rendition_is_what_it_was_without_the_loudness(loud_film: Path,
+                                                             tmp_path: Path) -> None:
+    probe = pk._ffprobe(loud_film)
+    assert [(s["codec_name"], s["channels"], int(s["sample_rate"])) for s in probe.audio] == [
+        ("aac", 1, 48000), ("aac", 2, 44100), ("flac", 3, 48000), ("flac", 2, 44100),
+        ("aac", 1, 48000)]
+    runs = {}
+    for label, target in (("before", None), ("after", -20.0)):
+        (tmp_path / label).mkdir()
+        runs[label] = pk._prepare_source(loud_film, probe, tmp_path / label,
+                                         audio_visible_indices=None, default_index=0,
+                                         stereo_loudness=target)
+    (before, _, _), (after, meta, _) = runs["before"], runs["after"]
+    # The loud ones kept, the quiet mono lifted ...
+    assert [m.get("_lift") for m in meta] == ["keep", "keep", "keep", "keep", "lift"]
+    assert _streams(meta[4]["_input"]) == [("aac", 2, "stereo")]
+    # ... and every rendition of the remux as it was, packet for packet.
+    assert _streams(after) == _streams(before) == [("aac", 2, "stereo")] * 5
+    for stream in [f"0:a:{n}" for n in range(5)]:
+        assert _framemd5(after, stream) == _framemd5(before, stream), stream
+
+
+def _quiet_stereo(path: Path, seed: int) -> None:
+    _ff("-f", "lavfi", "-i", f"anoisesrc=color=pink:amplitude=0.15:seed={seed}:duration=12",
+        "-ac", "2", "-c:a", "aac", "-b:a", "192k", str(path))
+
+
+@pytest.mark.skipif(shutil.which("packager") is None, reason="needs shaka-packager on PATH")
+def test_the_default_track_is_lifted_though_no_client_is_offered_it(tmp_path: Path,
+                                                                    monkeypatch) -> None:
+    # French and Italian, a whitelist of English and German: no track shown,
+    # and the master's default plays all the same.
+    for n in (1, 2):
+        _quiet_stereo(tmp_path / f"q{n}.mka", n)
+    film = tmp_path / "film.mkv"
+    _ff("-f", "lavfi", "-i", "color=c=black:s=64x64:r=24:d=12", "-i", str(tmp_path / "q1.mka"),
+        "-i", str(tmp_path / "q2.mka"), "-map", "0:v", "-map", "1:a", "-map", "2:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "copy",
+        "-metadata:s:a:0", "language=fre", "-metadata:s:a:1", "language=ita", str(film))
+    monkeypatch.setattr(pk, "PACKAGES_ROOT", tmp_path / "packages")
+    stereo = pk.StereoLoudness()
+    manifest = pk.package_item(ITEM, str(film), "movie", title="clip", trickplay=False,
+                               language_whitelist=["en", "de"], keep_original_if_single=True,
+                               options=pk.PackageOptions(stereo_loudness=-20.0), stereo=stereo)
+    audio = manifest["renditions"]["audio"]
+    assert [(a["language"], a["visible"], a["default"]) for a in audio] == [
+        ("fre", False, True), ("ita", False, False)]
+    assert stereo.details == " st_lift=1 st_keep=0 st_skip=0"
+    root = tmp_path / "packages" / "movies" / ITEM[:2] / ITEM
+    master = (root / "hls" / "master.m3u8").read_text()
+    assert 'LANGUAGE="fr"' in master and "DEFAULT=YES,AUTOSELECT=YES" in master
+    joined = tmp_path / "a0.mp4"
+    joined.write_bytes(b"".join(p.read_bytes() for p in [
+        root / "hls" / "a0" / "init.mp4", *sorted((root / "hls" / "a0").glob("seg-*.m4s"))]))
+    assert _r128(joined)["I"] == pytest.approx(-20.0, abs=1.0)
+
+
+def test_a_title_tag_of_latin_1_bytes_is_packaged_and_lifted(tmp_path: Path) -> None:
+    # The title as an old muxer wrote it: Latin-1 bytes, not UTF-8.
+    _quiet_stereo(tmp_path / "q.mka", 1)
+    utf8 = tmp_path / "utf8.mkv"
+    _ff("-f", "lavfi", "-i", "color=c=black:s=64x64:r=24:d=12", "-i", str(tmp_path / "q.mka"),
+        "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "copy",
+        "-metadata", "title=Caf\u00e9X", "-metadata:s:a:0", "language=eng", str(utf8))
+    data = utf8.read_bytes()
+    film = tmp_path / "latin1.mkv"
+    film.write_bytes(data.replace(b"Caf\xc3\xa9X", b"Caf\xe9XX", 1))
+    assert b"Caf\xe9XX" in film.read_bytes()
+    # ffmpeg's log of the film itself holds those bytes: read, all the same.
+    assert pk._measure_loudness(film) is not None
+    probe = pk._ffprobe(film)
+    mp4, meta, _ = pk._prepare_source(film, probe, tmp_path, default_index=0,
+                                      stereo_loudness=-20.0)
+    assert meta[0].get("_lift") == "lift"
+    assert _r128(meta[0]["_input"])["I"] == pytest.approx(-20.0, abs=1.0)
+
+
+def test_a_lift_that_runs_over_its_timeout_is_killed_and_leaves_nothing(
+        film: Path, tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(pk, "_LIFT_TIMEOUT", 0.0001)
+    monkeypatch.setattr(pk, "_LIFT_TIMEOUT_PER_SECOND", 0.0)
+    _mp4, meta = _prepare(film, tmp_path, -20.0)
+    # Every quiet track's lift ran over: made as before, counted skipped.
+    assert [m.get("_lift") for m in meta] == ["skip", "skip", "skip", "skip"]
+    assert not any("_input" in m for m in meta)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["transmux.mp4"]

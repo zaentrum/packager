@@ -82,9 +82,12 @@ class Binaries:
                          subtitles=[], video_index=0)
 
     @staticmethod
-    def _prepare(_src, _probe, tmpdir: Path, **_kw):
+    def _prepare(_src, _probe, tmpdir: Path, **kw):
+        # Its one track shown, at the target or above: kept, as the remux
+        # marks it (packager._prepare_source; the done step's details say it).
         audio = [{"idx": 0, "codec": "aac", "language": "eng", "title": "", "channels": 2,
-                  "default": True, "visible": True}]
+                  "default": True, "visible": True,
+                  **({"_lift": "keep"} if kw.get("stereo_loudness") is not None else {})}]
         return tmpdir / "transmux.mp4", audio, []
 
     def _shaka(self, _primary, videos, audio_meta, surround_meta, out_root: Path, **_kw):
@@ -278,10 +281,15 @@ def _whole(share: Share) -> None:
         pk.MANIFEST_FILE, ".failed", pk.STAGING_DIR, pk.SENTINEL)]
 
 
+# What the done step's details end with for the stub's one track, kept.
+KEPT_ONE = " st_lift=0 st_keep=1 st_skip=0"
+
+
 def test_a_version_goes_into_the_record(binaries: Binaries, share: Share) -> None:
     catalog = Catalog()
     run(share.record(), catalog)
     assert catalog.statuses == ["in_progress", "done"]
+    assert str(catalog.written[-1][1]["details"]).endswith(KEPT_ONE)
     _whole(share)
     assert not share.staging.exists() and not share.inbox.exists()
 
@@ -765,6 +773,7 @@ def test_an_extra_goes_into_its_titles_folder(binaries: Binaries, share: Share) 
     catalog = Catalog()
     run_extra(x.record(), catalog)
     assert catalog.statuses == ["in_progress", "done"]
+    assert str(catalog.written[-1][1]["details"]).endswith(KEPT_ONE)
     assert sorted(p.name for p in x.extra_dir.iterdir()) == [
         ".complete", "checksums.sha256", "extra.json", "hls", "package.json"]
     assert library.verify_chain(x.extra_dir, "extra.json", rec.EXTRA_DIRS) is None

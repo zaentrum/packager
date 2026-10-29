@@ -695,6 +695,7 @@ def test_an_add_puts_a_package_into_the_version_that_holds_its_original(
     catalog = Catalog()
     go(add, catalog)
     assert catalog.statuses == ["in_progress", "done"]
+    assert str(catalog.written[-1][1]["details"]).endswith(" st_lift=0 st_keep=1 st_skip=0")
     assert binaries.builds == 1
     assert sorted(p.name for p in vdir.iterdir()) == [
         ".complete", "checksums.sha256", "hls", NAME, "package.json", "subs", "trickplay",

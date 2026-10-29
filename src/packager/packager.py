@@ -235,17 +235,27 @@ _DOWNMIX_LIMITER = "alimiter=limit=-3dB:attack=10:release=100:level=disabled:lat
 # encoders a mono). Where the limiter doesn't act, it is that matrix sample
 # for sample.
 _STEREO_FALLBACK_MATRIX = f"aresample=48000:rematrix_maxval=1,{_STEREO_FORMAT}"
+# What the remuxes shaka-packager packages from leave out of the original:
+# its global metadata (the container's title and its other tags) and its
+# chapters, so nothing of them can reach a package's media, whatever
+# shaka-packager would carry over. The streams' own metadata is copied as
+# before: the languages the renditions are named by. ffmpeg writes its own
+# muxer tags (encoder), which say nothing of the original.
+NO_GLOBAL_METADATA = ("-map_metadata", "-1", "-map_chapters", "-1")
 # The stereo rendition's loudness (_lift_stereo). Downloads and phones play
 # the stereo rendition, and a film's mix, made for a cinema or a living
 # room, comes out of the downmix at -28 to -34 LUFS: too quiet for a phone
 # or headphones. So the signal a stereo rendition is made from (after the
-# downmix) is measured first (EBU R128: integrated loudness, loudness range,
-# true peak), and a rendition that would be quieter than the target
+# downmix) is measured first (EBU R128: integrated loudness, loudness range),
+# and a rendition that would be quieter than the target
 # (options.stereo_loudness, STEREO_LOUDNESS by default) by more than
-# _LIFT_WITHIN is made again from it, lifted to the target, by at most
-# _LIFT_MAX. Only lifted: a mix at the target or above, one too short to
-# measure (_LIFT_MIN_SECONDS) and a silent one (_SILENT: nothing passes the
-# absolute gate) are made as before, a stereo track's sample for sample. The
+# _LIFT_WITHIN is made again from it, its integrated loudness lifted to the
+# target by at most _LIFT_MAX (its quiet passages may rise more: the make-up
+# after the compressor lifts what it doesn't bring down). Only lifted: a mix
+# at the target or above, one too short to measure (_LIFT_MIN_SECONDS) and a
+# silent one (_SILENT: nothing passes the absolute gate) are made as before,
+# a stereo track's sample for sample. The tracks measured are those a client
+# offers and the default one, which plays whatever the settings show. The
 # 5.1 companions and the copied tracks are never touched.
 STEREO_LOUDNESS = -20.0
 _LIFT_WITHIN = 1.0
@@ -256,8 +266,9 @@ _SILENT = -70.0
 # threshold is _LIFT_THRESHOLD over the lifted mix's integrated loudness, so
 # that dialogue passes it untouched and only the loudest passages are
 # brought down, slowly; the make-up of what it and the limiter take off the
-# integrated loudness (measured: 0.1 to 3 LU); a lookahead limiter for what
-# is left of the peaks, its delay compensated. The gain into the limiter
+# integrated loudness (0.1 to 4 LU), measured in one run at two make-ups
+# (_LIFT_PROBES) and taken on the line between them; a lookahead limiter for
+# what is left of the peaks, its delay compensated. The gain into the limiter
 # alone left it 8.7 dB to take off a film's loudest peaks lifted 13 dB;
 # with the compressor before it, no more than 6, more than 3 for 0.1 % of
 # the time, and the dialogue's level moves by under 0.5 dB (on a synthetic
@@ -265,14 +276,23 @@ _SILENT = -70.0
 # loudnorm, two-pass, falls back to its dynamic mode on a film mix (its true
 # peak leaves no linear gain) and moves the dialogue by 3 to 7 dB, its
 # loudness up to 4 LU off the target. The AAC encode overshoots the limiter
-# by up to 2 dB: the decoded AAC is measured, and a true peak not under
-# _LIFT_TRUE_PEAK makes it again with the limiter that much lower, once.
+# by up to 2 dB: the decoded AAC is measured (its true peak only there, once),
+# and one whose true peak is not under _LIFT_TRUE_PEAK, or whose loudness is
+# more than _LIFT_TOLERANCE off the level the lift puts it at (what the
+# limiter takes too), is made again with the limiter that much lower and the
+# make-up that much corrected, once.
 _LIFT_THRESHOLD = 8.0
 _LIFT_COMPRESSOR = "ratio=2:attack=50:release=500:knee=2.82843:detection=rms:link=maximum"
 _LIFT_CEILING = -4.0
 _LIFT_TRUE_PEAK = -2.0
-_LIFT_TOLERANCE = 0.3
-_LIFT_ROUNDS = 3
+_LIFT_TOLERANCE = 0.5
+_LIFT_PROBES = (0.0, 4.0)
+# Every ffmpeg run of a lift has a timeout, a generous one: _LIFT_TIMEOUT
+# seconds and _LIFT_TIMEOUT_PER_SECOND for every second of the track (a run
+# takes a fraction of it). One that runs over is killed, and the track is
+# made as before (SKIPPED).
+_LIFT_TIMEOUT = 600.0
+_LIFT_TIMEOUT_PER_SECOND = 2.0
 # The limiter keeps its own timestamps only while each frame it is given
 # starts where the last one ended; at the first that doesn't (timestamps a
 # container's time base rounded, a millisecond in Matroska) it takes the
@@ -291,18 +311,23 @@ _LIFT_TIMING_SLACK = 0.002
 # are its signal to a step (-138 dBFS). Full scale clips only what a lossy
 # decoder overshoots it by (the downmix is normalised): in a mix quiet
 # enough to be lifted those are peaks that the lift's limiter takes down by
-# more than the clip did. Written for the tracks a client offers only (the others are
-# packaged as before), and only where the temp folder keeps, with an upper
-# bound of them written (_SIGNAL_BYTES_PER_SECOND each: FLAC's worst case,
-# 24-bit PCM and its frames, 2.1 % over it on random samples), more free than
-# _LIFT_TEMP_FLOOR bytes and _LIFT_TEMP_SHARE of its file system: it is a
-# node's own disk, which a pod is evicted from as it fills (the remux is
-# written as before, not counted).
+# more than the clip did. None of the source's metadata goes into them.
+# Written for the tracks measured only (the others are packaged as before),
+# and only where the temp folder keeps, with an upper bound of them written
+# (_SIGNAL_BYTES_PER_SECOND each: FLAC's worst case, 24-bit PCM and its
+# frames, 2.1 % over it on random samples), more free than _LIFT_TEMP_FLOOR
+# bytes and _LIFT_TEMP_SHARE of its file system. The temp folder is on the
+# node's own file system: under 10 % free there the kubelet evicts pods, and
+# where its images share it, under 15 % it removes the images no pod uses
+# first; 12 % keeps the signals clear of eviction. The remux is written as
+# before, not counted. A signal is decoded on one thread (_SIGNAL_INPUT): the
+# FLAC decoder's frame threads only cost.
 _SIGNAL_CODEC = ("-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24",
-                 "-frame_size", "1024")
+                 "-frame_size", "1024", *NO_GLOBAL_METADATA)
+_SIGNAL_INPUT = ("-threads", "1")
 _SIGNAL_BYTES_PER_SECOND = 48000 * 2 * 3 * 1.025
 _LIFT_TEMP_FLOOR = 30e9
-_LIFT_TEMP_SHARE = 0.15
+_LIFT_TEMP_SHARE = 0.12
 # How many tracks are lifted at once: each lift is a few ffmpeg runs of one
 # thread or two, and nothing else runs meanwhile (the CPUs the deployment
 # gives a packager).
@@ -405,7 +430,7 @@ class PackageError(RuntimeError):
     .failed so operators can see what went wrong."""
 
 
-def _run_ffmpeg_capturing(label: str, args: list[str]) -> None:
+def _run_ffmpeg_capturing(label: str, args: list[str], timeout: float | None = None) -> None:
     """Run an ffmpeg invocation capturing stderr so failures surface
     the actual diagnostic instead of the bare exit code.
 
@@ -413,9 +438,15 @@ def _run_ffmpeg_capturing(label: str, args: list[str]) -> None:
     exit but its str(e) is a one-line `Command '[...]' returned
     non-zero exit status 1.` — useless when triaging failures on the
     bulk-packaging queue. Capturing stderr + raising PackageError
-    with a 1500-char snippet keeps the .failed sentinel actionable.
+    with a 1500-char snippet keeps the .failed sentinel actionable. Its
+    stderr is read as UTF-8 whatever bytes a file's tags bring into it; a
+    run over `timeout` seconds is killed (PackageError).
     """
-    result = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", stdin=subprocess.DEVNULL, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise PackageError(f"ffmpeg {label} ran over {timeout:.0f} s and was killed") from e
     if result.returncode != 0:
         stderr = (result.stderr or "").strip()
         raise PackageError(
@@ -578,9 +609,11 @@ LIFTED, KEPT, SKIPPED = "lift", "keep", "skip"
 
 @dataclass
 class StereoLoudness:
-    """What the stereo loudness did with a run's shown tracks, each counted
-    once (LIFTED, KEPT, SKIPPED); `off`: it had no target. The done step's
-    details say it (`details`)."""
+    """What the stereo loudness did with a run's measured tracks (those a
+    client offers and the default), each counted once (LIFTED, KEPT,
+    SKIPPED); `off`: it had no target; `known`: a run said so. The done
+    step's details say it (`details`); nothing where it isn't known."""
+    known: bool = False
     off: bool = False
     lifted: int = 0
     kept: int = 0
@@ -588,6 +621,8 @@ class StereoLoudness:
 
     @property
     def details(self) -> str:
+        if not self.known:
+            return ""
         if self.off:
             return " st=off"
         return f" st_lift={self.lifted} st_keep={self.kept} st_skip={self.skipped}"
@@ -598,8 +633,8 @@ def _stereo_loudness_of(audio_meta: list[dict[str, Any]], target: float | None) 
     with (`_lift`), the marks taken off them."""
     done = [entry.pop("_lift") for entry in audio_meta if "_lift" in entry]
     if target is None:
-        return StereoLoudness(off=True)
-    return StereoLoudness(lifted=done.count(LIFTED), kept=done.count(KEPT),
+        return StereoLoudness(known=True, off=True)
+    return StereoLoudness(known=True, lifted=done.count(LIFTED), kept=done.count(KEPT),
                           skipped=done.count(SKIPPED))
 
 
@@ -1495,13 +1530,6 @@ def _pick_default_surround(
     return min(plan, key=rank).source_index
 
 
-# What the remuxes shaka-packager packages from leave out of the original:
-# its global metadata (the container's title and its other tags) and its
-# chapters, so nothing of them can reach a package's media, whatever
-# shaka-packager would carry over. The streams' own metadata is copied as
-# before: the languages the renditions are named by. ffmpeg writes its own
-# muxer tags (encoder), which say nothing of the original.
-NO_GLOBAL_METADATA = ("-map_metadata", "-1", "-map_chapters", "-1")
 
 
 def _timeline_input_args(timeline: str) -> list[str]:
@@ -1562,9 +1590,12 @@ def _stereo_chain(stream: dict[str, Any]) -> _StereoChain:
 
 def _stereo_split(stream: dict[str, Any], i: int) -> str:
     """_stereo_filter, the signal the rendition is made from split off to
-    [l{i}] (asplit) before the rest: the same rendition, and its signal."""
+    [l{i}] (asplit) before the rest: the same rendition, and its signal. The
+    sample format is fixed before the split, as the AAC encoder takes it:
+    left open, the signal's FLAC (s32) would choose it for the resample a
+    mono or stereo track's format makes, and the rendition would change."""
     chain = _stereo_chain(stream)
-    split = f"{chain.signal},asplit=2[l{i}]"
+    split = f"{chain.signal},aformat=sample_fmts=fltp,asplit=2[l{i}]"
     return f"{split}[r{i}];[r{i}]{chain.rest}" if chain.rest else split
 
 
@@ -1586,18 +1617,20 @@ _SUMMARY = {
 }
 
 
-def _measure_loudness(path: Path, filters: str = "", *,
-                      true_peak: bool = True) -> _Loudness | None:
+def _measure_loudness(path: Path, filters: str = "", *, true_peak: bool = False,
+                      timeout: float | None = None) -> _Loudness | None:
     """The loudness of an audio file's first stream, through `filters`
-    first where there are any (ebur128's summary; its length from ffmpeg's
-    progress); None when it can't be measured."""
+    first where there are any (ebur128's summary; its true peak only where
+    asked, -inf else; its length from ffmpeg's last progress); None when it
+    can't be measured, or not within `timeout` seconds (the run killed)."""
     meter = f"ebur128=peak={'true' if true_peak else 'none'}:framelog=quiet"
     args = ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-progress", "pipe:1",
-            "-i", str(path), "-map", "0:a:0", "-af", f"{filters},{meter}" if filters else meter,
-            "-f", "null", "-"]
+            *_SIGNAL_INPUT, "-i", str(path), "-map", "0:a:0",
+            "-af", f"{filters},{meter}" if filters else meter, "-f", "null", "-"]
     try:
-        result = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    except OSError as e:
+        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", stdin=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
         log.warning("packager.loudness.failed", path=str(path), error=str(e)[:200])
         return None
     summary = result.stderr.rpartition("Summary:")[2]
@@ -1638,14 +1671,49 @@ def _lift_compressor(gain: float, level: float, retime: bool = False) -> str:
             f"acompressor=threshold={threshold:.5f}:{_LIFT_COMPRESSOR}")
 
 
+def _lift_limiter(ceiling: float = _LIFT_CEILING) -> str:
+    return f"alimiter=limit={ceiling:.1f}dB:attack=10:release=100:level=disabled:latency=enabled"
+
+
 def _lift_filter(gain: float, level: float, makeup: float, ceiling: float = _LIFT_CEILING,
                  retime: bool = False) -> str:
     """The filters that make a lifted stereo rendition of its signal: the
     gain and the compressor (_lift_compressor), the make-up after it (dB),
     the limiter at `ceiling` (dBFS), the format."""
     return (f"{_lift_compressor(gain, level, retime)},volume={makeup:.2f}dB,"
-            f"alimiter=limit={ceiling:.1f}dB:attack=10:release=100:level=disabled:latency=enabled,"
-            f"{_STEREO_FORMAT}")
+            f"{_lift_limiter(ceiling)},{_STEREO_FORMAT}")
+
+
+def _lift_makeup(signal: Path, gain: float, level: float, retime: bool = False,
+                 timeout: float | None = None) -> float | None:
+    """The make-up after the compressor that puts the lifted signal at
+    `level`, the limiter's share in it: the lift measured in one run at the
+    two make-ups of _LIFT_PROBES (the signal decoded once, the compressor's
+    output split to both), and the make-up on the line between the two
+    loudnesses that is at `level`. None when it can't be measured."""
+    graph = f"[0:a:0]{_lift_compressor(gain, level, retime)},asplit=2[p0][p1];" + ";".join(
+        f"[p{n}]volume={makeup:.2f}dB,{_lift_limiter()},ebur128@probe{n}=peak=none"
+        f":framelog=quiet[m{n}]" for n, makeup in enumerate(_LIFT_PROBES))
+    args = ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", *_SIGNAL_INPUT, "-i", str(signal),
+            "-filter_complex", graph, "-map", "[m0]", "-f", "null", "-", "-map", "[m1]",
+            "-f", "null", "-"]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", stdin=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("packager.loudness.failed", path=str(signal), error=str(e)[:200])
+        return None
+    found = [re.search(rf"\[ebur128@probe{n} @ [^]]*\] Summary:.*?\bI:\s+(-?[\d.]+) LUFS",
+                       result.stderr, re.S) for n in range(2)]
+    if result.returncode != 0 or not all(found):
+        log.warning("packager.loudness.failed", path=str(signal), code=result.returncode,
+                    error=result.stderr.strip()[-300:])
+        return None
+    (low, high), (at_low, at_high) = _LIFT_PROBES, (float(m.group(1)) for m in found if m)
+    if at_high - at_low < 0.1 * (high - low):
+        log.warning("packager.stereo.makeup_flat", path=str(signal), at_low=at_low, at_high=at_high)
+        return None
+    return round(low + (level - at_low) * (high - low) / (at_high - at_low), 2)
 
 
 def _lift_args(signal: Path, filters: str, out: Path, language: str) -> list[str]:
@@ -1653,7 +1721,7 @@ def _lift_args(signal: Path, filters: str, out: Path, language: str) -> list[str
     encoded as every stereo rendition is, its timestamps as they are: the
     signal is on the transmux's timeline."""
     return ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning", "-copyts",
-            "-i", str(signal), "-map", "0:a:0", "-af", filters,
+            *_SIGNAL_INPUT, "-i", str(signal), "-map", "0:a:0", "-af", filters,
             "-c:a", STEREO_CODEC, "-b:a", STEREO_BITRATE, "-metadata:s:a:0", f"language={language}",
             *NO_GLOBAL_METADATA, "-movflags", "+faststart", str(out)]
 
@@ -1681,25 +1749,29 @@ def _audio_timing(path: Path, stream: str) -> dict[str, Any] | None:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", stream, "-show_entries",
              "stream=time_base,start_pts,duration_ts,nb_frames", "-of", "json", str(path)],
-            capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL)
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
+            stdin=subprocess.DEVNULL, timeout=120)
         streams = json.loads(out.stdout).get("streams") or []
-    except (OSError, ValueError, subprocess.CalledProcessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return streams[0] if len(streams) == 1 else None
 
 
-def _shown(probe: _Probe, visible: set[int] | None) -> list[int]:
-    """The tracks a client offers (`visible`; None: all)."""
-    return [i for i in range(len(probe.audio)) if visible is None or i in visible]
+def _shown(probe: _Probe, visible: set[int] | None, default: int | None = None) -> list[int]:
+    """The tracks the loudness measures: those a client offers (`visible`;
+    None: all) and the default one (DEFAULT=YES in the master, and played,
+    whatever the settings show)."""
+    return [i for i in range(len(probe.audio))
+            if visible is None or i in visible or i == default]
 
 
 def _stereo_signals(probe: _Probe, tmpdir: Path, target: float | None,
-                    visible: set[int] | None) -> dict[int, Path]:
+                    visible: set[int] | None, default: int | None = None) -> dict[int, Path]:
     """The signals written beside the transmux for the loudness, by track:
-    of the tracks shown (`visible`; None: all), with a target, and where the
-    temp folder keeps the free space _SIGNAL_CODEC's comment says with an
-    upper bound of them written. None else, logged with the reason."""
-    tracks = _shown(probe, visible)
+    of the tracks measured (_shown), with a target, and where the temp
+    folder keeps the free space _SIGNAL_CODEC's comment says with an upper
+    bound of them written. None else, logged with the reason."""
+    tracks = _shown(probe, visible, default)
     if target is None or not tracks:
         return {}
     bound = probe.duration_ms / 1000 * _SIGNAL_BYTES_PER_SECOND * len(tracks)
@@ -1722,59 +1794,49 @@ def _lift_stereo(probe: _Probe, signals: dict[int, Path], transmuxed: Path,
                  target: float) -> dict[int, tuple[str, Path | None]]:
     """What became of the stereo rendition of every track whose signal was
     written beside the transmux, by track (_lift_one: LIFTED and its MP4,
-    KEPT or SKIPPED), _LIFT_WORKERS at once. A track whose lift fails
-    (SKIPPED) keeps the rendition it has; each signal is removed once done."""
+    KEPT or SKIPPED), _LIFT_WORKERS at once, each run within its timeout
+    (_LIFT_TIMEOUT). A track whose lift fails, however it fails, keeps the
+    rendition it has (SKIPPED); each signal is removed once done, and an MP4
+    not kept."""
+    timeout = _LIFT_TIMEOUT + _LIFT_TIMEOUT_PER_SECOND * max(probe.duration_ms, 0) / 1000
+
     def lift(i: int, signal: Path) -> tuple[str, Path | None]:
+        done: tuple[str, Path | None] = (SKIPPED, None)
         try:
-            return _lift_one(i, probe.audio[i], signal, transmuxed, target)
-        except PackageError as e:
-            log.warning("packager.stereo.lift_failed", track=i, error=str(e)[:300])
-            return SKIPPED, None
+            done = _lift_one(i, probe.audio[i], signal, transmuxed, target, timeout=timeout)
+        except Exception as e:  # a failed lift costs its track the lift, never the package
+            log.warning("packager.stereo.lift_failed", track=i,
+                        error=f"{type(e).__name__}: {e}"[:300])
         finally:
             signal.unlink(missing_ok=True)
+            if done[0] != LIFTED:
+                signal.with_suffix(".mp4").unlink(missing_ok=True)
+        return done
 
     with ThreadPoolExecutor(max_workers=max(1, min(_LIFT_WORKERS, len(signals)))) as pool:
         runs = {i: pool.submit(lift, i, signal) for i, signal in signals.items()}
     return {i: run.result() for i, run in runs.items()}
 
 
-def _lift_makeup(signal: Path, gain: float, level: float, retime: bool = False) -> float | None:
-    """The make-up after the compressor that puts the lifted signal at
-    `level`: what the compressor takes off the integrated loudness, then
-    what the limiter takes too, measured with it and made up again, until
-    the whole lift is within _LIFT_TOLERANCE of `level` (_LIFT_ROUNDS at
-    most). None when it can't be measured."""
-    measured = _measure_loudness(signal, _lift_compressor(gain, level, retime), true_peak=False)
-    if measured is None:
-        return None
-    makeup = round(level - measured.integrated, 2)
-    for _ in range(_LIFT_ROUNDS):
-        measured = _measure_loudness(signal, _lift_filter(gain, level, makeup, retime=retime),
-                                     true_peak=False)
-        if measured is None:
-            return None
-        if abs(level - measured.integrated) <= _LIFT_TOLERANCE:
-            break
-        makeup = round(makeup + level - measured.integrated, 2)
-    return makeup
-
-
 def _lift_one(i: int, stream: dict[str, Any], signal: Path, transmuxed: Path,
-              target: float) -> tuple[str, Path | None]:
+              target: float, *, timeout: float | None = None) -> tuple[str, Path | None]:
     """The signal's loudness, and where it is quiet (_stereo_lift), the
-    rendition made of it lifted (its make-up: _lift_makeup), encoded, the
-    AAC decoded and measured; a true peak not under _LIFT_TRUE_PEAK (it is
-    measured to 0.1 dB) makes it again with the limiter that much (and 0.5
-    dB) lower, once. Kept only with the timing of the rendition in the
-    transmux (stream a:i, _same_timing). LIFTED and the MP4; KEPT where the
-    mix needs no lift; SKIPPED where it couldn't be measured or lifted."""
+    rendition made of it lifted: its make-up measured (_lift_makeup), then
+    encoded, the AAC decoded and measured with its true peak.
+    One whose true peak is not under _LIFT_TRUE_PEAK (it is measured to 0.1
+    dB) or whose loudness is more than _LIFT_TOLERANCE off the lift's level
+    is made again, once: the limiter that much (and 0.5 dB) lower, the
+    make-up that much corrected; one still over the true peak is not kept.
+    Kept only with the timing of the rendition in the transmux (stream a:i,
+    _same_timing). LIFTED and the MP4; KEPT where the mix needs no lift;
+    SKIPPED where it couldn't be measured or lifted. Every run within
+    `timeout` seconds."""
     chain = _stereo_chain(stream)
-    loudness = _measure_loudness(signal)
+    loudness = _measure_loudness(signal, timeout=timeout)
     lift = _stereo_lift(loudness, chain.makeup, target)
     log.info("packager.stereo.loudness", track=i, target=target,
              integrated=loudness.integrated if loudness else None,
              lra=loudness.lra if loudness else None,
-             true_peak=loudness.true_peak if loudness else None,
              seconds=loudness.seconds if loudness else None, downmix_makeup=chain.makeup,
              before=round(loudness.integrated + chain.makeup, 2) if loudness else None,
              lift=lift)
@@ -1785,24 +1847,29 @@ def _lift_one(i: int, stream: dict[str, Any], signal: Path, transmuxed: Path,
     gain = round(chain.makeup + lift, 2)
     level = loudness.integrated + gain
     retime = not chain.rest  # no limiter of its own (_LIFT_RETIME)
-    makeup = _lift_makeup(signal, gain, level, retime)
+    makeup = _lift_makeup(signal, gain, level, retime, timeout)
     if makeup is None:
         return SKIPPED, None
     out = signal.with_suffix(".mp4")
     ceiling = _LIFT_CEILING
-    for _ in range(2):
+    for again in (False, True):
         _run_ffmpeg_capturing(f"stereo {i}", _lift_args(
             signal, _lift_filter(gain, level, makeup, ceiling, retime), out,
-            _track_language(stream)))
-        made = _measure_loudness(out)
+            _track_language(stream)), timeout=timeout)
+        made = _measure_loudness(out, true_peak=True, timeout=timeout)
         if made is None:
             return SKIPPED, None
-        if made.true_peak < _LIFT_TRUE_PEAK:
+        over = made.true_peak >= _LIFT_TRUE_PEAK
+        off = abs(made.integrated - level) > _LIFT_TOLERANCE
+        if again and over:
+            log.warning("packager.stereo.lift_over_peak", track=i, true_peak=made.true_peak)
+            return SKIPPED, None
+        if again or not (over or off):
             break
-        ceiling -= made.true_peak - _LIFT_TRUE_PEAK + 0.5
-    else:
-        log.warning("packager.stereo.lift_over_peak", track=i, true_peak=made.true_peak)
-        return SKIPPED, None
+        if over:
+            ceiling -= made.true_peak - _LIFT_TRUE_PEAK + 0.5
+        if off:
+            makeup = round(makeup + level - made.integrated, 2)
     timing, before = _audio_timing(out, "a:0"), _audio_timing(transmuxed, f"a:{i}")
     if not _same_timing(timing, before):
         log.warning("packager.stereo.lift_timing", track=i, lifted=timing, rendition=before)
@@ -1920,7 +1987,8 @@ def _prepare_source(
         args += ["-tag:v", "hvc1"]
 
     encode_surround = {s.source_index for s in surround if s.mode == "encode"}
-    signals = _stereo_signals(probe, tmpdir, stereo_loudness, audio_visible_indices)
+    signals = _stereo_signals(probe, tmpdir, stereo_loudness, audio_visible_indices,
+                              default_index)
     chains: list[str] = []
     for i, stream in enumerate(probe.audio):
         stereo = _stereo_split(stream, i) if i in signals else _stereo_filter(stream)
@@ -1966,7 +2034,7 @@ def _prepare_source(
     # What became of each shown track's stereo rendition; one without a
     # signal is one the temp space left out.
     lifts: dict[int, tuple[str, Path | None]] = (
-        {i: (SKIPPED, None) for i in _shown(probe, audio_visible_indices)}
+        {i: (SKIPPED, None) for i in _shown(probe, audio_visible_indices, default_index)}
         if stereo_loudness is not None else {})
     if signals:
         lifts.update(_lift_stereo(probe, signals, transmuxed, stereo_loudness))
