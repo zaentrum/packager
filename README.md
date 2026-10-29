@@ -224,6 +224,24 @@ channels, no name) gets ffmpeg's own fold normalised
 overshoots a normalised full scale). A track of six channels or fewer is
 made a 5.1 as before, a 5.1 sample for sample.
 
+**Loudness.** Downloads and phones play the stereo rendition, and a film's
+mix comes out of the downmix at -28 to -34 LUFS. So the signal each stereo
+rendition is made from (after the downmix; written beside the remux in the
+same run, the source is read once) is measured (EBU R128), and a rendition
+more than 1 LU under the `packager.stereo_loudness` setting (integrated
+LUFS, `-20` by default; `off` lifts none) is made again from it, lifted to
+it by at most 14 dB: a gentle compressor 8 dB over the lifted loudness (2:1,
+50 ms attack, 500 ms release), its make-up measured, and a lookahead
+limiter at -4 dBFS. The AAC is decoded and measured, and one whose true
+peak is not under -2 dBTP is made again with the limiter lower. A lifted
+rendition is an MP4 of its own, with the first timestamp, the samples and
+the length of the one made before. On film mixes lifted 5 to 13 dB the
+limiter takes off more than 3 dB for at most 0.12 % of the time, the
+dialogue's level moves by under 0.5 dB, and the loudness range stays within
+1.1 LU. A mix at the target or above, one shorter than 3 s and a silent one
+are made as before (a stereo track's sample for sample); the 5.1 companions
+and the copied tracks are never touched.
+
 **Subtitles.** Sidecars are extracted exactly as before; PGS / VobSub /
 DVB stay sidecar-only because HLS can't carry them. The source's PGS and
 text tracks are written in one ffmpeg run over it, an output per track,
