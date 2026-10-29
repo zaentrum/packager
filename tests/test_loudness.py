@@ -193,13 +193,16 @@ def test_only_the_tracks_a_client_offers_get_a_signal(monkeypatch, tmp_path: Pat
     assert "[l1]" not in args and "[l0]" in args and "[l2]" in args
 
 
-# The production node: 256 GB, the floor max(30 GB, 15 %) = 38.4 GB.
+# The production node: 256 GB, the floor max(30 GB, 15 %) = 38.4 GB. A shown
+# track of 1.8 h: 1.91 GB of signal at most (24-bit PCM and FLAC's frames).
 @pytest.mark.parametrize(("free", "minutes", "shown", "signals"), [
-    (44, 108, 4, False),   # 9.95 GB of signals at most: 34.05 GB left, under 38.4
-    (44, 108, 1, True),    # 2.49 GB: 41.5 left
-    (49, 108, 4, True),    # 39.05 left
+    (44, 108, 4, False),   # 7.65 GB: 36.35 left, under 38.4
+    (44, 108, 3, False),   # 5.74 GB: 38.26 left (24-bit PCM alone would leave 38.401)
+    (44, 108, 2, True),    # 3.83 GB: 40.17 left
+    (44, 108, 1, True),
+    (49, 108, 4, True),    # 41.35 left
     (200, 180, 12, True),
-    (40, 1, 1, True),      # 0.01 GB: 39.99 left
+    (40, 1, 1, True),      # 0.02 GB: 39.98 left
     (38, 1, 1, False),     # under the floor before any signal
 ])
 def test_the_signals_need_the_temp_space(monkeypatch, tmp_path: Path, space, free: float,
@@ -217,7 +220,7 @@ def test_the_signals_need_the_temp_space(monkeypatch, tmp_path: Path, space, fre
     else:
         [e] = skipped
         assert (e["reason"], e["tracks"], e["floor"]) == ("temp space", shown, round(38.4 * GB))
-        assert e["bound"] == round(minutes * 60 * 48000 * 2 * 4 * shown)
+        assert e["bound"] == round(minutes * 60 * 48000 * 2 * 3 * 1.025 * shown)
 
 
 def test_the_floor_is_30_gb_on_a_small_file_system(monkeypatch, tmp_path: Path) -> None:

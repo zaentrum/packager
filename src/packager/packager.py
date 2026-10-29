@@ -293,12 +293,14 @@ _LIFT_TIMING_SLACK = 0.002
 # enough to be lifted those are peaks that the lift's limiter takes down by
 # more than the clip did. Written for the tracks a client offers only (the others are
 # packaged as before), and only where the temp folder keeps, with an upper
-# bound of them (float, _SIGNAL_BYTES_PER_SECOND each), more free than
+# bound of them written (_SIGNAL_BYTES_PER_SECOND each: FLAC's worst case,
+# 24-bit PCM and its frames, 2.1 % over it on random samples), more free than
 # _LIFT_TEMP_FLOOR bytes and _LIFT_TEMP_SHARE of its file system: it is a
-# node's own disk, which a pod is evicted from as it fills.
+# node's own disk, which a pod is evicted from as it fills (the remux is
+# written as before, not counted).
 _SIGNAL_CODEC = ("-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24",
                  "-frame_size", "1024")
-_SIGNAL_BYTES_PER_SECOND = 48000 * 2 * 4
+_SIGNAL_BYTES_PER_SECOND = 48000 * 2 * 3 * 1.025
 _LIFT_TEMP_FLOOR = 30e9
 _LIFT_TEMP_SHARE = 0.15
 # How many tracks are lifted at once: each lift is a few ffmpeg runs of one
