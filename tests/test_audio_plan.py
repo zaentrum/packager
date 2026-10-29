@@ -217,10 +217,14 @@ def test_a_hidden_tracks_companion_is_hidden_too(monkeypatch, tmp_path: Path) ->
     assert [(m["idx"], m["channels"], m["default"], m["visible"], m["mode"])
             for m in surround_meta] == [(0, 6, True, True, "encode"),
                                         (1, 6, False, False, "encode")]
-    # The 7.1 is made a 5.1 like the others: the same filter, a 5.1 layout;
-    # its stereo is the 7.1's downmix.
+    # The 7.1 is made a 5.1 like the others, a 5.1 layout, its back pair
+    # folded into the surrounds under full scale (test_downmix.py); the 5.1
+    # by the format, as ever. Its stereo is the 7.1's downmix.
     graph = calls[0][calls[0].index("-filter_complex") + 1]
-    assert "[am1]aformat=sample_rates=48000:channel_layouts=5.1(side)|5.1[m1]" in graph
+    assert "[am0]aformat=sample_rates=48000:channel_layouts=5.1(side)|5.1[m0]" in graph
+    assert ("[am1]pan=5.1(side)|FL=0.5858*FL|FR=0.5858*FR|FC=0.5858*FC|LFE=0.5858*LFE"
+            "|SL=0.5858*SL+0.4142*BL|SR=0.5858*SR+0.4142*BR,") in graph
+    assert ",aformat=sample_rates=48000:channel_layouts=5.1(side)|5.1[m1]" in graph
     assert "[as1]pan=stereo|FL=0.3204*FL+0.2265*FC+0.2265*BL+0.2265*SL|" in graph
 
 

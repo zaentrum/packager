@@ -19,8 +19,9 @@ Design rules:
   channels downmixed under full scale (_stereo_filter). A source track with
   more than two channels (with SURROUND_AUDIO) additionally gets a 5.1
   E-AC-3 (or AC-3) rendition, first per language, in group
-  "audio-surround", shown or hidden as its stereo rendition is. Exactly
-  one rendition per group is DEFAULT=YES: the preferred-language track;
+  "audio-surround", shown or hidden as its stereo rendition is, one of
+  more than six channels folded under full scale (_surround_filter).
+  Exactly one rendition per group is DEFAULT=YES: the preferred-language track;
   in the 5.1 group its companion, else the 5.1 rendition of its
   language, else that of the first preferred language with one, else the
   first — a shown one before a hidden one.
@@ -231,6 +232,39 @@ _SURROUND_FORMAT = (
     f"aformat=sample_rates=48000:channel_layouts={SURROUND_LAYOUT}(side)|{SURROUND_LAYOUT}"
 )
 _SURROUND_CODECS = {"eac3": "ec-3", "ac3": "ac-3"}
+# The 5.1 companion encoded from a track of more than six channels
+# (_surround_filter). ffmpeg's own matrix folds the channels a 5.1 hasn't got
+# into the ones it has, a 7.1's back pair into the surrounds at -3 dB: a
+# surround's gains sum to 1.71, scaled down for an integer output only, never
+# for the float samples AC-3 and E-AC-3 are encoded from. A loud 7.1 came out
+# at +3.7 dBFS. So the matrix is explicit: a channel the 5.1(side) has into
+# itself as it is (a back pair into the surrounds where the layout has no
+# side pair), a back pair beside a side pair into the surrounds at -3 dB, a
+# back centre into both surrounds at -3 dB, a front left or right of centre
+# into its front and the centre at -3 dB (where it sits between them). Its
+# gains are normalised so that no channel's sum to more than 1, made up again
+# to 3 dB under the plain matrix (_DOWNMIX_LEVEL) and held under -3 dBFS by
+# the stereo downmix's limiter (_DOWNMIX_LIMITER). 3 dB down, a channel that
+# is a source channel as it is (the fronts, the centre, the LFE) reaches the
+# ceiling at full scale and no further: the limiter holds the folded sums
+# alone. The E-AC-3 and AC-3 encodes overshoot it by up to 1.1 dB at a
+# transient, so a programme's decoded peaks stay under -1 dBFS. A track of six
+# channels or fewer is made a 5.1 as before (_SURROUND_FORMAT): a 5.1 isn't
+# rematrixed.
+_SURROUND_CHANNEL_NAMES = ("FL", "FR", "FC", "LFE", "SL", "SR")  # 5.1(side)
+_SURROUND_FOLDS = {"BL": ("SL",), "BR": ("SR",), "BC": ("SL", "SR"),
+                   "FLC": ("FL", "FC"), "FRC": ("FR", "FC")}
+# The layouts of more than six channels made of those, by ffprobe's names
+# (ffmpeg -layouts). Any other (one with height channels, a 5.1.2 or a 7.1.4,
+# one ffprobe has no name for) gets ffmpeg's own matrix normalised
+# (rematrix_maxval=1): never over full scale, no make-up, no limiter.
+_SURROUND_FOLD_LAYOUTS = {
+    "6.1": "FL+FR+FC+LFE+BC+SL+SR", "6.1(back)": "FL+FR+FC+LFE+BL+BR+BC",
+    "6.1(front)": "FL+FR+LFE+FLC+FRC+SL+SR", "7.0": "FL+FR+FC+BL+BR+SL+SR",
+    "7.0(front)": "FL+FR+FC+FLC+FRC+SL+SR", "7.1": "FL+FR+FC+LFE+BL+BR+SL+SR",
+    "7.1(wide)": "FL+FR+FC+LFE+BL+BR+FLC+FRC", "7.1(wide-side)": "FL+FR+FC+LFE+FLC+FRC+SL+SR",
+    "octagonal": "FL+FR+FC+BL+BR+BC+SL+SR",
+}
 
 
 @dataclass(frozen=True)
@@ -1367,6 +1401,37 @@ def _stereo_filter(stream: dict[str, Any]) -> str:
     return f"{pan},aresample=48000,volume={makeup:.2f}dB,{_DOWNMIX_LIMITER},{_STEREO_FORMAT}"
 
 
+def _surround_filter(stream: dict[str, Any]) -> str:
+    """The filters that make a source track's encoded 5.1 companion, 48 kHz
+    5.1, by the track's channels and channel_layout as ffprobe has them. Six
+    channels or fewer: _SURROUND_FORMAT, as ever. A layout of
+    _SURROUND_FOLD_LAYOUTS: its matrix normalised (pan; a layout without an
+    LFE leaves it silent), the resample to 48 kHz, the make-up to
+    _DOWNMIX_LEVEL under the plain matrix, the limiter (every one of them
+    folds a channel into one it has, so every one sums to more than the
+    make-up gives back). Any other layout: ffmpeg's own matrix, normalised."""
+    channels = int(stream.get("channels") or 0)
+    if channels <= SURROUND_CHANNELS:
+        return _SURROUND_FORMAT
+    names = _SURROUND_FOLD_LAYOUTS.get(str(stream.get("channel_layout") or ""), "").split("+")
+    if len(names) != channels:
+        return f"aresample=48000:rematrix_maxval=1,{_SURROUND_FORMAT}"
+    rows: dict[str, list[tuple[str, float]]] = {out: [] for out in _SURROUND_CHANNEL_NAMES}
+    for name in sorted(names, key=lambda name: name not in rows):  # its own channels first
+        into = (name,) if name in rows else _SURROUND_FOLDS[name]
+        # A channel the 5.1 has as it is, and a back pair where there is no
+        # side pair (it is the surrounds then); any other at -3 dB.
+        gain = 1.0 if len(into) == 1 and (into[0] == name or into[0] not in names) else _M3DB
+        for out in into:
+            rows[out].append((name, gain))
+    total = max(sum(gain for _, gain in row) for row in rows.values())
+    pan = f"pan={SURROUND_LAYOUT}(side)|" + "|".join(
+        out + "=" + "+".join(f"{gain / total:.4g}*{name}" for name, gain in row)
+        for out, row in rows.items() if row)
+    makeup = 20 * math.log10(total * _DOWNMIX_LEVEL)
+    return f"{pan},aresample=48000,volume={makeup:.2f}dB,{_DOWNMIX_LIMITER},{_SURROUND_FORMAT}"
+
+
 def _prepare_source(
     src: Path, probe: _Probe, tmpdir: Path,
     *,
@@ -1396,8 +1461,10 @@ def _prepare_source(
     `-ac:a:N`, which silently no-ops for channel counts.
 
     Surround: per `_surround_plan`, a stream copy or an E-AC-3/AC-3 5.1
-    encode at 48 kHz of the same decoded audio (asplit, one decode). The
-    one marked default is `surround_default` (`_pick_default_surround`).
+    encode at 48 kHz of the same decoded audio (asplit, one decode), a
+    track of more than six channels folded under full scale
+    (_surround_filter), any other made a 5.1 as before. The one marked
+    default is `surround_default` (`_pick_default_surround`).
 
     audio_meta is a list of dicts with keys {idx, codec, language,
     title, channels, default, visible}, in source order (audio_meta[N]
@@ -1438,7 +1505,7 @@ def _prepare_source(
             chains += [
                 f"[0:a:{i}]asplit=2[as{i}][am{i}]",
                 f"[as{i}]{stereo}[s{i}]",
-                f"[am{i}]{_SURROUND_FORMAT}[m{i}]",
+                f"[am{i}]{_surround_filter(stream)}[m{i}]",
             ]
         else:
             chains.append(f"[0:a:{i}]{stereo}[s{i}]")
