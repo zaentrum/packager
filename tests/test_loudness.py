@@ -423,9 +423,14 @@ def test_the_make_up_is_on_the_line_between_its_two_probes(monkeypatch) -> None:
             in graph and f"[p1]volume=4.00dB,{pk._lift_limiter()},ebur128@probe1" in graph)
     assert args[args.index("-i") - 2:args.index("-i")] == ["-threads", "1"]
     assert (kw["timeout"], kw["encoding"], kw["errors"]) == (9.0, "utf-8", "replace")
-    # Past them, on their line; retimed, the compressor's input too.
+    # Past them, on their line, to twice the higher one at most; none under.
+    _ran(monkeypatch, _probes(-22.0, -20.4))
+    assert pk._lift_makeup(Path("/t/s.nut"), 13.3, -20.0) == 5.0
     _ran(monkeypatch, _probes(-26.0, -25.0))
-    assert pk._lift_makeup(Path("/t/s.nut"), 13.3, -20.0) == 24.0
+    assert pk._lift_makeup(Path("/t/s.nut"), 13.3, -20.0) == 8.0
+    _ran(monkeypatch, _probes(-19.0, -15.0))
+    assert pk._lift_makeup(Path("/t/s.nut"), 13.3, -20.0) == 0.0
+    # Retimed, the compressor's input too.
     seen = _ran(monkeypatch, _probes(-23.6, -20.1))
     pk._lift_makeup(Path("/t/s.nut"), 13.3, -20.0, retime=True)
     assert f"[0:a:0]{pk._LIFT_RETIME}," in seen[0][0][seen[0][0].index("-filter_complex") + 1]

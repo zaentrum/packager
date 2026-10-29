@@ -1690,7 +1690,9 @@ def _lift_makeup(signal: Path, gain: float, level: float, retime: bool = False,
     `level`, the limiter's share in it: the lift measured in one run at the
     two make-ups of _LIFT_PROBES (the signal decoded once, the compressor's
     output split to both), and the make-up on the line between the two
-    loudnesses that is at `level`. None when it can't be measured."""
+    loudnesses that is at `level`, from none to twice the higher probe (a
+    mix that would need more is one the limiter would flatten). None when
+    it can't be measured."""
     graph = f"[0:a:0]{_lift_compressor(gain, level, retime)},asplit=2[p0][p1];" + ";".join(
         f"[p{n}]volume={makeup:.2f}dB,{_lift_limiter()},ebur128@probe{n}=peak=none"
         f":framelog=quiet[m{n}]" for n, makeup in enumerate(_LIFT_PROBES))
@@ -1713,7 +1715,8 @@ def _lift_makeup(signal: Path, gain: float, level: float, retime: bool = False,
     if at_high - at_low < 0.1 * (high - low):
         log.warning("packager.stereo.makeup_flat", path=str(signal), at_low=at_low, at_high=at_high)
         return None
-    return round(low + (level - at_low) * (high - low) / (at_high - at_low), 2)
+    makeup = low + (level - at_low) * (high - low) / (at_high - at_low)
+    return round(min(max(makeup, 0.0), 2 * high), 2)
 
 
 def _lift_args(signal: Path, filters: str, out: Path, language: str) -> list[str]:
