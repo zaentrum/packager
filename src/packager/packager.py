@@ -248,16 +248,26 @@ _SURROUND_CODECS = {"eac3": "ec-3", "ac3": "ac-3"}
 # is a source channel as it is (the fronts, the centre, the LFE) reaches the
 # ceiling at full scale and no further: the limiter holds the folded sums
 # alone. The E-AC-3 and AC-3 encodes overshoot it by up to 1.1 dB at a
-# transient, so a programme's decoded peaks stay under -1 dBFS. A track of six
-# channels or fewer is made a 5.1 as before (_SURROUND_FORMAT): a 5.1 isn't
-# rematrixed.
+# transient of a programme (its decoded peaks stayed under -1 dBFS on every
+# test mix) and by up to 3 dB on a full-scale square wave, still under full
+# scale. A track of six channels or fewer is made a 5.1 as before
+# (_SURROUND_FORMAT): a 5.1 isn't rematrixed.
 _SURROUND_CHANNEL_NAMES = ("FL", "FR", "FC", "LFE", "SL", "SR")  # 5.1(side)
 _SURROUND_FOLDS = {"BL": ("SL",), "BR": ("SR",), "BC": ("SL", "SR"),
                    "FLC": ("FL", "FC"), "FRC": ("FR", "FC")}
 # The layouts of more than six channels made of those, by ffprobe's names
 # (ffmpeg -layouts). Any other (one with height channels, a 5.1.2 or a 7.1.4,
 # one ffprobe has no name for) gets ffmpeg's own matrix normalised
-# (rematrix_maxval=1): never over full scale, no make-up, no limiter.
+# (rematrix_maxval=1), no make-up, and the limiter: the normalised samples
+# reach full scale, and the encode overshoots that by up to 0.8 dB on noise,
+# 3 dB on a square wave. The 5.1(side) is fixed right after the matrix, one
+# layout, not a choice: so that the resample which normalises it is the one
+# that folds, and the encoder gets a 5.1 (left a choice of two through the
+# limiter, the AC-3 and E-AC-3 encoders were given a mono).
+_SURROUND_FALLBACK = (
+    f"aresample=48000:rematrix_maxval=1,aformat=sample_rates=48000:channel_layouts="
+    f"{SURROUND_LAYOUT}(side),{_DOWNMIX_LIMITER},{_SURROUND_FORMAT}"
+)
 _SURROUND_FOLD_LAYOUTS = {
     "6.1": "FL+FR+FC+LFE+BC+SL+SR", "6.1(back)": "FL+FR+FC+LFE+BL+BR+BC",
     "6.1(front)": "FL+FR+LFE+FLC+FRC+SL+SR", "7.0": "FL+FR+FC+BL+BR+SL+SR",
@@ -1409,13 +1419,14 @@ def _surround_filter(stream: dict[str, Any]) -> str:
     LFE leaves it silent), the resample to 48 kHz, the make-up to
     _DOWNMIX_LEVEL under the plain matrix, the limiter (every one of them
     folds a channel into one it has, so every one sums to more than the
-    make-up gives back). Any other layout: ffmpeg's own matrix, normalised."""
+    make-up gives back). Any other layout: ffmpeg's own matrix, normalised,
+    and the limiter (_SURROUND_FALLBACK)."""
     channels = int(stream.get("channels") or 0)
     if channels <= SURROUND_CHANNELS:
         return _SURROUND_FORMAT
     names = _SURROUND_FOLD_LAYOUTS.get(str(stream.get("channel_layout") or ""), "").split("+")
     if len(names) != channels:
-        return f"aresample=48000:rematrix_maxval=1,{_SURROUND_FORMAT}"
+        return _SURROUND_FALLBACK
     rows: dict[str, list[tuple[str, float]]] = {out: [] for out in _SURROUND_CHANNEL_NAMES}
     for name in sorted(names, key=lambda name: name not in rows):  # its own channels first
         into = (name,) if name in rows else _SURROUND_FOLDS[name]

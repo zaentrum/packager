@@ -220,8 +220,9 @@ ceiling by up to 1.1 dB), 3 LU under ffmpeg's fold, its timing unchanged.
 Layouts are known by ffprobe's names (6.1 to 7.1, `7.1(wide)` and
 `octagonal` among them); any other of more than six channels (height
 channels, no name) gets ffmpeg's own fold normalised
-(`rematrix_maxval=1`). A track of six channels or fewer is made a 5.1 as
-before, a 5.1 sample for sample.
+(`rematrix_maxval=1`), as a 5.1(side), behind the same limiter (the encode
+overshoots a normalised full scale). A track of six channels or fewer is
+made a 5.1 as before, a 5.1 sample for sample.
 
 **Subtitles.** Sidecars are extracted exactly as before; PGS / VobSub /
 DVB stay sidecar-only because HLS can't carry them. The source's PGS and

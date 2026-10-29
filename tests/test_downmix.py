@@ -113,7 +113,10 @@ def test_any_other_layout_gets_ffmpegs_own_matrix_normalised(channels: int,
 
 
 SURROUND_FORMAT = "aformat=sample_rates=48000:channel_layouts=5.1(side)|5.1"
-SURROUND_NORMALISED = f"aresample=48000:rematrix_maxval=1,{SURROUND_FORMAT}"
+SURROUND_NORMALISED = ("aresample=48000:rematrix_maxval=1,"
+                       "aformat=sample_rates=48000:channel_layouts=5.1(side),"
+                       "alimiter=limit=-3dB:attack=10:release=100:level=disabled:latency=enabled,"
+                       f"{SURROUND_FORMAT}")
 SURROUND = ("FL", "FR", "FC", "LFE", "SL", "SR")
 
 

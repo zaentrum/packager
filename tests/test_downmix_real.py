@@ -13,15 +13,19 @@ full scale, every one as long as the plain matrix's, beside their 5.1
 companions; the stereo track's rendition is what the filter it always had
 makes of it, sample for sample. ffmpeg's own fold of the 7.1 into its 5.1
 companion goes over full scale too; the packager's companions of the 7.1 and
-the 6.1 stay under -1 dBFS in every channel as the E-AC-3 is decoded, that of
-the unnamed 7.1 under full scale, every companion as long as before and
+the 6.1 and the unnamed 7.1 stay under -1 dBFS in every channel as the
+E-AC-3 is decoded, every companion as long as before and
 starting where it did; those of the 5.1 tracks are what the format they
 always had makes of them, sample for sample. The layouts the downmix and the
-fold know by name are ffmpeg's, and ffmpeg runs every fold."""
+fold know by name are ffmpeg's, and ffmpeg runs every fold; the fallback is
+ffmpeg's normalised fold where the limiter doesn't act, and each fold puts
+every source channel where it belongs, on the sample."""
 
 from __future__ import annotations
 
+import array
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -46,6 +50,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 SECONDS = 6
+H = math.sqrt(0.5)
 CHANNELS = {"5.1(side)": "FL FR FC LFE SL SR", "7.1": "FL FR FC LFE BL BR SL SR",
             "5.1": "FL FR FC LFE BL BR", "6.1": "FL FR FC LFE BC SL SR"}
 
@@ -247,13 +252,12 @@ def test_a_loud_tracks_5_1_companion_stays_under_full_scale(film: Path, prepared
     plain = _channel_peaks(_encode_surround(film, 1, pk._SURROUND_FORMAT,
                                             tmp_path / "plain.mp4"), "0:a:0")
     assert max(plain) > 0, plain
-    # The 7.1's and the 6.1's companions: every channel under -1 dBFS as
-    # the E-AC-3 is decoded; the unnamed 7.1's (ffmpeg's matrix normalised):
-    # under full scale. Six channels each, every one of them sounding.
+    # The 7.1's and the 6.1's companions, and the unnamed 7.1's (ffmpeg's
+    # matrix normalised, then the limiter): every channel under -1 dBFS as
+    # the E-AC-3 is decoded. Six channels each, every one of them sounding.
     peaks = {track: _channel_peaks(prepared, COMPANIONS[track]) for track in (1, 5, 6)}
     assert all(len(p) == 6 and min(p) > -40 for p in peaks.values()), peaks
-    assert all(peak <= -1.0 for track in (1, 5) for peak in peaks[track]), peaks
-    assert all(peak <= 0 for peak in peaks[6]), peaks
+    assert all(peak <= -1.0 for p in peaks.values() for peak in p), peaks
 
 
 def test_a_5_1_tracks_companion_is_as_before(film: Path, prepared: Path, tmp_path: Path) -> None:
@@ -272,3 +276,80 @@ def test_every_companions_timing_is_as_before(film: Path, prepared: Path,
     for track, stream in COMPANIONS.items():
         before = _encode_surround(film, track, pk._SURROUND_FORMAT, tmp_path / f"t{track}.mp4")
         assert _timing(prepared, stream) == _timing(before, "0:a:0"), track
+
+
+def test_the_fallback_folds_as_ffmpeg_does_and_stays_under_full_scale(tmp_path: Path) -> None:
+    # A 7.1 ffprobe names no layout for (PCM in Matroska), the same noise in
+    # every channel at once: quiet, the fallback is ffmpeg's matrix normalised
+    # sample for sample (the limiter doesn't act); at full scale that matrix
+    # goes over full scale as the E-AC-3 is decoded, the fallback stays under
+    # -1 dBFS; a 5.1(side) either way.
+    plain = "aresample=48000:rematrix_maxval=1," + pk._SURROUND_FORMAT
+    fallback = pk._surround_filter({"channels": 8})
+    for level, quiet in ((0.05, True), (0.99, False)):
+        src = tmp_path / f"src{level}.mka"
+        _ff("-f", "lavfi", "-i", f"anoisesrc=color=pink:seed=3:duration=3,lowpass=f=5000,"
+            f"alimiter=limit=0.0625:level=disabled,volume={level / 0.0625},"
+            "pan=7.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0|SL=c0|SR=c0",
+            "-c:a", "pcm_s16le", str(src))
+        assert pk._ffprobe(src).audio[0].get("channel_layout") is None
+        encoded = {}
+        for label, chain in (("plain", plain), ("fallback", fallback)):
+            if quiet:
+                wav = _ffwav(src, chain, tmp_path / f"{label}.wav")
+                encoded[label] = _decoded_md5(wav, "0:a:0")
+                continue
+            out = tmp_path / f"{label}.mp4"
+            _ff("-i", str(src), "-af", chain, "-c:a", "eac3", "-b:a", "448k", str(out))
+            encoded[label] = _channel_peaks(out, "0:a:0")
+        if quiet:
+            assert encoded["plain"] == encoded["fallback"]
+        else:
+            assert len(encoded["fallback"]) == 6, encoded
+            assert max(encoded["plain"]) > 0, encoded
+            assert max(encoded["fallback"]) <= -1.0, encoded
+
+
+def _ffwav(src: Path, chain: str, out: Path) -> Path:
+    _ff("-i", str(src), "-af", chain, "-c:a", "pcm_f32le", str(out))
+    return out
+
+
+# What one sample of a source channel becomes in each channel of the 5.1(side)
+# companion (FL FR FC LFE SL SR): a channel the 5.1 has, and a back pair where
+# there is no side pair, at 3 dB under full; a back pair beside the side pair,
+# a back centre and a front of centre at 6 dB under, into the channels it is
+# folded into; nothing anywhere else, and nothing early or late.
+ROUTES = {
+    "7.1": {"FL": {"FL": H}, "FR": {"FR": H}, "FC": {"FC": H}, "LFE": {"LFE": H},
+            "BL": {"SL": 0.5}, "BR": {"SR": 0.5}, "SL": {"SL": H}, "SR": {"SR": H}},
+    "6.1": {"FL": {"FL": H}, "FR": {"FR": H}, "FC": {"FC": H}, "LFE": {"LFE": H},
+            "BC": {"SL": 0.5, "SR": 0.5}, "SL": {"SL": H}, "SR": {"SR": H}},
+    "7.1(wide)": {"FL": {"FL": H}, "FR": {"FR": H}, "FC": {"FC": H}, "LFE": {"LFE": H},
+                  "BL": {"SL": H}, "BR": {"SR": H}, "FLC": {"FL": 0.5, "FC": 0.5},
+                  "FRC": {"FR": 0.5, "FC": 0.5}},
+}
+
+
+@pytest.mark.parametrize("layout", sorted(ROUTES))
+def test_the_fold_puts_every_channel_where_it_belongs(layout: str, tmp_path: Path) -> None:
+    # One sample of 0.25 in each source channel in turn, a quarter of a
+    # second apart (under the limiter's ceiling: it doesn't act).
+    names = pk._SURROUND_FOLD_LAYOUTS[layout].split("+")
+    at = [48000 + 12000 * i for i in range(len(names))]
+    src = tmp_path / "impulses.mka"
+    _ff("-f", "lavfi", "-i", f"aevalsrc=exprs='{'|'.join(f'0.25*eq(n,{n})' for n in at)}'"
+        f":channel_layout={layout}:sample_rate=48000:duration=3", "-c:a", "flac", str(src))
+    raw = tmp_path / "out.f32"
+    chain = pk._surround_filter({"channels": len(names), "channel_layout": layout})
+    _ff("-i", str(src), "-af", chain, "-c:a", "pcm_f32le", "-f", "f32le", str(raw))
+    samples = array.array("f")
+    samples.frombytes(raw.read_bytes())
+    out = ("FL", "FR", "FC", "LFE", "SL", "SR")
+    for name, n in zip(names, at, strict=True):
+        for j, channel in enumerate(out):
+            want = 0.25 * ROUTES[layout][name].get(channel, 0.0)
+            window = [samples[(n + k) * 6 + j] for k in range(-600, 601)]
+            assert abs(window[600] - want) < 0.002, (name, channel, window[600], want)
+            # nothing but the one sample: the limiter's delay is compensated
+            assert max(abs(v) for k, v in enumerate(window) if k != 600) < 0.002, (name, channel)
