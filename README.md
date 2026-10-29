@@ -204,7 +204,9 @@ dBFS as the AAC is decoded (the encode overshoots the ceiling by up to 1.5
 dB at a transient), 3 LU under the plain matrix's loudness. Layouts are
 known by ffprobe's names (2.1 to 7.1, `5.1` and `5.1(side)` alike); any
 other layout of more than two channels gets ffmpeg's own matrix
-normalised (`rematrix_maxval=1`), without make-up. A mono or stereo track
+normalised (`rematrix_maxval=1`), as a stereo, without make-up, behind the
+same limiter (the AAC encode overshoots a normalised full scale; behind the
+limiter a full-scale track decodes under -1 dBFS). A mono or stereo track
 is converted as before.
 
 The 5.1 companion encoded from a track of more than six channels is
@@ -226,11 +228,12 @@ made a 5.1 as before, a 5.1 sample for sample.
 
 **Loudness.** Downloads and phones play the stereo rendition, and a film's
 mix comes out of the downmix at -28 to -34 LUFS. So the signal each stereo
-rendition is made from (after the downmix; written beside the remux in the
-same run, the source is read once) is measured (EBU R128), and a rendition
-more than 1 LU under the `packager.stereo_loudness` setting (integrated
-LUFS, `-20` by default; `off` lifts none) is made again from it, lifted to
-it by at most 14 dB: a gentle compressor 8 dB over the lifted loudness (2:1,
+rendition a client offers is made from (after the downmix; written beside
+the remux in the same run, the source is read once, as FLAC of 24 bits:
+about 0.5 GB an hour) is measured (EBU R128), and a rendition more than 1
+LU under the `packager.stereo_loudness` setting (integrated LUFS, `-20` by
+default; `off` lifts none) is made again from it, lifted to it by at most
+14 dB: a gentle compressor 8 dB over the lifted loudness (2:1,
 50 ms attack, 500 ms release), its make-up measured, and a lookahead
 limiter at -4 dBFS. The AAC is decoded and measured, and one whose true
 peak is not under -2 dBTP is made again with the limiter lower. A lifted
@@ -239,8 +242,11 @@ the length of the one made before. On film mixes lifted 5 to 13 dB the
 limiter takes off more than 3 dB for at most 0.12 % of the time, the
 dialogue's level moves by under 0.5 dB, and the loudness range stays within
 1.1 LU. A mix at the target or above, one shorter than 3 s and a silent one
-are made as before (a stereo track's sample for sample); the 5.1 companions
-and the copied tracks are never touched.
+are made as before (a stereo track's sample for sample), and so are all of
+a title's when the temp folder (a node's own disk) would keep less than
+30 GB and 15 % of its file system free with an upper bound of the signals
+(float, 1.4 GB an hour each) written (`packager.stereo.lift_skipped`); the
+5.1 companions and the copied tracks are never touched.
 
 **Subtitles.** Sidecars are extracted exactly as before; PGS / VobSub /
 DVB stay sidecar-only because HLS can't carry them. The source's PGS and
