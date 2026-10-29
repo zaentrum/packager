@@ -207,6 +207,22 @@ other layout of more than two channels gets ffmpeg's own matrix
 normalised (`rematrix_maxval=1`), without make-up. A mono or stereo track
 is converted as before.
 
+The 5.1 companion encoded from a track of more than six channels is
+folded the same way: the channels a 5.1 has as they are (a back pair is
+the surrounds where there is no side pair), a back pair beside the side
+pair and a back centre into the surrounds and a front left or right of
+centre into its front and the centre at -3 dB, normalised, made up again
+to 3 dB under the plain fold and held under -3 dBFS by the same limiter.
+ffmpeg's own fold, unscaled for the AC-3 / E-AC-3 encoder's float input,
+reached +3.7 dBFS on a loud 7.1; on loud test mixes every channel of the
+companion stays under -1 dBFS as it is decoded (the encode overshoots the
+ceiling by up to 1.1 dB), 3 LU under ffmpeg's fold, its timing unchanged.
+Layouts are known by ffprobe's names (6.1 to 7.1, `7.1(wide)` and
+`octagonal` among them); any other of more than six channels (height
+channels, no name) gets ffmpeg's own fold normalised
+(`rematrix_maxval=1`). A track of six channels or fewer is made a 5.1 as
+before, a 5.1 sample for sample.
+
 **Subtitles.** Sidecars are extracted exactly as before; PGS / VobSub /
 DVB stay sidecar-only because HLS can't carry them. The source's PGS and
 text tracks are written in one ffmpeg run over it, an output per track,
