@@ -8,18 +8,20 @@ over -1 dBFS, and a dialogue band in the centre besides, as a 5.1(side), a
 Matroska), a stereo AAC track, a 6.1 (FLAC) and a 7.1 ffprobe names no
 layout for (PCM). The plain matrix the stereo rendition had goes over full
 scale on it; the packager's stereo renditions of the surround tracks stay
-under -1 dBFS as a player decodes them, those of the unnamed layouts under
-full scale, every one as long as the plain matrix's, beside their 5.1
-companions; the stereo track's rendition is what the filter it always had
-makes of it, sample for sample. ffmpeg's own fold of the 7.1 into its 5.1
-companion goes over full scale too; the packager's companions of the 7.1 and
-the 6.1 and the unnamed 7.1 stay under -1 dBFS in every channel as the
-E-AC-3 is decoded, every companion as long as before and
-starting where it did; those of the 5.1 tracks are what the format they
+under -1 dBFS as a player decodes them, those of the unnamed layouts too
+(ffmpeg's matrix normalised, then the limiter), every one as long as the
+plain matrix's, beside their 5.1 companions; the stereo track's rendition is
+what the filter it always had makes of it, sample for sample. ffmpeg's own
+fold of the 7.1 into its 5.1 companion goes over full scale too; the
+packager's companions of the 7.1 and the 6.1 and the unnamed 7.1 stay under
+-1 dBFS in every channel as the E-AC-3 is decoded, every companion as long
+as before and starting where it did; those of the 5.1 tracks are what the format they
 always had makes of them, sample for sample. The layouts the downmix and the
 fold know by name are ffmpeg's, and ffmpeg runs every fold; the fallback is
 ffmpeg's normalised fold where the limiter doesn't act, and each fold puts
-every source channel where it belongs, on the sample."""
+every source channel where it belongs, on the sample. The stereo fallback,
+too, is ffmpeg's normalised matrix where the limiter doesn't act, and a
+stereo under -1 dBFS as the AAC of a full-scale track is decoded."""
 
 from __future__ import annotations
 
@@ -222,12 +224,11 @@ def test_a_loud_surround_track_stays_under_full_scale(film: Path, prepared: Path
     plain, plain_samples = _stats(
         _encode(film, "0:a:0", pk._STEREO_FORMAT, tmp_path / "plain.mp4"), "0:a:0")
     assert plain > 0
-    # The 5.1(side), the 7.1, the 5.1 and the 6.1: under -1 dBFS; the 5.1
-    # and the 7.1 ffprobe names no layout for (ffmpeg's matrix normalised):
-    # under full scale.
+    # The 5.1(side), the 7.1, the 5.1 and the 6.1, and the 5.1 and the 7.1
+    # ffprobe names no layout for (ffmpeg's matrix normalised, then the
+    # limiter): under -1 dBFS.
     stats = [_stats(prepared, f"0:a:{i}") for i in (0, 1, 2, 5, 3, 6)]
-    assert all(peak <= -1.0 for peak, _ in stats[:4]), stats
-    assert all(peak <= 0 for peak, _ in stats[4:]), stats
+    assert all(peak <= -1.0 for peak, _ in stats), stats
     # The limiter's delay is compensated: as many samples as the plain
     # matrix's, nothing lost at the end, nothing added at the start.
     assert {samples for _, samples in stats} == {plain_samples}
@@ -353,3 +354,45 @@ def test_the_fold_puts_every_channel_where_it_belongs(layout: str, tmp_path: Pat
             assert abs(window[600] - want) < 0.002, (name, channel, window[600], want)
             # nothing but the one sample: the limiter's delay is compensated
             assert max(abs(v) for k, v in enumerate(window) if k != 600) < 0.002, (name, channel)
+
+
+def _layout(path: Path) -> list[tuple[str, int, str]]:
+    """Every audio stream's codec, channels and layout, as ffprobe has them."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+                          "stream=codec_name,channels,channel_layout", "-of", "json", str(path)],
+                         capture_output=True, text=True, check=True).stdout
+    return [(s["codec_name"], s["channels"], s.get("channel_layout", ""))
+            for s in json.loads(out)["streams"]]
+
+
+def test_the_stereo_fallback_downmixes_as_ffmpeg_does_and_stays_under_full_scale(
+        tmp_path: Path) -> None:
+    # A 5.1 ffprobe names no layout for (PCM in Matroska), the same noise in
+    # every channel: quiet, the fallback is ffmpeg's matrix normalised sample
+    # for sample (the limiter doesn't act); at full scale that matrix reaches
+    # full scale as the AAC is decoded (over it, by the noise: +0.35 dBFS on
+    # this one, 8.1), the fallback stays under -1 dBFS; a stereo either way,
+    # as long as the matrix alone.
+    plain = f"aresample=48000:rematrix_maxval=1,{pk._STEREO_FORMAT}"
+    fallback = pk._stereo_filter({"channels": 6})
+    assert fallback == pk._stereo_filter({"channels": 6, "channel_layout": "unknown"}) != plain
+    for level, quiet in ((0.05, True), (1.0, False)):
+        src = tmp_path / f"src{level}.mka"
+        _ff("-f", "lavfi", "-i", f"anoisesrc=color=pink:seed=3:duration=3,lowpass=f=5000,"
+            f"alimiter=limit=0.0625:level=disabled,volume={level / 0.0625},"
+            "pan=5.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0", "-c:a", "pcm_s16le", str(src))
+        assert [(s["channels"], s.get("channel_layout")) for s in pk._ffprobe(src).audio] == [
+            (6, None)]
+        if quiet:
+            wavs = [_ffwav(src, chain, tmp_path / f"{label}.wav")
+                    for label, chain in (("plain", plain), ("fallback", fallback))]
+            assert _decoded_md5(wavs[0], "0:a:0") == _decoded_md5(wavs[1], "0:a:0")
+            assert [s[:2] for s in _layout(wavs[1])] == [("pcm_f32le", 2)]  # WAV: no mask
+            continue
+        encoded = {label: _encode(src, "0:a:0", chain, tmp_path / f"{label}.mp4")
+                   for label, chain in (("plain", plain), ("fallback", fallback))}
+        assert _layout(encoded["fallback"]) == [("aac", 2, "stereo")]
+        (plain_peak, plain_samples), (peak, samples) = (_stats(encoded[k], "0:a:0")
+                                                        for k in ("plain", "fallback"))
+        assert plain_peak > -1.0 >= peak, (plain_peak, peak)
+        assert samples == plain_samples

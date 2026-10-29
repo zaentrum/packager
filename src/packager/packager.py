@@ -213,7 +213,7 @@ _DOWNMIX_GAINS = {  # (left, right)
 # The layouts made of those channels, by the names ffprobe gives them (ffmpeg
 # -layouts). Any other layout of more than two channels (a 7.1(wide), a
 # 5.1.2, one ffprobe has no name for) gets ffmpeg's own matrix normalised
-# (rematrix_maxval=1): never over full scale, no make-up, no limiter.
+# (rematrix_maxval=1), no make-up, and the limiter (_STEREO_FALLBACK_MATRIX).
 _DOWNMIX_LAYOUTS = {
     "2.1": "FL+FR+LFE", "3.0": "FL+FR+FC", "3.0(back)": "FL+FR+BC",
     "3.1": "FL+FR+FC+LFE", "4.0": "FL+FR+FC+BC", "quad": "FL+FR+BL+BR",
@@ -226,6 +226,15 @@ _DOWNMIX_LAYOUTS = {
 }
 _DOWNMIX_LEVEL = _M3DB
 _DOWNMIX_LIMITER = "alimiter=limit=-3dB:attack=10:release=100:level=disabled:latency=enabled"
+# ffmpeg's matrix normalised reaches full scale, and the AAC encode overshoots
+# that: the fallback goes behind the limiter too, the stereo layout fixed
+# right after the matrix, one layout, not a choice, so that the resample
+# which normalises is the one that downmixes (the limiter takes any layout:
+# left open, the source's channels could pass it and a resample after it
+# downmix them unnormalised; the 5.1 fallback, left a choice, gave its
+# encoders a mono). Where the limiter doesn't act, it is that matrix sample
+# for sample.
+_STEREO_FALLBACK_MATRIX = f"aresample=48000:rematrix_maxval=1,{_STEREO_FORMAT}"
 # The stereo rendition's loudness (_lift_stereo). Downloads and phones play
 # the stereo rendition, and a film's mix, made for a cinema or a living
 # room, comes out of the downmix at -28 to -34 LUFS: too quiet for a phone
@@ -269,11 +278,10 @@ _LIFT_ROUNDS = 3
 # container's time base rounded, a millisecond in Matroska) it takes the
 # frame's own and forgets the delay it compensates: the rest comes 10 ms
 # late. A rendition made with the downmix's limiter has that already, and
-# its lift the same; one made without it (a mono or stereo track, a layout
-# ffmpeg downmixes) is lifted from timestamps counted from its first
-# sample (_LIFT_RETIME). Its timing is the rendition's own, then: its first
-# timestamp, its packets, its length to the source's rounding
-# (_LIFT_TIMING_SLACK, seconds).
+# its lift the same; one made without it (a mono or stereo track) is lifted
+# from timestamps counted from its first sample (_LIFT_RETIME). Its timing
+# is the rendition's own, then: its first timestamp, its packets, its length
+# to the source's rounding (_LIFT_TIMING_SLACK, seconds).
 _LIFT_RETIME = "asettb=1/sr,asetpts=STARTPTS+N"
 _LIFT_TIMING_SLACK = 0.002
 # How many tracks are lifted at once: each lift is a few ffmpeg runs of one
@@ -1469,13 +1477,14 @@ def _stereo_chain(stream: dict[str, Any]) -> _StereoChain:
     the normalised matrix (pan), then, where its gains sum to more than the
     make-up gives back, the resample to 48 kHz (so nothing after the limiter
     can raise a peak), the make-up to _DOWNMIX_LEVEL under the plain matrix,
-    the limiter. Any other layout: ffmpeg's own matrix, normalised."""
+    the limiter. Any other layout: ffmpeg's own matrix, normalised, and the
+    limiter (_STEREO_FALLBACK_MATRIX)."""
     channels = int(stream.get("channels") or 0)
     if channels <= 2:
         return _StereoChain(_STEREO_FORMAT)
     names = _DOWNMIX_LAYOUTS.get(str(stream.get("channel_layout") or ""), "").split("+")
     if len(names) != channels:
-        return _StereoChain(f"aresample=48000:rematrix_maxval=1,{_STEREO_FORMAT}")
+        return _StereoChain(_STEREO_FALLBACK_MATRIX, rest=f"{_DOWNMIX_LIMITER},{_STEREO_FORMAT}")
     rows = [[(name, _DOWNMIX_GAINS[name][side]) for name in names if _DOWNMIX_GAINS[name][side]]
             for side in (0, 1)]
     total = max(sum(gain for _, gain in row) for row in rows)

@@ -38,7 +38,7 @@ def _loudness(integrated: float, seconds: float = 600.0, true_peak: float = -9.0
     (2, "stereo", FORMAT, 0.0, ""),
     (1, "mono", FORMAT, 0.0, ""),
     (6, "5.1(side)", f"{PAN_5_1},aresample=48000", 4.65, f"volume=4.65dB,{LIMITER},{FORMAT}"),
-    (6, None, f"aresample=48000:rematrix_maxval=1,{FORMAT}", 0.0, ""),
+    (6, None, f"aresample=48000:rematrix_maxval=1,{FORMAT}", 0.0, f"{LIMITER},{FORMAT}"),
     (3, "2.1", f"pan=stereo|FL=1*FL|FR=1*FR,{FORMAT}", 0.0, ""),
 ])
 def test_a_renditions_signal_is_its_filters_before_the_make_up(
@@ -288,6 +288,19 @@ def test_a_rendition_over_the_true_peak_is_made_again_lower(monkeypatch) -> None
         _loudness(-33.3), _loudness(-21.2), _loudness(-20.0), _loudness(-20.0, true_peak=-1.2),
         _loudness(-20.0, true_peak=-1.9)])
     assert out is None
+
+
+def test_the_fallback_has_a_limiter_its_lift_is_not_retimed(monkeypatch) -> None:
+    encoded: list[str] = []
+    measured = [_loudness(-30.0), _loudness(-21.0), _loudness(-20.0),
+                _loudness(-20.1, true_peak=-2.5)]
+    monkeypatch.setattr(pk, "_measure_loudness", lambda *_a, **_kw: measured.pop(0))
+    monkeypatch.setattr(pk, "_run_ffmpeg_capturing",
+                        lambda label, args: encoded.append(args[args.index("-af") + 1]))
+    monkeypatch.setattr(pk, "_audio_timing", lambda path, stream: TIMING)
+    out = pk._lift_one(2, _s(6, None), Path("/t/stereo2.nut"), Path("/t/transmux.mp4"), -20.0)
+    assert out == Path("/t/stereo2.mp4")
+    assert encoded == [pk._lift_filter(10.0, -20.0, 1.0)]
 
 
 def test_a_rendition_without_a_limiter_is_lifted_retimed(monkeypatch) -> None:

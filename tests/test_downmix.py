@@ -3,7 +3,7 @@
 format they always were; a track of more than two channels in a layout the
 downmix knows is downmixed by the usual matrix normalised, made up to 3 dB
 under the plain matrix and limited under -3 dBFS; one in any other layout by
-ffmpeg's own matrix, normalised. And those that make its encoded 5.1
+ffmpeg's own matrix, normalised, made a stereo and limited. And those that make its encoded 5.1
 companion (packager._surround_filter): a track of six channels or fewer is
 made a 5.1 by the format it always was; one of more than six in a layout the
 fold knows by the fold normalised, made up to 3 dB under the plain matrix and
@@ -21,7 +21,7 @@ from packager import packager as pk
 
 FORMAT = "aformat=sample_rates=48000:channel_layouts=stereo"
 LIMITER = "alimiter=limit=-3dB:attack=10:release=100:level=disabled:latency=enabled"
-NORMALISED = f"aresample=48000:rematrix_maxval=1,{FORMAT}"
+NORMALISED = f"aresample=48000:rematrix_maxval=1,{FORMAT},{LIMITER},{FORMAT}"
 
 # The plain matrix, (left, right) per channel: the fronts as they are, the
 # centre and the surrounds at -3 dB, a back centre at -6 dB, no LFE.
@@ -107,9 +107,12 @@ def test_every_layout_is_the_plain_matrix_3_db_down_and_limited(layout: str) -> 
     (8, "7.1(wide)"),   # front left and right of centre
     (8, "5.1(side)"),   # a name that isn't the track's channels
 ])
-def test_any_other_layout_gets_ffmpegs_own_matrix_normalised(channels: int,
-                                                             layout: str | None) -> None:
-    assert pk._stereo_filter(_s(channels, layout)) == NORMALISED
+def test_any_other_layout_gets_ffmpegs_own_matrix_normalised_and_limited(
+        channels: int, layout: str | None) -> None:
+    chain = pk._stereo_filter(_s(channels, layout))
+    assert chain == NORMALISED
+    # The stereo fixed right after the matrix: one layout, not a choice.
+    assert chain.split(",")[1] == FORMAT and "|" not in FORMAT
 
 
 SURROUND_FORMAT = "aformat=sample_rates=48000:channel_layouts=5.1(side)|5.1"
