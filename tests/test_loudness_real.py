@@ -189,6 +189,8 @@ def test_a_quiet_mix_is_lifted_to_the_target_under_the_true_peak(runs) -> None:
     _, meta = runs["after"]
     lifted = [m.get("_input") for m in meta]
     assert [i for i, path in enumerate(lifted) if path is not None] == list(QUIET)
+    # Every shown track says what became of it: the loud one is kept.
+    assert [m.get("_lift") for m in meta] == ["lift", "lift", "keep", "lift"]
     for i in QUIET:
         # Quiet as the renditions were made before ...
         assert _r128(before, f"0:a:{i}")["I"] < -28
@@ -262,12 +264,18 @@ def test_a_track_no_client_offers_is_made_as_before(film: Path, tmp_path: Path) 
 @pytest.mark.skipif(shutil.which("packager") is None, reason="needs shaka-packager on PATH")
 def test_a_lifted_rendition_is_packaged_on_the_segments_it_had(
         film: Path, tmp_path: Path, monkeypatch) -> None:
-    roots = {}
+    roots, stereo = {}, {}
     for label, target in (("before", None), ("after", -20.0)):
         monkeypatch.setattr(pk, "PACKAGES_ROOT", tmp_path / label)
-        pk.package_item(ITEM, str(film), "movie", title="clip", trickplay=False,
-                        options=pk.PackageOptions(stereo_loudness=target))
+        stereo[label] = pk.StereoLoudness()
+        manifest = pk.package_item(ITEM, str(film), "movie", title="clip", trickplay=False,
+                                   options=pk.PackageOptions(stereo_loudness=target),
+                                   stereo=stereo[label])
         roots[label] = tmp_path / label / "movies" / ITEM[:2] / ITEM
+        assert not any(k.startswith("_") for a in manifest["renditions"]["audio"] for k in a)
+    # What the done step's details say of it: three lifted, the loud one kept.
+    assert stereo == {"before": pk.StereoLoudness(off=True),
+                      "after": pk.StereoLoudness(lifted=3, kept=1, skipped=0)}
     for a in ("a0", "a1", "a2", "a3", "a4", "a5"):
         playlists = [(roots[label] / "hls" / a / "playlist.m3u8").read_text()
                      for label in ("before", "after")]
@@ -325,12 +333,12 @@ def test_a_track_whose_timestamps_are_rounded_keeps_its_timing(tmp_path: Path, m
         # frame, and not kept.
         with monkeypatch.context() as mp:
             mp.setattr(pk, "_LIFT_RETIME", "anull")
-            assert pk._lift_one(0, stream, signal, before, -20.0) is None
+            assert pk._lift_one(0, stream, signal, before, -20.0) == (pk.SKIPPED, None)
             late = pk._audio_timing(tmp_path / "stereo0.mp4", "a:0")
             assert late is not None and int(late["duration_ts"]) - int(
                 pk._audio_timing(before, "a:0")["duration_ts"]) > 400
-    lifted = pk._lift_one(0, stream, signal, before, -20.0)
-    assert lifted is not None and _streams(lifted) == [("aac", 2, "stereo")]
+    kind, lifted = pk._lift_one(0, stream, signal, before, -20.0)
+    assert kind == pk.LIFTED and _streams(lifted) == [("aac", 2, "stereo")]
     start, duration, samples = _timing(lifted, "a:0")
     start_before, duration_before, samples_before = _timing(before, "a:0")
     assert (start, samples) == (start_before, samples_before)

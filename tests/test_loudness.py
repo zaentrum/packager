@@ -144,7 +144,7 @@ def test_the_remux_writes_every_renditions_signal_beside_it(monkeypatch, tmp_pat
     lifts: list[dict] = []
     monkeypatch.setattr(pk, "_lift_stereo", lambda probe, signals, mp4, target: (
         lifts.append({"signals": signals, "mp4": mp4, "target": target}) or
-        {1: tmp_path / "stereo1.mp4"}))
+        {0: (pk.KEPT, None), 1: (pk.LIFTED, tmp_path / "stereo1.mp4")}))
     audio = [_s(6, "5.1(side)", codec="dts"), _s(2, "stereo", "ger")]
     surround = pk._surround_plan(audio, {0, 1}, pk.PackageOptions())
     mp4, meta, surround_meta = pk._prepare_source(
@@ -170,8 +170,10 @@ def test_the_remux_writes_every_renditions_signal_beside_it(monkeypatch, tmp_pat
         str(tmp_path / "stereo1.nut")]
     assert lifts == [{"signals": {0: tmp_path / "stereo0.nut", 1: tmp_path / "stereo1.nut"},
                       "mp4": mp4, "target": -20.0}]
-    # The lifted rendition's entry names its MP4; the 5.1 companion is as it was.
+    # The lifted rendition's entry names its MP4, every shown one says what
+    # became of it; the 5.1 companion is as it was.
     assert [m.get("_input") for m in meta] == [None, tmp_path / "stereo1.mp4"]
+    assert [m.get("_lift") for m in meta] == ["keep", "lift"]
     assert [(m["idx"], m["mode"]) for m in surround_meta] == [(0, "encode")]
 
 
@@ -181,10 +183,11 @@ def test_only_the_tracks_a_client_offers_get_a_signal(monkeypatch, tmp_path: Pat
     monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: calls.append(args))
     lifts: list[dict] = []
     monkeypatch.setattr(pk, "_lift_stereo", lambda probe, signals, mp4, target: (
-        lifts.append(signals) or {}))
+        lifts.append(signals) or {i: (pk.KEPT, None) for i in signals}))
     audio = [_s(2, "stereo", "eng"), _s(2, "stereo", "ger"), _s(6, None, "fre", "dts")]
-    pk._prepare_source(Path("/m/src.mkv"), _probe(audio), tmp_path, audio_visible_indices={0, 2},
-                       stereo_loudness=-20.0)
+    _mp4, meta, _ = pk._prepare_source(Path("/m/src.mkv"), _probe(audio), tmp_path,
+                                       audio_visible_indices={0, 2}, stereo_loudness=-20.0)
+    assert [m.get("_lift") for m in meta] == ["keep", None, "keep"]
     [args] = calls
     graph = args[args.index("-filter_complex") + 1]
     # The hidden German track is made as before, no signal of it.
@@ -367,7 +370,7 @@ def test_a_quiet_rendition_is_lifted(monkeypatch) -> None:
     out, encoded, measures = _lift_run(monkeypatch, [
         _loudness(-33.3, true_peak=-11.0), _loudness(-21.2), _loudness(-20.1),
         _loudness(-20.1, true_peak=-2.4)])
-    assert out == Path("/t/stereo0.mp4")
+    assert out == (pk.LIFTED, Path("/t/stereo0.mp4"))
     assert encoded == [pk._lift_filter(13.3, -20.0, 1.2)]
     assert measures == ["", pk._lift_compressor(13.3, -20.0), pk._lift_filter(13.3, -20.0, 1.2),
                         ""]
@@ -387,7 +390,7 @@ def test_a_rendition_over_the_true_peak_is_made_again_lower(monkeypatch) -> None
     out, encoded, _ = _lift_run(monkeypatch, [
         _loudness(-33.3), _loudness(-21.2), _loudness(-20.0), _loudness(-20.0, true_peak=-1.2),
         _loudness(-20.2, true_peak=-2.6)])
-    assert out == Path("/t/stereo0.mp4")
+    assert out == (pk.LIFTED, Path("/t/stereo0.mp4"))
     # 0.8 dB over: the limiter 1.3 dB lower.
     assert [f.split("alimiter=limit=")[1].split("dB")[0] for f in encoded] == [
         f"{pk._LIFT_CEILING:.1f}", f"{pk._LIFT_CEILING - 1.3:.1f}"]
@@ -395,12 +398,12 @@ def test_a_rendition_over_the_true_peak_is_made_again_lower(monkeypatch) -> None
     out, encoded, _ = _lift_run(monkeypatch, [
         _loudness(-33.3), _loudness(-21.2), _loudness(-20.0), _loudness(-20.0, true_peak=-2.0),
         _loudness(-20.2, true_peak=-2.5)])
-    assert out is not None and len(encoded) == 2 and "limit=-4.5dB" in encoded[1]
+    assert out[0] == pk.LIFTED and len(encoded) == 2 and "limit=-4.5dB" in encoded[1]
     # Over again: the rendition made before stays.
     out, _, _ = _lift_run(monkeypatch, [
         _loudness(-33.3), _loudness(-21.2), _loudness(-20.0), _loudness(-20.0, true_peak=-1.2),
         _loudness(-20.0, true_peak=-1.9)])
-    assert out is None
+    assert out == (pk.SKIPPED, None)  # a lift not kept
 
 
 def test_the_fallback_has_a_limiter_its_lift_is_not_retimed(monkeypatch) -> None:
@@ -412,7 +415,7 @@ def test_the_fallback_has_a_limiter_its_lift_is_not_retimed(monkeypatch) -> None
                         lambda label, args: encoded.append(args[args.index("-af") + 1]))
     monkeypatch.setattr(pk, "_audio_timing", lambda path, stream: TIMING)
     out = pk._lift_one(2, _s(6, None), Path("/t/stereo2.nut"), Path("/t/transmux.mp4"), -20.0)
-    assert out == Path("/t/stereo2.mp4")
+    assert out == (pk.LIFTED, Path("/t/stereo2.mp4"))
     assert encoded == [pk._lift_filter(10.0, -20.0, 1.0)]
 
 
@@ -425,7 +428,7 @@ def test_a_rendition_without_a_limiter_is_lifted_retimed(monkeypatch) -> None:
                         lambda label, args: encoded.append(args[args.index("-af") + 1]))
     monkeypatch.setattr(pk, "_audio_timing", lambda path, stream: TIMING)
     out = pk._lift_one(1, _s(2, "stereo"), Path("/t/stereo1.nut"), Path("/t/transmux.mp4"), -20.0)
-    assert out == Path("/t/stereo1.mp4")
+    assert out == (pk.LIFTED, Path("/t/stereo1.mp4"))
     assert encoded == [pk._lift_filter(10.0, -20.0, 1.0, retime=True)]
 
 
@@ -449,19 +452,22 @@ def test_a_lift_with_another_timing_is_not_kept(monkeypatch) -> None:
     out, encoded, _ = _lift_run(monkeypatch, [
         _loudness(-33.3), _loudness(-21.2), _loudness(-20.0), _loudness(-20.1, true_peak=-2.4)],
         timing={**TIMING, "start_pts": 0})
-    assert out is None and len(encoded) == 1
+    assert out == (pk.SKIPPED, None) and len(encoded) == 1
 
 
-@pytest.mark.parametrize(("measured", "encodes"), [
-    ([_loudness(-24.0)], 0),                  # loud enough: -19.35 as made
-    ([None], 0),                              # not measured
-    ([_loudness(-33.3), None], 0),            # the compressor's output not measured
-    ([_loudness(-33.3), _loudness(-21.2), None], 0),
-    ([_loudness(-33.3), _loudness(-21.2), _loudness(-20.0), None], 1),  # nor the AAC
+@pytest.mark.parametrize(("measured", "outcome", "encodes"), [
+    ([_loudness(-24.0)], "keep", 0),                  # loud enough: -19.35 as made
+    ([_loudness(-40.0, seconds=2.0)], "keep", 0),     # too short to measure
+    ([_loudness(-70.0)], "keep", 0),                  # silent
+    ([None], "skip", 0),                              # not measured
+    ([_loudness(-33.3), None], "skip", 0),            # the compressor's output not measured
+    ([_loudness(-33.3), _loudness(-21.2), None], "skip", 0),
+    ([_loudness(-33.3), _loudness(-21.2), _loudness(-20.0), None], "skip", 1),  # nor the AAC
 ])
-def test_no_lift_leaves_the_rendition(monkeypatch, measured: list, encodes: int) -> None:
+def test_no_lift_leaves_the_rendition(monkeypatch, measured: list, outcome: str,
+                                      encodes: int) -> None:
     out, encoded, _ = _lift_run(monkeypatch, list(measured))
-    assert out is None and len(encoded) == encodes
+    assert out == (outcome, None) and len(encoded) == encodes
 
 
 def test_every_signal_is_removed_and_a_failed_lift_keeps_its_rendition(
@@ -473,13 +479,109 @@ def test_every_signal_is_removed_and_a_failed_lift_keeps_its_rendition(
     def lift_one(i, stream, signal, mp4, target):
         if i == 1:
             raise pk.PackageError("ffmpeg stereo 1 exited 1")
-        return signal.with_suffix(".mp4") if i == 0 else None
+        return (pk.LIFTED, signal.with_suffix(".mp4")) if i == 0 else (pk.KEPT, None)
 
     monkeypatch.setattr(pk, "_lift_one", lift_one)
     probe = _probe([_s(2, "stereo")] * 3)
     assert pk._lift_stereo(probe, signals, tmp_path / "transmux.mp4", -20.0) == {
-        0: tmp_path / "stereo0.mp4"}
+        0: (pk.LIFTED, tmp_path / "stereo0.mp4"), 1: (pk.SKIPPED, None), 2: (pk.KEPT, None)}
     assert not any(p.exists() for p in signals.values())
+
+
+# ------------------------------------------------------------ the count
+
+def _marked(lifts: dict, visible: set[int] | None, monkeypatch, tmp_path: Path, space,
+            free: float = 200) -> list[dict]:
+    """The stereo entries _prepare_source leaves for four stereo tracks,
+    `visible` of them shown, their lifts `lifts` (by track; a track missing
+    raises, as an encode that fails does)."""
+    space["free"] = free * GB
+    monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: None)
+
+    def lift_one(i, stream, signal, mp4, target):
+        if i not in lifts:
+            raise pk.PackageError(f"ffmpeg stereo {i} exited 1")
+        return lifts[i]
+
+    monkeypatch.setattr(pk, "_lift_one", lift_one)
+    audio = [_s(2, "stereo", lang) for lang in ("eng", "ger", "fre", "ita")]
+    _mp4, meta, _ = pk._prepare_source(Path("/m/src.mkv"), _probe(audio), tmp_path,
+                                       audio_visible_indices=visible, stereo_loudness=-20.0)
+    return meta
+
+
+def test_every_shown_track_is_counted_once(monkeypatch, tmp_path: Path, space) -> None:
+    # Track 0 lifted, 1 at the target, 2 failing its encode, 3 hidden.
+    meta = _marked({0: (pk.LIFTED, tmp_path / "stereo0.mp4"), 1: (pk.KEPT, None)}, {0, 1, 2},
+                   monkeypatch, tmp_path, space)
+    assert [m.get("_lift") for m in meta] == ["lift", "keep", "skip", None]
+    stereo = pk._stereo_loudness_of(meta, -20.0)
+    assert stereo == pk.StereoLoudness(lifted=1, kept=1, skipped=1)
+    assert stereo.details == " st_lift=1 st_keep=1 st_skip=1"
+    # The marks are taken off: nothing of them reaches the manifest.
+    assert not any("_lift" in m for m in meta)
+
+
+def test_a_title_the_temp_space_leaves_out_counts_every_shown_track_skipped(
+        monkeypatch, tmp_path: Path, space) -> None:
+    meta = _marked({}, {1, 3}, monkeypatch, tmp_path, space, free=31)
+    assert [m.get("_lift") for m in meta] == [None, "skip", None, "skip"]
+    assert pk._stereo_loudness_of(meta, -20.0).details == " st_lift=0 st_keep=0 st_skip=2"
+
+
+def test_with_the_setting_off_the_count_says_so(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: None)
+    _mp4, meta, _ = pk._prepare_source(Path("/m/src.mkv"), _probe([_s(2, "stereo")]), tmp_path)
+    assert "_lift" not in meta[0]
+    assert pk._stereo_loudness_of(meta, None) == pk.StereoLoudness(off=True)
+    assert pk.StereoLoudness(off=True).details == " st=off"
+
+
+def test_the_done_steps_details_say_it() -> None:
+    manifest = {"renditions": {"video": [{"codec": "hvc1.2.4.L150.90"}], "audio": [{}, {}],
+                               "audioSurround": [{}]}, "subtitles": [{}] * 4}
+    base = "v=hvc1.2.4.L150.90 a=2 subs=4 dur_s=12.5 a51=1"
+    assert worker._details(manifest, 12.5) == base  # a version reported again: no run's count
+    assert worker._details(manifest, 12.5, pk.StereoLoudness(lifted=1, kept=0, skipped=1)) == (
+        base + " st_lift=1 st_keep=0 st_skip=1")
+    assert worker._details(manifest, 12.5, pk.StereoLoudness(off=True)) == base + " st=off"
+
+
+@pytest.mark.parametrize(("setting", "tail"), [
+    ("-20", " st_lift=1 st_keep=0 st_skip=1"), ("off", " st=off")])
+def test_the_item_steps_details_say_it(monkeypatch, tmp_path: Path, setting: str,
+                                       tail: str) -> None:
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x")
+    monkeypatch.setattr(worker, "_INBOX_ROOT", tmp_path / "_inbox")
+    monkeypatch.setattr(worker, "probe_source", lambda _path: {})
+
+    def package_item(*_a, stereo, options, **_kw):
+        if options.stereo_loudness is None:
+            stereo.off = True
+        else:
+            stereo.lifted, stereo.skipped = 1, 1
+        return {"renditions": {"video": [{"codec": "hvc1"}], "audio": [{}, {}]}, "subtitles": []}
+
+    monkeypatch.setattr(worker, "package_item", package_item)
+    done: list[str] = []
+
+    class Client:
+        def settings(self) -> dict:
+            return {"packager.stereo_loudness": setting}
+
+        def upsert_step(self, _id, status, **kw) -> None:
+            if status == "done":
+                done.append(kw["details"])
+
+        def packaging_complete(self, *_args) -> None:
+            pass
+
+    item = ClaimedItem(id="c0ffee00-0000-4000-8000-0000000000ab", type="movie", title="Clip",
+                       year=None, duration_ms=None, path=str(source))
+    worker._process_one(item, Client())  # type: ignore[arg-type]
+    [details] = done
+    assert details.startswith("v=hvc1 a=2 subs=0 dur_s=") and details.endswith(tail)
 
 
 # ------------------------------------------------------------ shaka

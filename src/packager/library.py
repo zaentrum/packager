@@ -89,6 +89,7 @@ from .packager import (
     STALE_STAGING_SECONDS,
     PackageError,
     PackageOptions,
+    StereoLoudness,
     _remove,
     _started_before,
     _subdirs,
@@ -348,13 +349,16 @@ class Placed:
     named mapped to the rendition made from it. reported_again: the folder
     was in place already, from a run whose handover was lost. original:
     where the original is in the version folder, when the run renamed it
-    there. A version taken in has no package: no body, no package."""
+    there. A version taken in has no package: no body, no package. stereo:
+    what the stereo loudness did, where this run made the package (in no
+    record: the done step's details)."""
     folder: Path
     body: bytes | None
     package: dict[str, Any] | None
     sidecars: list[dict[str, Any]]
     reported_again: bool = False
     original: Path | None = None
+    stereo: StereoLoudness | None = None
 
     @property
     def complete(self) -> str | None:
@@ -546,7 +550,8 @@ def _stage_version(
              bytes=package["checksums"]["bytes"], original=lib.build.original_name)
     vdir = Path(lib.build.version_dir)
     return Placed(vdir, body, package, _handover(item, package, copies, sid),
-                  original=vdir / lib.build.original_name if lib.build.original_name else None)
+                  original=vdir / lib.build.original_name if lib.build.original_name else None,
+                  stereo=built.stereo)
 
 
 def _source_of(
@@ -678,7 +683,7 @@ def _add_package(
     log.info("packager.library.package_added", item_id=item.id, version_id=vid,
              package_id=package_id, files=package["checksums"]["files"],
              bytes=package["checksums"]["bytes"])
-    return Placed(vdir, body, package, _handover(item, package, copies, sid))
+    return Placed(vdir, body, package, _handover(item, package, copies, sid), stereo=built.stereo)
 
 
 def _holding_its_original(item: ClaimedItem, lib: ItemLibrary) -> bytes:
@@ -1207,7 +1212,7 @@ def package_extra(
         raise
     log.info("packager.library.extra", extra_id=extra.id, package_id=package_id,
              files=package["checksums"]["files"], bytes=package["checksums"]["bytes"])
-    return Placed(xdir, body, package, [])
+    return Placed(xdir, body, package, [], stereo=built.stereo)
 
 
 def _extra_library(extra: ClaimedExtra) -> ExtraLibrary:

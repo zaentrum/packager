@@ -139,9 +139,12 @@ class Binaries:
         monkeypatch.setattr(pk, "_generate_trickplay", self._sprites)
 
     @staticmethod
-    def _prepare(_src, _probe, tmpdir: Path, **_kw):
+    def _prepare(_src, _probe, tmpdir: Path, **kw):
+        # Its one track shown, at the target or above: kept, as the remux
+        # marks it (packager._prepare_source).
         audio = [{"idx": 0, "codec": "aac", "language": "eng", "title": "", "channels": 2,
-                  "default": True, "visible": True}]
+                  "default": True, "visible": True,
+                  **({"_lift": "keep"} if kw.get("stereo_loudness") is not None else {})}]
         return tmpdir / "transmux.mp4", audio, []
 
     @staticmethod
@@ -559,7 +562,10 @@ def run(monkeypatch: pytest.MonkeyPatch, events: list[dict], catalog: Catalog,
 
     def package_item(*args, **kwargs) -> dict:
         calls.append((args, kwargs))
-        return package(*args, **kwargs) if package else MANIFEST
+        if package:
+            return package(*args, **kwargs)
+        kwargs["stereo"].kept = 1  # its one track, as a run at the target says
+        return MANIFEST
 
     monkeypatch.setattr(extras, "build_consumer", build_consumer)
     monkeypatch.setattr(extras, "package_item", package_item)
@@ -601,7 +607,8 @@ def test_an_extra_is_packaged_and_handed_to_the_catalog(
     assert catalog.writes[1][2] == {**MANIFEST, "source": SOURCE}
     done = catalog.writes[2][2]
     assert done["status"] == "done"
-    assert re.fullmatch(r"v=avc1\.64001f a=1 subs=0 dur_s=[0-9.]+ vr=2", done["details"])
+    assert re.fullmatch(r"v=avc1\.64001f a=1 subs=0 dur_s=[0-9.]+ vr=2"
+                        r" st_lift=0 st_keep=1 st_skip=0", done["details"])
     assert not inbox.exists()  # the handoff goes once the catalog has the package
     assert broker.committed == [0]
 

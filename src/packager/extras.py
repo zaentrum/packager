@@ -65,7 +65,7 @@ import structlog
 from . import library
 from .events import build_consumer, is_retry, parse_envelope, parse_extra_id
 from .katalog import ClaimedExtra, KatalogClient
-from .packager import PACKAGES_ROOT, PackageOptions, iso639_2, package_item
+from .packager import PACKAGES_ROOT, PackageOptions, StereoLoudness, iso639_2, package_item
 from .renditions import ContractError, resolve_inputs
 from .worker import _details, _parse_settings, _source_block, _with_settings
 
@@ -184,6 +184,7 @@ def _process_extra(
     track_languages = _track_languages(extra)
 
     t0 = time.monotonic()
+    stereo = StereoLoudness()
     try:
         manifest = package_item(
             extra.id, extra.path, item_type=EXTRA_TYPE,
@@ -195,6 +196,7 @@ def _process_extra(
             track_languages=track_languages,
             trickplay=False,
             manifest_extra={"parentId": parent_id, "extraKind": kind},
+            stereo=stereo,
         )
     except Exception as e:
         # package_item wrote `.failed` into the extra's folder and logged
@@ -215,7 +217,7 @@ def _process_extra(
         client.upsert_extra_step(
             extra.id, "failed", error="packaging-complete: the catalog did not take the package")
         return
-    details = _details(manifest, seconds)
+    details = _details(manifest, seconds, stereo)
     client.upsert_extra_step(extra.id, "done", details=details)
     _cleanup_inbox(extra.id)
     log.info(
@@ -288,7 +290,7 @@ def _process_extra_library(
         client.upsert_extra_step(extra.id, "failed",
                                  error=f"packaging-complete: {handed.error}"[:500])
         return
-    details = _details(placed.package, seconds)
+    details = _details(placed.package, seconds, placed.stereo)
     client.upsert_extra_step(extra.id, "done", details=details)
     library.finish(lib.staging_dir, inbox, Path(lib.inbox_dir))
     log.info("packager.extra.done", extra_id=extra.id, kind=extra.kind, details=details,

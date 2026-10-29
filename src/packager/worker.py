@@ -67,7 +67,7 @@ import structlog
 from . import library
 from .events import build_consumer, is_retry, is_takein, parse_envelope, parse_item_id
 from .katalog import TAKEIN, ClaimedItem, KatalogClient
-from .packager import PACKAGES_ROOT, PackageOptions, package_item, probe_source
+from .packager import PACKAGES_ROOT, PackageOptions, StereoLoudness, package_item, probe_source
 from .renditions import ContractError, PackageInputs, resolve_inputs
 
 log = structlog.get_logger(__name__)
@@ -178,10 +178,13 @@ def _with_settings(options: PackageOptions | None, raw: dict[str, str]) -> Packa
     return replace(options, stereo_loudness=target)
 
 
-def _details(manifest: dict[str, Any], seconds: float) -> str:
+def _details(manifest: dict[str, Any], seconds: float,
+             stereo: StereoLoudness | None = None) -> str:
     """The `done` step's details: the top rung's codec, the audio and
     subtitle counts and the run's seconds, the ladder and the 5.1 group
-    where there are any. Read from a manifest or a package.json alike."""
+    where there are any. Read from a manifest or a package.json alike. Then
+    what the stereo loudness did with the shown tracks (StereoLoudness:
+    st_lift= st_keep= st_skip=, or st=off), where this run made the package."""
     renditions = manifest.get("renditions") or {}
     video = renditions.get("video") or []
     surround = renditions.get("audioSurround") or []
@@ -191,6 +194,7 @@ def _details(manifest: dict[str, Any], seconds: float) -> str:
         f"subs={len(manifest.get('subtitles') or [])} dur_s={seconds}"
         + (f" vr={len(video)}" if len(video) > 1 else "")
         + (f" a51={len(surround)}" if surround else "")
+        + (stereo.details if stereo is not None else "")
     )
 
 
@@ -253,6 +257,7 @@ def _process_one(
     options = _with_settings(options, settings)
 
     t0 = time.monotonic()
+    stereo = StereoLoudness()
     try:
         manifest = package_item(
             # The source as the catalog has it: v0 (inputs.primary) may be
@@ -274,6 +279,7 @@ def _process_one(
             tmdb_id=item.tmdb_id,
             inputs=inputs,
             options=options,
+            stereo=stereo,
         )
     except Exception as e:
         # package_item already wrote `.failed` to the package dir and
@@ -304,6 +310,7 @@ def _process_one(
         f"subs={len(subtitles)} dur_s={seconds}"
         + (f" vr={len(video_renditions)}" if len(video_renditions) > 1 else "")
         + (f" a51={len(surround_renditions)}" if surround_renditions else "")
+        + stereo.details
     )
     # Mirror the manifest into the catalog DB so the Object Page Files
     # facet picks up codec/resolution/bitrate + the packaged-asset row
@@ -409,7 +416,7 @@ def _process_library(
         # version folder stays as it is; a retry reports it again.
         client.upsert_step(item.id, "failed", error=f"packaging-complete: {handed.error}"[:500])
         return
-    details = _details(placed.package, seconds)
+    details = _details(placed.package, seconds, placed.stereo)
     client.upsert_step(item.id, "done", details=details)
     library.finish(lib.build.staging_dir, inbox, Path(lib.inbox_dir))
     log.info("packager.item.done", item_id=item.id, title=item.title, seconds=seconds,

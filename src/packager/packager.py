@@ -455,8 +455,10 @@ def package_item(
     subtitle_files: list[Any] | None = None,
     trickplay: bool = True,
     manifest_extra: dict[str, Any] | None = None,
+    stereo: StereoLoudness | None = None,
 ) -> dict[str, Any]:
-    """Package one item synchronously. Returns the written manifest.
+    """Package one item synchronously. Returns the written manifest; a
+    `stereo` given is set to what the stereo loudness did (StereoLoudness).
 
     The new package is built in the item folder's staging folder and
     swapped in only once it is complete; until then an existing package
@@ -522,7 +524,7 @@ def package_item(
 
     try:
         _open_staging(out_root, options.old_package_grace_seconds)
-        manifest = build_package(
+        built = build_package(
             item_id, source_path, item_type, stage, inputs=inputs, options=options,
             language_whitelist=language_whitelist,
             keep_original_if_single=keep_original_if_single,
@@ -530,7 +532,8 @@ def package_item(
             season_number=season_number, episode_number=episode_number, tmdb_id=tmdb_id,
             track_languages=track_languages, subtitle_files=subtitle_files,
             trickplay=trickplay, manifest_extra=manifest_extra,
-        ).manifest
+        )
+        manifest = built.manifest
         _write_atomic(stage / MANIFEST_FILE, json.dumps(manifest, indent=2).encode())
 
         # Only a whole package replaces the live one. The live one is kept
@@ -538,6 +541,8 @@ def package_item(
         # it, then removed.
         _verify_staged(stage)
         replaced = _swap_in(out_root, stage)
+        if stereo is not None and built.stereo is not None:
+            vars(stereo).update(vars(built.stereo))
         log.info("packager.complete", item_id=item_id, dir=str(out_root),
                  replaced=[p.name for p in replaced] or None)
         _remove_after(replaced, options.old_package_grace_seconds)
@@ -563,16 +568,53 @@ def _inputs_of(source_path: str, inputs: PackageInputs | None) -> PackageInputs:
     return inputs
 
 
+# What became of a shown track's stereo rendition (_lift_one): lifted;
+# kept, made as before on purpose (at the target or above, too short to
+# measure, silent); skipped, made as before though it may be quiet (no
+# signal for the temp space, a measurement or an encode that failed, a lift
+# not kept for its true peak or its timing).
+LIFTED, KEPT, SKIPPED = "lift", "keep", "skip"
+
+
+@dataclass
+class StereoLoudness:
+    """What the stereo loudness did with a run's shown tracks, each counted
+    once (LIFTED, KEPT, SKIPPED); `off`: it had no target. The done step's
+    details say it (`details`)."""
+    off: bool = False
+    lifted: int = 0
+    kept: int = 0
+    skipped: int = 0
+
+    @property
+    def details(self) -> str:
+        if self.off:
+            return " st=off"
+        return f" st_lift={self.lifted} st_keep={self.kept} st_skip={self.skipped}"
+
+
+def _stereo_loudness_of(audio_meta: list[dict[str, Any]], target: float | None) -> StereoLoudness:
+    """The count of what _prepare_source marked its shown tracks' entries
+    with (`_lift`), the marks taken off them."""
+    done = [entry.pop("_lift") for entry in audio_meta if "_lift" in entry]
+    if target is None:
+        return StereoLoudness(off=True)
+    return StereoLoudness(lifted=done.count(LIFTED), kept=done.count(KEPT),
+                          skipped=done.count(SKIPPED))
+
+
 @dataclass
 class Built:
     """What build_package left in its folder: the manifest that describes
     it (the v2 manifest, written by the caller), the probe of v0 it was
     made from (with the catalog's track languages), and the subtitle file
     next to the source each of its subtitles from one was converted from,
-    by subtitle id ("sub3")."""
+    by subtitle id ("sub3"); and what the stereo loudness did (in no record:
+    the done step's details)."""
     manifest: dict[str, Any]
     probe: _Probe
     from_files: dict[str, _SubtitleFile]
+    stereo: StereoLoudness | None = None
 
 
 def build_package(
@@ -676,6 +718,7 @@ def build_package(
             ts_offset=inputs.timestamp_offset,
             stereo_loudness=options.stereo_loudness,
         )
+        stereo = _stereo_loudness_of(audio_meta, options.stereo_loudness)
         videos = [_StagedVideo(inputs.primary, packaging_source, probe)]
         for rung in inputs.video[1:]:
             staged = _remux_video(rung, tmpdir, inputs.timestamp_offset, codecs)
@@ -770,7 +813,7 @@ def build_package(
         if clash:
             raise PackageError(f"manifest_extra would replace {', '.join(clash)}")
         manifest.update(manifest_extra)
-    return Built(manifest, probe, from_files)
+    return Built(manifest, probe, from_files, stereo)
 
 
 def _open_staging(out_root: Path, grace_seconds: float) -> Path:
@@ -1645,13 +1688,18 @@ def _audio_timing(path: Path, stream: str) -> dict[str, Any] | None:
     return streams[0] if len(streams) == 1 else None
 
 
+def _shown(probe: _Probe, visible: set[int] | None) -> list[int]:
+    """The tracks a client offers (`visible`; None: all)."""
+    return [i for i in range(len(probe.audio)) if visible is None or i in visible]
+
+
 def _stereo_signals(probe: _Probe, tmpdir: Path, target: float | None,
                     visible: set[int] | None) -> dict[int, Path]:
     """The signals written beside the transmux for the loudness, by track:
     of the tracks shown (`visible`; None: all), with a target, and where the
     temp folder keeps the free space _SIGNAL_CODEC's comment says with an
     upper bound of them written. None else, logged with the reason."""
-    tracks = [i for i in range(len(probe.audio)) if visible is None or i in visible]
+    tracks = _shown(probe, visible)
     if target is None or not tracks:
         return {}
     bound = probe.duration_ms / 1000 * _SIGNAL_BYTES_PER_SECOND * len(tracks)
@@ -1671,23 +1719,23 @@ def _stereo_signals(probe: _Probe, tmpdir: Path, target: float | None,
 
 
 def _lift_stereo(probe: _Probe, signals: dict[int, Path], transmuxed: Path,
-                 target: float) -> dict[int, Path]:
-    """The stereo renditions made again lifted, an MP4 each, by track
-    (_lift_one): of every track whose signal was written beside the
-    transmux, _LIFT_WORKERS at once. A track whose lift fails keeps the
-    rendition it has; each signal is removed once done."""
-    def lift(i: int, signal: Path) -> Path | None:
+                 target: float) -> dict[int, tuple[str, Path | None]]:
+    """What became of the stereo rendition of every track whose signal was
+    written beside the transmux, by track (_lift_one: LIFTED and its MP4,
+    KEPT or SKIPPED), _LIFT_WORKERS at once. A track whose lift fails
+    (SKIPPED) keeps the rendition it has; each signal is removed once done."""
+    def lift(i: int, signal: Path) -> tuple[str, Path | None]:
         try:
             return _lift_one(i, probe.audio[i], signal, transmuxed, target)
         except PackageError as e:
             log.warning("packager.stereo.lift_failed", track=i, error=str(e)[:300])
-            return None
+            return SKIPPED, None
         finally:
             signal.unlink(missing_ok=True)
 
     with ThreadPoolExecutor(max_workers=max(1, min(_LIFT_WORKERS, len(signals)))) as pool:
         runs = {i: pool.submit(lift, i, signal) for i, signal in signals.items()}
-    return {i: out for i, run in runs.items() if (out := run.result()) is not None}
+    return {i: run.result() for i, run in runs.items()}
 
 
 def _lift_makeup(signal: Path, gain: float, level: float, retime: bool = False) -> float | None:
@@ -1712,14 +1760,14 @@ def _lift_makeup(signal: Path, gain: float, level: float, retime: bool = False) 
 
 
 def _lift_one(i: int, stream: dict[str, Any], signal: Path, transmuxed: Path,
-              target: float) -> Path | None:
+              target: float) -> tuple[str, Path | None]:
     """The signal's loudness, and where it is quiet (_stereo_lift), the
     rendition made of it lifted (its make-up: _lift_makeup), encoded, the
     AAC decoded and measured; a true peak not under _LIFT_TRUE_PEAK (it is
     measured to 0.1 dB) makes it again with the limiter that much (and 0.5
-    dB) lower, once. Kept only
-    with the timing of the rendition in the transmux (stream a:i,
-    _same_timing)."""
+    dB) lower, once. Kept only with the timing of the rendition in the
+    transmux (stream a:i, _same_timing). LIFTED and the MP4; KEPT where the
+    mix needs no lift; SKIPPED where it couldn't be measured or lifted."""
     chain = _stereo_chain(stream)
     loudness = _measure_loudness(signal)
     lift = _stereo_lift(loudness, chain.makeup, target)
@@ -1730,14 +1778,16 @@ def _lift_one(i: int, stream: dict[str, Any], signal: Path, transmuxed: Path,
              seconds=loudness.seconds if loudness else None, downmix_makeup=chain.makeup,
              before=round(loudness.integrated + chain.makeup, 2) if loudness else None,
              lift=lift)
-    if lift is None or loudness is None:
-        return None
+    if loudness is None:
+        return SKIPPED, None
+    if lift is None:
+        return KEPT, None
     gain = round(chain.makeup + lift, 2)
     level = loudness.integrated + gain
     retime = not chain.rest  # no limiter of its own (_LIFT_RETIME)
     makeup = _lift_makeup(signal, gain, level, retime)
     if makeup is None:
-        return None
+        return SKIPPED, None
     out = signal.with_suffix(".mp4")
     ceiling = _LIFT_CEILING
     for _ in range(2):
@@ -1746,20 +1796,20 @@ def _lift_one(i: int, stream: dict[str, Any], signal: Path, transmuxed: Path,
             _track_language(stream)))
         made = _measure_loudness(out)
         if made is None:
-            return None
+            return SKIPPED, None
         if made.true_peak < _LIFT_TRUE_PEAK:
             break
         ceiling -= made.true_peak - _LIFT_TRUE_PEAK + 0.5
     else:
         log.warning("packager.stereo.lift_over_peak", track=i, true_peak=made.true_peak)
-        return None
+        return SKIPPED, None
     timing, before = _audio_timing(out, "a:0"), _audio_timing(transmuxed, f"a:{i}")
     if not _same_timing(timing, before):
         log.warning("packager.stereo.lift_timing", track=i, lifted=timing, rendition=before)
-        return None
+        return SKIPPED, None
     log.info("packager.stereo.lifted", track=i, gain=gain, makeup=makeup, ceiling=ceiling,
              integrated=made.integrated, lra=made.lra, true_peak=made.true_peak)
-    return out
+    return LIFTED, out
 
 
 def _surround_filter(stream: dict[str, Any]) -> str:
@@ -1828,7 +1878,9 @@ def _prepare_source(
     same run (asplit; the source is read once) where the temp folder has the
     space (_stereo_signals), and a rendition whose mix is quiet
     is made again from it, lifted, into an MP4 of its own (_lift_stereo):
-    its entry names that file (`_input`), which shaka packages it from.
+    its entry names that file (`_input`), which shaka packages it from. The
+    entry of every shown track says what became of it (`_lift`: LIFTED,
+    KEPT, SKIPPED), which build_package counts and takes off.
 
     Surround: per `_surround_plan`, a stream copy or an E-AC-3/AC-3 5.1
     encode at 48 kHz of the same decoded audio (asplit, one decode), a
@@ -1911,7 +1963,13 @@ def _prepare_source(
         args += ["-map", f"[l{i}]", *_SIGNAL_CODEC,
                  *_timeline_output_args(timeline, ts_offset), "-f", "nut", str(path)]
     _run_ffmpeg_capturing("transmux", args)
-    lifted = _lift_stereo(probe, signals, transmuxed, stereo_loudness) if signals else {}
+    # What became of each shown track's stereo rendition; one without a
+    # signal is one the temp space left out.
+    lifts: dict[int, tuple[str, Path | None]] = (
+        {i: (SKIPPED, None) for i in _shown(probe, audio_visible_indices)}
+        if stereo_loudness is not None else {})
+    if signals:
+        lifts.update(_lift_stereo(probe, signals, transmuxed, stereo_loudness))
 
     # Visibility is attached per-meta-entry, not by dropping tracks —
     # every audio stream is packaged into the HLS tree; the client
@@ -1924,8 +1982,10 @@ def _prepare_source(
             audio_visible_indices is None or i in audio_visible_indices
         )
         entry["default"] = i == default_index
-        if i in lifted:
-            entry["_input"] = lifted[i]
+        if i in lifts:
+            entry["_lift"], lifted = lifts[i]
+            if lifted is not None:
+                entry["_input"] = lifted
         meta.append(entry)
     surround_meta: list[dict[str, Any]] = []
     for s in surround:
