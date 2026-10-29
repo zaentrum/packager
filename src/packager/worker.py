@@ -53,10 +53,12 @@ acked: the catalog sends the job its record names.
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -149,6 +151,33 @@ def _parse_settings(raw: dict[str, str]) -> tuple[list[str], bool]:
     return whitelist, keep_original
 
 
+# The packager.stereo_loudness setting's range: a target outside it is a
+# typo, not a mix (-23 is the broadcast loudness, -16 a loud stream).
+STEREO_LOUDNESS_RANGE = (-35.0, -10.0)
+
+
+def _with_settings(options: PackageOptions | None, raw: dict[str, str]) -> PackageOptions:
+    """The options a run packages with, by the settings: the integrated
+    loudness a quiet stereo rendition is lifted to (packager.stereo_loudness,
+    LUFS, e.g. "-20"; "off" lifts none). Unset, blank or not a number in
+    STEREO_LOUDNESS_RANGE: the options' own (STEREO_LOUDNESS by default)."""
+    options = options or PackageOptions()
+    value = raw.get("packager.stereo_loudness", "").strip().lower()
+    if not value:
+        return options
+    if value in ("off", "none", "false"):
+        return replace(options, stereo_loudness=None)
+    try:
+        target = float(value.removesuffix("lufs").strip())
+    except ValueError:
+        target = math.nan
+    low, high = STEREO_LOUDNESS_RANGE
+    if not low <= target <= high:
+        log.warning("packager.settings.stereo_loudness_ignored", value=value)
+        return options
+    return replace(options, stereo_loudness=target)
+
+
 def _details(manifest: dict[str, Any], seconds: float) -> str:
     """The `done` step's details: the top rung's codec, the audio and
     subtitle counts and the run's seconds, the ladder and the 5.1 group
@@ -218,8 +247,10 @@ def _process_one(
     # an operator's Settings edit takes effect on the very next item.
     # Failures here return {} (logged warning) and package_item falls
     # through to "all tracks visible" — which is the legacy behaviour
-    # and never wrong, just verbose.
-    language_whitelist, keep_original = _parse_settings(client.settings())
+    # and never wrong, just verbose. The stereo loudness setting too.
+    settings = client.settings()
+    language_whitelist, keep_original = _parse_settings(settings)
+    options = _with_settings(options, settings)
 
     t0 = time.monotonic()
     try:
@@ -357,11 +388,12 @@ def _process_library(
         return
 
     client.upsert_step(item.id, "in_progress")
-    language_whitelist, keep_original = _parse_settings(client.settings())
+    settings = client.settings()
+    language_whitelist, keep_original = _parse_settings(settings)
     t0 = time.monotonic()
     try:
         placed = library.package_version(
-            item, inputs, options=options or PackageOptions(),
+            item, inputs, options=_with_settings(options, settings),
             language_whitelist=language_whitelist, keep_original_if_single=keep_original)
     except Exception as e:
         log.exception("packager.item.failed", item_id=item.id, error=str(e)[:300])

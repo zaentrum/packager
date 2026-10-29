@@ -16,7 +16,8 @@ Design rules:
   assembled by `packager.hls` from shaka's media playlists.
 * Audio: every source track becomes an AAC-LC 48 kHz stereo rendition
   (group "audio" — what every browser decodes), one of more than two
-  channels downmixed under full scale (_stereo_filter). A source track with
+  channels downmixed under full scale (_stereo_filter), one whose mix is
+  quiet lifted to the stereo loudness (_lift_stereo). A source track with
   more than two channels (with SURROUND_AUDIO) additionally gets a 5.1
   E-AC-3 (or AC-3) rendition, first per language, in group
   "audio-surround", shown or hidden as its stereo rendition is, one of
@@ -57,8 +58,10 @@ import tempfile
 import threading
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -223,6 +226,60 @@ _DOWNMIX_LAYOUTS = {
 }
 _DOWNMIX_LEVEL = _M3DB
 _DOWNMIX_LIMITER = "alimiter=limit=-3dB:attack=10:release=100:level=disabled:latency=enabled"
+# The stereo rendition's loudness (_lift_stereo). Downloads and phones play
+# the stereo rendition, and a film's mix, made for a cinema or a living
+# room, comes out of the downmix at -28 to -34 LUFS: too quiet for a phone
+# or headphones. So the signal a stereo rendition is made from (after the
+# downmix) is measured first (EBU R128: integrated loudness, loudness range,
+# true peak), and a rendition that would be quieter than the target
+# (options.stereo_loudness, STEREO_LOUDNESS by default) by more than
+# _LIFT_WITHIN is made again from it, lifted to the target, by at most
+# _LIFT_MAX. Only lifted: a mix at the target or above, one too short to
+# measure (_LIFT_MIN_SECONDS) and a silent one (_SILENT: nothing passes the
+# absolute gate) are made as before, a stereo track's sample for sample. The
+# 5.1 companions and the copied tracks are never touched.
+STEREO_LOUDNESS = -20.0
+_LIFT_WITHIN = 1.0
+_LIFT_MAX = 14.0
+_LIFT_MIN_SECONDS = 3.0
+_SILENT = -70.0
+# The lift (_lift_filter): the gain, then a gentle compressor whose
+# threshold is _LIFT_THRESHOLD over the lifted mix's integrated loudness, so
+# that dialogue passes it untouched and only the loudest passages are
+# brought down, slowly; the make-up of what it and the limiter take off the
+# integrated loudness (measured: 0.1 to 3 LU); a lookahead limiter for what
+# is left of the peaks, its delay compensated. The gain into the limiter
+# alone left it 8.7 dB to take off a film's loudest peaks lifted 13 dB;
+# with the compressor before it, no more than 6, more than 3 for 0.1 % of
+# the time, and the dialogue's level moves by under 0.5 dB (on a synthetic
+# film of bursts 30 dB over its dialogue: 12.7 dB, and 9.8). ffmpeg's
+# loudnorm, two-pass, falls back to its dynamic mode on a film mix (its true
+# peak leaves no linear gain) and moves the dialogue by 3 to 7 dB, its
+# loudness up to 4 LU off the target. The AAC encode overshoots the limiter
+# by up to 2 dB: the decoded AAC is measured, and a true peak not under
+# _LIFT_TRUE_PEAK makes it again with the limiter that much lower, once.
+_LIFT_THRESHOLD = 8.0
+_LIFT_COMPRESSOR = "ratio=2:attack=50:release=500:knee=2.82843:detection=rms:link=maximum"
+_LIFT_CEILING = -4.0
+_LIFT_TRUE_PEAK = -2.0
+_LIFT_TOLERANCE = 0.3
+_LIFT_ROUNDS = 3
+# The limiter keeps its own timestamps only while each frame it is given
+# starts where the last one ended; at the first that doesn't (timestamps a
+# container's time base rounded, a millisecond in Matroska) it takes the
+# frame's own and forgets the delay it compensates: the rest comes 10 ms
+# late. A rendition made with the downmix's limiter has that already, and
+# its lift the same; one made without it (a mono or stereo track, a layout
+# ffmpeg downmixes) is lifted from timestamps counted from its first
+# sample (_LIFT_RETIME). Its timing is the rendition's own, then: its first
+# timestamp, its packets, its length to the source's rounding
+# (_LIFT_TIMING_SLACK, seconds).
+_LIFT_RETIME = "asettb=1/sr,asetpts=STARTPTS+N"
+_LIFT_TIMING_SLACK = 0.002
+# How many tracks are lifted at once: each lift is a few ffmpeg runs of one
+# thread or two, and nothing else runs meanwhile (the CPUs the deployment
+# gives a packager).
+_LIFT_WORKERS = 4
 # The surround companion's layout: every one is a 5.1, a copy of a 5.1 of
 # the target codec or an encode made one (_surround_plan). The rules
 # report names it (rules.py).
@@ -290,6 +347,9 @@ class PackageOptions:
     preferred_languages: tuple[str, ...] = field(default_factory=tuple)
     # Seconds a package replaced by a new one stays on disk.
     old_package_grace_seconds: float = OLD_PACKAGE_GRACE_SECONDS
+    # The integrated loudness (LUFS) a quiet stereo rendition is lifted to
+    # (_lift_stereo); None: none is. The packager.stereo_loudness setting.
+    stereo_loudness: float | None = STEREO_LOUDNESS
 
 
 def _episode_code(season: int | None, episode: int | None) -> str | None:
@@ -587,6 +647,7 @@ def build_package(
             surround_default=default_surround,
             timeline=inputs.primary.timeline,
             ts_offset=inputs.timestamp_offset,
+            stereo_loudness=options.stereo_loudness,
         )
         videos = [_StagedVideo(inputs.primary, packaging_source, probe)]
         for rung in inputs.video[1:]:
@@ -1385,20 +1446,36 @@ def _timeline_output_args(timeline: str, ts_offset: float) -> list[str]:
     return []
 
 
+@dataclass(frozen=True)
+class _StereoChain:
+    """A stereo rendition's filters in two: `signal` makes the 48 kHz stereo
+    signal it is made from (the downmix), `rest` the rendition of it as it
+    always was (the make-up, `makeup` dB, and the limiter; '' for nothing)."""
+    signal: str
+    makeup: float = 0.0
+    rest: str = ""
+
+
 def _stereo_filter(stream: dict[str, Any]) -> str:
     """The filters that make a source track's stereo rendition, 48 kHz
-    stereo, by the track's channels and channel_layout as ffprobe has them.
-    Mono or stereo: _STEREO_FORMAT, as ever. A layout of _DOWNMIX_LAYOUTS: the
-    normalised matrix (pan), then, where its gains sum to more than the
+    stereo, by the track's channels and channel_layout as ffprobe has them
+    (_stereo_chain)."""
+    chain = _stereo_chain(stream)
+    return ",".join(part for part in (chain.signal, chain.rest) if part)
+
+
+def _stereo_chain(stream: dict[str, Any]) -> _StereoChain:
+    """Mono or stereo: _STEREO_FORMAT, as ever. A layout of _DOWNMIX_LAYOUTS:
+    the normalised matrix (pan), then, where its gains sum to more than the
     make-up gives back, the resample to 48 kHz (so nothing after the limiter
     can raise a peak), the make-up to _DOWNMIX_LEVEL under the plain matrix,
     the limiter. Any other layout: ffmpeg's own matrix, normalised."""
     channels = int(stream.get("channels") or 0)
     if channels <= 2:
-        return _STEREO_FORMAT
+        return _StereoChain(_STEREO_FORMAT)
     names = _DOWNMIX_LAYOUTS.get(str(stream.get("channel_layout") or ""), "").split("+")
     if len(names) != channels:
-        return f"aresample=48000:rematrix_maxval=1,{_STEREO_FORMAT}"
+        return _StereoChain(f"aresample=48000:rematrix_maxval=1,{_STEREO_FORMAT}")
     rows = [[(name, _DOWNMIX_GAINS[name][side]) for name in names if _DOWNMIX_GAINS[name][side]]
             for side in (0, 1)]
     total = max(sum(gain for _, gain in row) for row in rows)
@@ -1407,8 +1484,229 @@ def _stereo_filter(stream: dict[str, Any]) -> str:
         for out, row in zip(("FL", "FR"), rows, strict=True))
     makeup = 20 * math.log10(total * _DOWNMIX_LEVEL)
     if makeup <= 0:
-        return f"{pan},{_STEREO_FORMAT}"
-    return f"{pan},aresample=48000,volume={makeup:.2f}dB,{_DOWNMIX_LIMITER},{_STEREO_FORMAT}"
+        return _StereoChain(f"{pan},{_STEREO_FORMAT}")
+    return _StereoChain(f"{pan},aresample=48000", round(makeup, 2),
+                        f"volume={makeup:.2f}dB,{_DOWNMIX_LIMITER},{_STEREO_FORMAT}")
+
+
+def _stereo_split(stream: dict[str, Any], i: int) -> str:
+    """_stereo_filter, the signal the rendition is made from split off to
+    [l{i}] (asplit) before the rest: the same rendition, and its signal."""
+    chain = _stereo_chain(stream)
+    split = f"{chain.signal},asplit=2[l{i}]"
+    return f"{split}[r{i}];[r{i}]{chain.rest}" if chain.rest else split
+
+
+@dataclass(frozen=True)
+class _Loudness:
+    """A signal's loudness as ffmpeg's ebur128 measures it (EBU R128, ITU-R
+    BS.1770 gating): integrated (LUFS), its range (LU) and its true peak
+    (dBTP; -inf when not measured), over `seconds`."""
+    integrated: float
+    lra: float
+    true_peak: float
+    seconds: float
+
+
+_SUMMARY = {
+    "integrated": re.compile(r"\bI:\s+(-?[\d.]+) LUFS"),
+    "lra": re.compile(r"\bLRA:\s+(-?[\d.]+) LU\b"),
+    "true_peak": re.compile(r"\bTrue peak:\s+Peak:\s+(-?[\d.]+|-inf) dBFS"),
+}
+
+
+def _measure_loudness(path: Path, filters: str = "", *,
+                      true_peak: bool = True) -> _Loudness | None:
+    """The loudness of an audio file's first stream, through `filters`
+    first where there are any (ebur128's summary; its length from ffmpeg's
+    progress); None when it can't be measured."""
+    meter = f"ebur128=peak={'true' if true_peak else 'none'}:framelog=quiet"
+    args = ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-progress", "pipe:1",
+            "-i", str(path), "-map", "0:a:0", "-af", f"{filters},{meter}" if filters else meter,
+            "-f", "null", "-"]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except OSError as e:
+        log.warning("packager.loudness.failed", path=str(path), error=str(e)[:200])
+        return None
+    summary = result.stderr.rpartition("Summary:")[2]
+    found = {key: pattern.search(summary) for key, pattern in _SUMMARY.items()}
+    seconds = re.findall(r"^out_time_us=(\d+)$", result.stdout, re.M)
+    if (result.returncode != 0 or not seconds or not found["integrated"] or not found["lra"]
+            or (true_peak and not found["true_peak"])):
+        log.warning("packager.loudness.failed", path=str(path), code=result.returncode,
+                    error=result.stderr.strip()[-300:])
+        return None
+    peak = found["true_peak"]
+    return _Loudness(float(found["integrated"].group(1)), float(found["lra"].group(1)),
+                     float(peak.group(1)) if peak else -math.inf, int(seconds[-1]) / 1e6)
+
+
+def _stereo_lift(loudness: _Loudness | None, makeup: float, target: float | None) -> float | None:
+    """How many dB a stereo rendition is lifted over the level it has
+    without (its signal's integrated loudness and the downmix's make-up):
+    to the target, by at most _LIFT_MAX. None where it is left as it is:
+    no target, no measurement, too short, silent, or within _LIFT_WITHIN of
+    the target or above it."""
+    if target is None or loudness is None:
+        return None
+    if loudness.seconds < _LIFT_MIN_SECONDS or loudness.integrated <= _SILENT:
+        return None
+    level = loudness.integrated + makeup
+    if level >= target - _LIFT_WITHIN:
+        return None
+    return round(min(target - level, _LIFT_MAX), 2)
+
+
+def _lift_compressor(gain: float, level: float, retime: bool = False) -> str:
+    """The gain (dB) and the compressor, its threshold _LIFT_THRESHOLD over
+    `level`, the integrated loudness the gain lifts the signal to; with
+    `retime`, the timestamps counted from the first sample before them."""
+    threshold = min(max(10 ** ((level + _LIFT_THRESHOLD) / 20), 1 / 1024), 1.0)
+    return (f"{_LIFT_RETIME + ',' if retime else ''}volume={gain:.2f}dB,"
+            f"acompressor=threshold={threshold:.5f}:{_LIFT_COMPRESSOR}")
+
+
+def _lift_filter(gain: float, level: float, makeup: float, ceiling: float = _LIFT_CEILING,
+                 retime: bool = False) -> str:
+    """The filters that make a lifted stereo rendition of its signal: the
+    gain and the compressor (_lift_compressor), the make-up after it (dB),
+    the limiter at `ceiling` (dBFS), the format."""
+    return (f"{_lift_compressor(gain, level, retime)},volume={makeup:.2f}dB,"
+            f"alimiter=limit={ceiling:.1f}dB:attack=10:release=100:level=disabled:latency=enabled,"
+            f"{_STEREO_FORMAT}")
+
+
+def _lift_args(signal: Path, filters: str, out: Path, language: str) -> list[str]:
+    """The ffmpeg run that makes a lifted stereo rendition of its signal,
+    encoded as every stereo rendition is, its timestamps as they are: the
+    signal is on the transmux's timeline."""
+    return ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning", "-copyts",
+            "-i", str(signal), "-map", "0:a:0", "-af", filters,
+            "-c:a", STEREO_CODEC, "-b:a", STEREO_BITRATE, "-metadata:s:a:0", f"language={language}",
+            *NO_GLOBAL_METADATA, "-movflags", "+faststart", str(out)]
+
+
+def _same_timing(lifted: dict[str, Any] | None, rendition: dict[str, Any] | None) -> bool:
+    """Whether a lifted rendition has its rendition's timing (_audio_timing):
+    the same time base, first timestamp and packets, its length within
+    _LIFT_TIMING_SLACK."""
+    if lifted is None or rendition is None:
+        return False
+    if any(lifted.get(key) != rendition.get(key) for key in ("time_base", "start_pts",
+                                                            "nb_frames")):
+        return False
+    try:
+        apart = abs(int(lifted["duration_ts"]) - int(rendition["duration_ts"]))
+        return apart * Fraction(str(lifted["time_base"])) <= _LIFT_TIMING_SLACK
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return False
+
+
+def _audio_timing(path: Path, stream: str) -> dict[str, Any] | None:
+    """An audio stream's timing as ffprobe reads it from its container: its
+    time base, first timestamp, length and packets."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", stream, "-show_entries",
+             "stream=time_base,start_pts,duration_ts,nb_frames", "-of", "json", str(path)],
+            capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL)
+        streams = json.loads(out.stdout).get("streams") or []
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return None
+    return streams[0] if len(streams) == 1 else None
+
+
+def _lift_stereo(probe: _Probe, signals: dict[int, Path], transmuxed: Path,
+                 target: float) -> dict[int, Path]:
+    """The stereo renditions made again lifted, an MP4 each, by track
+    (_lift_one): of every track whose signal was written beside the
+    transmux, _LIFT_WORKERS at once. A track whose lift fails keeps the
+    rendition it has; each signal is removed once done."""
+    def lift(i: int, signal: Path) -> Path | None:
+        try:
+            return _lift_one(i, probe.audio[i], signal, transmuxed, target)
+        except PackageError as e:
+            log.warning("packager.stereo.lift_failed", track=i, error=str(e)[:300])
+            return None
+        finally:
+            signal.unlink(missing_ok=True)
+
+    with ThreadPoolExecutor(max_workers=max(1, min(_LIFT_WORKERS, len(signals)))) as pool:
+        runs = {i: pool.submit(lift, i, signal) for i, signal in signals.items()}
+    return {i: out for i, run in runs.items() if (out := run.result()) is not None}
+
+
+def _lift_makeup(signal: Path, gain: float, level: float, retime: bool = False) -> float | None:
+    """The make-up after the compressor that puts the lifted signal at
+    `level`: what the compressor takes off the integrated loudness, then
+    what the limiter takes too, measured with it and made up again, until
+    the whole lift is within _LIFT_TOLERANCE of `level` (_LIFT_ROUNDS at
+    most). None when it can't be measured."""
+    measured = _measure_loudness(signal, _lift_compressor(gain, level, retime), true_peak=False)
+    if measured is None:
+        return None
+    makeup = round(level - measured.integrated, 2)
+    for _ in range(_LIFT_ROUNDS):
+        measured = _measure_loudness(signal, _lift_filter(gain, level, makeup, retime=retime),
+                                     true_peak=False)
+        if measured is None:
+            return None
+        if abs(level - measured.integrated) <= _LIFT_TOLERANCE:
+            break
+        makeup = round(makeup + level - measured.integrated, 2)
+    return makeup
+
+
+def _lift_one(i: int, stream: dict[str, Any], signal: Path, transmuxed: Path,
+              target: float) -> Path | None:
+    """The signal's loudness, and where it is quiet (_stereo_lift), the
+    rendition made of it lifted (its make-up: _lift_makeup), encoded, the
+    AAC decoded and measured; a true peak not under _LIFT_TRUE_PEAK (it is
+    measured to 0.1 dB) makes it again with the limiter that much (and 0.5
+    dB) lower, once. Kept only
+    with the timing of the rendition in the transmux (stream a:i,
+    _same_timing)."""
+    chain = _stereo_chain(stream)
+    loudness = _measure_loudness(signal)
+    lift = _stereo_lift(loudness, chain.makeup, target)
+    log.info("packager.stereo.loudness", track=i, target=target,
+             integrated=loudness.integrated if loudness else None,
+             lra=loudness.lra if loudness else None,
+             true_peak=loudness.true_peak if loudness else None,
+             seconds=loudness.seconds if loudness else None, downmix_makeup=chain.makeup,
+             before=round(loudness.integrated + chain.makeup, 2) if loudness else None,
+             lift=lift)
+    if lift is None or loudness is None:
+        return None
+    gain = round(chain.makeup + lift, 2)
+    level = loudness.integrated + gain
+    retime = not chain.rest  # no limiter of its own (_LIFT_RETIME)
+    makeup = _lift_makeup(signal, gain, level, retime)
+    if makeup is None:
+        return None
+    out = signal.with_suffix(".mp4")
+    ceiling = _LIFT_CEILING
+    for _ in range(2):
+        _run_ffmpeg_capturing(f"stereo {i}", _lift_args(
+            signal, _lift_filter(gain, level, makeup, ceiling, retime), out,
+            _track_language(stream)))
+        made = _measure_loudness(out)
+        if made is None:
+            return None
+        if made.true_peak < _LIFT_TRUE_PEAK:
+            break
+        ceiling -= made.true_peak - _LIFT_TRUE_PEAK + 0.5
+    else:
+        log.warning("packager.stereo.lift_over_peak", track=i, true_peak=made.true_peak)
+        return None
+    timing, before = _audio_timing(out, "a:0"), _audio_timing(transmuxed, f"a:{i}")
+    if not _same_timing(timing, before):
+        log.warning("packager.stereo.lift_timing", track=i, lifted=timing, rendition=before)
+        return None
+    log.info("packager.stereo.lifted", track=i, gain=gain, makeup=makeup, ceiling=ceiling,
+             integrated=made.integrated, lra=made.lra, true_peak=made.true_peak)
+    return out
 
 
 def _surround_filter(stream: dict[str, Any]) -> str:
@@ -1452,6 +1750,7 @@ def _prepare_source(
     surround_default: int | None = None,
     timeline: str = "normalize",
     ts_offset: float = 0.0,
+    stereo_loudness: float | None = None,
 ) -> tuple[Path, list[dict[str, Any]], list[dict[str, Any]]]:
     """Return an MP4 shaka-packager can consume (v0 video stream-copied,
     then one AAC stereo track per source audio track, then the 5.1
@@ -1470,6 +1769,12 @@ def _prepare_source(
     the filter graph (_stereo_filter: aformat, and for more than two
     channels a downmix that stays under full scale), never by per-stream
     `-ac:a:N`, which silently no-ops for channel counts.
+
+    Loudness: with a `stereo_loudness`, the signal each stereo rendition
+    is made from (_stereo_chain) is written beside the MP4 in the same run
+    (asplit; the source is read once), and a rendition whose mix is quiet
+    is made again from it, lifted, into an MP4 of its own (_lift_stereo):
+    its entry names that file (`_input`), which shaka packages it from.
 
     Surround: per `_surround_plan`, a stream copy or an E-AC-3/AC-3 5.1
     encode at 48 kHz of the same decoded audio (asplit, one decode), a
@@ -1509,9 +1814,11 @@ def _prepare_source(
         args += ["-tag:v", "hvc1"]
 
     encode_surround = {s.source_index for s in surround if s.mode == "encode"}
+    signals = ({i: tmpdir / f"stereo{i}.nut" for i in range(len(probe.audio))}
+               if stereo_loudness is not None else {})
     chains: list[str] = []
     for i, stream in enumerate(probe.audio):
-        stereo = _stereo_filter(stream)
+        stereo = _stereo_split(stream, i) if i in signals else _stereo_filter(stream)
         if i in encode_surround:
             chains += [
                 f"[0:a:{i}]asplit=2[as{i}][am{i}]",
@@ -1546,7 +1853,13 @@ def _prepare_source(
     # global metadata (NO_GLOBAL_METADATA).
     args += ["-sn", "-dn", *NO_GLOBAL_METADATA, *_timeline_output_args(timeline, ts_offset),
              "-movflags", "+faststart", str(transmuxed)]
+    # The stereo renditions' signals, float as the filters make them, on the
+    # MP4's timeline: NUT keeps every sample's timestamp.
+    for i, path in signals.items():
+        args += ["-map", f"[l{i}]", "-c:a", "pcm_f32le",
+                 *_timeline_output_args(timeline, ts_offset), "-f", "nut", str(path)]
     _run_ffmpeg_capturing("transmux", args)
+    lifted = _lift_stereo(probe, signals, transmuxed, stereo_loudness) if signals else {}
 
     # Visibility is attached per-meta-entry, not by dropping tracks —
     # every audio stream is packaged into the HLS tree; the client
@@ -1559,6 +1872,8 @@ def _prepare_source(
             audio_visible_indices is None or i in audio_visible_indices
         )
         entry["default"] = i == default_index
+        if i in lifted:
+            entry["_input"] = lifted[i]
         meta.append(entry)
     surround_meta: list[dict[str, Any]] = []
     for s in surround:
@@ -2962,9 +3277,11 @@ def _run_shaka_packager(
         # Named by its language first.
         name = _audio_display_name(meta, surround=group == SURROUND_GROUP)
         meta["_name"] = name
+        # A lifted stereo rendition is in an MP4 of its own (_lift_stereo).
+        own = meta.pop("_input", None)
         descriptors.append(",".join([
-            f"in={primary}",
-            f"stream={n + 1}",
+            f"in={own or primary}",
+            f"stream={'audio' if own else n + 1}",
             f"init_segment=hls/a{n}/init.mp4",
             f"segment_template=hls/a{n}/seg-$Number%05d$.m4s",
             f"playlist_name=hls/a{n}/playlist.m3u8",

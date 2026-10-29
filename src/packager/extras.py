@@ -67,7 +67,7 @@ from .events import build_consumer, is_retry, parse_envelope, parse_extra_id
 from .katalog import ClaimedExtra, KatalogClient
 from .packager import PACKAGES_ROOT, PackageOptions, iso639_2, package_item
 from .renditions import ContractError, resolve_inputs
-from .worker import _details, _parse_settings, _source_block
+from .worker import _details, _parse_settings, _source_block, _with_settings
 
 log = structlog.get_logger(__name__)
 
@@ -176,8 +176,11 @@ def _process_extra(
 
     client.upsert_extra_step(extra.id, "in_progress")
     # The language settings at claim time, as for an item: the DEFAULT=YES
-    # pick and the visibility of a trailer's tracks follow the operator's.
-    language_whitelist, keep_original = _parse_settings(client.settings())
+    # pick and the visibility of a trailer's tracks follow the operator's;
+    # its stereo loudness too.
+    settings = client.settings()
+    language_whitelist, keep_original = _parse_settings(settings)
+    options = _with_settings(options, settings)
     track_languages = _track_languages(extra)
 
     t0 = time.monotonic()
@@ -265,11 +268,12 @@ def _process_extra_library(
         return
 
     client.upsert_extra_step(extra.id, "in_progress")
-    language_whitelist, keep_original = _parse_settings(client.settings())
+    settings = client.settings()
+    language_whitelist, keep_original = _parse_settings(settings)
     t0 = time.monotonic()
     try:
         placed = library.package_extra(
-            extra, inputs, options=options or PackageOptions(),
+            extra, inputs, options=_with_settings(options, settings),
             language_whitelist=language_whitelist, keep_original_if_single=keep_original,
             track_languages=_track_languages(extra))
     except Exception as e:

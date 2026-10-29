@@ -153,7 +153,7 @@ def test_an_hevc_source_with_in_band_parameter_sets_only_packages(
 ) -> None:
     _whole, in_band = clips
     manifest, root, calls = _package(tmp_path, monkeypatch, in_band)
-    transmux = next(args for args in calls if args[-1].endswith("transmux.mp4"))
+    transmux = next(args for args in calls if any(a.endswith("transmux.mp4") for a in args))
     copy = transmux[transmux.index("-c:v"):transmux.index("-filter_complex")]
     assert copy == ["-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-tag:v", "hvc1"]
     [video] = manifest["renditions"]["video"]
@@ -176,7 +176,7 @@ def test_an_hevc_source_with_its_parameter_sets_is_remuxed_as_before(
     whole, _in_band = clips
     assert pk._parameter_sets_in_band_only(whole, 0) is False
     manifest, root, calls = _package(tmp_path, monkeypatch, whole)
-    transmux = next(args for args in calls if args[-1].endswith("transmux.mp4"))
+    transmux = next(args for args in calls if any(a.endswith("transmux.mp4") for a in args))
     copy = transmux[transmux.index("-c:v"):transmux.index("-filter_complex")]
     assert copy == ["-c:v", "copy", "-tag:v", "hvc1"]
     assert manifest["renditions"]["video"][0]["codec"].startswith("hvc1.")
