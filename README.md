@@ -227,32 +227,41 @@ overshoots a normalised full scale). A track of six channels or fewer is
 made a 5.1 as before, a 5.1 sample for sample.
 
 **Loudness.** Downloads and phones play the stereo rendition, and a film's
-mix comes out of the downmix at -28 to -34 LUFS. So the signal each stereo
-rendition a client offers is made from (after the downmix; written beside
+mix comes out of the downmix at -28 to -34 LUFS. So the signal the stereo
+rendition of each track a client offers, and of the default one (it plays
+whatever the settings show), is made from (after the downmix; written beside
 the remux in the same run, the source is read once, as FLAC of 24 bits:
 about 0.5 GB an hour) is measured (EBU R128), and a rendition more than 1
 LU under the `packager.stereo_loudness` setting (integrated LUFS, `-20` by
-default; `off` lifts none) is made again from it, lifted to it by at most
-14 dB: a gentle compressor 8 dB over the lifted loudness (2:1,
-50 ms attack, 500 ms release), its make-up measured, and a lookahead
-limiter at -4 dBFS. The AAC is decoded and measured, and one whose true
-peak is not under -2 dBTP is made again with the limiter lower. A lifted
-rendition is an MP4 of its own, with the first timestamp, the samples and
-the length of the one made before. On film mixes lifted 5 to 13 dB the
-limiter takes off more than 3 dB for at most 0.12 % of the time, the
-dialogue's level moves by under 0.5 dB, and the loudness range stays within
-1.1 LU. A mix at the target or above, one shorter than 3 s and a silent one
-are made as before (a stereo track's sample for sample), and so are all of
-a title's when the temp folder (a node's own disk) would keep less than
-30 GB and 15 % of its file system free with an upper bound of the signals
-written (FLAC's worst case, 24-bit PCM and its frames: 1.06 GB an hour each;
-`packager.stereo.lift_skipped`); the 5.1 companions and the copied tracks
-are never touched. The `package` step's details say it for the tracks a
-client offers, each counted once: ` st_lift=` lifted, ` st_keep=` made as
-before on purpose (at the target or above, too short, silent), ` st_skip=`
-made as before though it may be quiet (the temp space, a measurement or an
-encode that failed, a lift not kept for its true peak or its timing); with
-the setting off, ` st=off`.
+default; `off` lifts none) is made again from it, its integrated loudness
+lifted to it by at most 14 dB (quiet passages may rise more: the make-up
+after the compressor lifts what it doesn't bring down): a gentle compressor
+8 dB over the lifted loudness (2:1, 50 ms attack, 500 ms release), its
+make-up measured with the limiter in one run at two make-ups, and a
+lookahead limiter at -4 dBFS. The AAC is decoded and measured, its true
+peak there only, and one whose true peak is not under -2 dBTP or whose
+loudness is more than 0.5 LU off is made again, once. A lifted rendition is
+an MP4 of its own, with the first timestamp, the samples and the length of
+the one made before. On film mixes lifted 5 to 13 dB the limiter takes off
+more than 3 dB for at most 0.12 % of the time, the dialogue's level moves
+by under 0.5 dB, and the loudness range stays within 1.1 LU. A mix at the
+target or above, one shorter than 3 s and a silent one are made as before,
+as is every rendition not lifted, sample for sample; and so are all of a
+title's when the temp folder would keep less than 30 GB and 12 % of its
+file system free with an upper bound of the signals written (FLAC's worst
+case, 24-bit PCM and its frames: 1.06 GB an hour each;
+`packager.stereo.lift_skipped`): the folder is on the node's own file
+system, where the kubelet evicts pods under 10 % free. Every ffmpeg run of
+a lift has a timeout (10 min and twice the track's length); a lift that
+fails, however, or runs over leaves its track as it was. The 5.1
+companions and the copied tracks are never touched. The `package` step's
+details say it for the tracks measured, each counted once: ` st_lift=`
+lifted, ` st_keep=` made as before on purpose (at the target or above, too
+short, silent), ` st_skip=` made as before though it may be quiet (the temp
+space, a measurement or an encode that failed or ran over, a lift not kept
+for its true peak or its timing, any other error); with the setting off,
+` st=off`; nothing where the run made no package (a version reported
+again).
 
 **Subtitles.** Sidecars are extracted exactly as before; PGS / VobSub /
 DVB stay sidecar-only because HLS can't carry them. The source's PGS and
