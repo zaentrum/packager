@@ -1,6 +1,7 @@
 """The stereo rendition's loudness (no ffmpeg run: the runner and the
 measurements are stubbed): the signal a rendition is made from, split off
-beside it; the decision to lift it (lift, no lift, the cap, silent, too
+beside it for the tracks a client offers, where the temp folder has the
+space; the decision to lift it (lift, no lift, the cap, silent, too
 short); the lift's filters and its ffmpeg run; the measurement's parsing;
 a rendition made again where its true peak is over, and kept only with the
 timing it had; the shaka input of a lifted rendition; the setting."""
@@ -8,10 +9,13 @@ timing it had; the shaka input of a lifted rendition; the setting."""
 from __future__ import annotations
 
 import math
+import shutil
 import subprocess
+from collections import namedtuple
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
 from packager import packager as pk
 from packager import worker
@@ -113,13 +117,28 @@ def test_the_lift_is_encoded_as_every_stereo_rendition_on_its_signals_timeline()
 
 # ------------------------------------------------------------ the remux
 
+Usage = namedtuple("Usage", "total used free")
+GB = 1e9
+
+
+@pytest.fixture
+def space(monkeypatch):
+    """The temp folder's file system as shutil.disk_usage has it: a node's
+    256 GB, `free` of them free (set it), plenty by default."""
+    usage = {"free": 200 * GB}
+    monkeypatch.setattr(shutil, "disk_usage",
+                        lambda path: Usage(256 * GB, 256 * GB - usage["free"], usage["free"]))
+    return usage
+
+
 def _probe(audio: list[dict]) -> pk._Probe:
     return pk._Probe(container="matroska,webm", duration_ms=60_000,
                      video={"codec_name": "hevc", "index": 0}, audio=audio, subtitles=[],
                      video_index=0)
 
 
-def test_the_remux_writes_every_renditions_signal_beside_it(monkeypatch, tmp_path: Path) -> None:
+def test_the_remux_writes_every_renditions_signal_beside_it(monkeypatch, tmp_path: Path,
+                                                            space) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: calls.append(args))
     lifts: list[dict] = []
@@ -142,16 +161,107 @@ def test_the_remux_writes_every_renditions_signal_beside_it(monkeypatch, tmp_pat
     # The MP4 is made as before; the signals follow it, on its timeline.
     mp4_end = args.index(str(tmp_path / "transmux.mp4"))
     assert args[mp4_end - 4:mp4_end] == ["-output_ts_offset", "0.021000", "-movflags", "+faststart"]
+    flac = ["-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24", "-frame_size",
+            "1024"]
     assert args[mp4_end + 1:] == [
-        "-map", "[l0]", "-c:a", "pcm_f32le", "-output_ts_offset", "0.021000", "-f", "nut",
+        "-map", "[l0]", *flac, "-output_ts_offset", "0.021000", "-f", "nut",
         str(tmp_path / "stereo0.nut"),
-        "-map", "[l1]", "-c:a", "pcm_f32le", "-output_ts_offset", "0.021000", "-f", "nut",
+        "-map", "[l1]", *flac, "-output_ts_offset", "0.021000", "-f", "nut",
         str(tmp_path / "stereo1.nut")]
     assert lifts == [{"signals": {0: tmp_path / "stereo0.nut", 1: tmp_path / "stereo1.nut"},
                       "mp4": mp4, "target": -20.0}]
     # The lifted rendition's entry names its MP4; the 5.1 companion is as it was.
     assert [m.get("_input") for m in meta] == [None, tmp_path / "stereo1.mp4"]
     assert [(m["idx"], m["mode"]) for m in surround_meta] == [(0, "encode")]
+
+
+def test_only_the_tracks_a_client_offers_get_a_signal(monkeypatch, tmp_path: Path,
+                                                      space) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: calls.append(args))
+    lifts: list[dict] = []
+    monkeypatch.setattr(pk, "_lift_stereo", lambda probe, signals, mp4, target: (
+        lifts.append(signals) or {}))
+    audio = [_s(2, "stereo", "eng"), _s(2, "stereo", "ger"), _s(6, None, "fre", "dts")]
+    pk._prepare_source(Path("/m/src.mkv"), _probe(audio), tmp_path, audio_visible_indices={0, 2},
+                       stereo_loudness=-20.0)
+    [args] = calls
+    graph = args[args.index("-filter_complex") + 1]
+    # The hidden German track is made as before, no signal of it.
+    assert f"[0:a:1]{FORMAT}[s1]" in graph.split(";")
+    assert lifts == [{0: tmp_path / "stereo0.nut", 2: tmp_path / "stereo2.nut"}]
+    assert "[l1]" not in args and "[l0]" in args and "[l2]" in args
+
+
+# The production node: 256 GB, the floor max(30 GB, 15 %) = 38.4 GB.
+@pytest.mark.parametrize(("free", "minutes", "shown", "signals"), [
+    (44, 108, 4, False),   # 9.95 GB of signals at most: 34.05 GB left, under 38.4
+    (44, 108, 1, True),    # 2.49 GB: 41.5 left
+    (49, 108, 4, True),    # 39.05 left
+    (200, 180, 12, True),
+    (40, 1, 1, True),      # 0.01 GB: 39.99 left
+    (38, 1, 1, False),     # under the floor before any signal
+])
+def test_the_signals_need_the_temp_space(monkeypatch, tmp_path: Path, space, free: float,
+                                         minutes: int, shown: int, signals: bool) -> None:
+    space["free"] = free * GB
+    probe = pk._Probe(container="matroska,webm", duration_ms=minutes * 60_000,
+                      video={"codec_name": "hevc", "index": 0},
+                      audio=[_s(2, "stereo")] * 12, subtitles=[], video_index=0)
+    with capture_logs() as logs:
+        got = pk._stereo_signals(probe, tmp_path, -20.0, set(range(shown)))
+    assert sorted(got) == (list(range(shown)) if signals else [])
+    skipped = [e for e in logs if e["event"] == "packager.stereo.lift_skipped"]
+    if signals:
+        assert not skipped
+    else:
+        [e] = skipped
+        assert (e["reason"], e["tracks"], e["floor"]) == ("temp space", shown, round(38.4 * GB))
+        assert e["bound"] == round(minutes * 60 * 48000 * 2 * 4 * shown)
+
+
+def test_the_floor_is_30_gb_on_a_small_file_system(monkeypatch, tmp_path: Path) -> None:
+    probe = pk._Probe(container="mov", duration_ms=60_000, video={}, audio=[_s(2, "stereo")],
+                      subtitles=[])
+    # 100 GB, 15 % of it 15 GB: the floor is 30.
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: Usage(100 * GB, 69 * GB, 31 * GB))
+    assert pk._stereo_signals(probe, tmp_path, -20.0, None) == {0: tmp_path / "stereo0.nut"}
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: Usage(100 * GB, 70.1 * GB, 29.9 * GB))
+    assert pk._stereo_signals(probe, tmp_path, -20.0, None) == {}
+
+
+def test_no_signals_without_a_target_a_length_or_the_temp_folders_size(monkeypatch,
+                                                                       tmp_path: Path,
+                                                                       space) -> None:
+    probe = pk._Probe(container="mov", duration_ms=60_000, video={}, audio=[_s(2, "stereo")],
+                      subtitles=[])
+    assert pk._stereo_signals(probe, tmp_path, None, None) == {}
+    assert pk._stereo_signals(probe, tmp_path, -20.0, set()) == {}
+    with capture_logs() as logs:
+        assert pk._stereo_signals(pk._Probe("mov", 0, {}, probe.audio, []), tmp_path, -20.0,
+                                  None) == {}
+
+        def fails(path):
+            raise OSError("gone")
+
+        monkeypatch.setattr(shutil, "disk_usage", fails)
+        assert pk._stereo_signals(probe, tmp_path, -20.0, None) == {}
+    assert [(e["event"], e["reason"]) for e in logs] == [
+        ("packager.stereo.lift_skipped", "length unknown"),
+        ("packager.stereo.lift_skipped", "temp space unknown")]
+
+
+def test_without_the_temp_space_the_remux_is_as_before(monkeypatch, tmp_path: Path,
+                                                       space) -> None:
+    space["free"] = 31 * GB
+    calls: list[list[str]] = []
+    monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: calls.append(args))
+    monkeypatch.setattr(pk, "_lift_stereo", lambda *a: pytest.fail("nothing to lift"))
+    _mp4, meta, _ = pk._prepare_source(Path("/m/src.mkv"), _probe([_s(2, "stereo")]), tmp_path,
+                                       stereo_loudness=-20.0)
+    [args] = calls
+    assert args[args.index("-filter_complex") + 1] == f"[0:a:0]{FORMAT}[s0]"
+    assert args[-1] == str(tmp_path / "transmux.mp4") and "_input" not in meta[0]
 
 
 def test_without_a_target_the_remux_is_as_before(monkeypatch, tmp_path: Path) -> None:

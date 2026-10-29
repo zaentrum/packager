@@ -284,6 +284,23 @@ _LIFT_ROUNDS = 3
 # to the source's rounding (_LIFT_TIMING_SLACK, seconds).
 _LIFT_RETIME = "asettb=1/sr,asetpts=STARTPTS+N"
 _LIFT_TIMING_SLACK = 0.002
+# The signals (_stereo_signals): FLAC of 24 bits, under half a gigabyte an
+# hour (float PCM: 1.4), in NUT, every packet's timestamp kept, in blocks of
+# an AAC frame's 1024 samples, so that where a source's timestamps are not
+# contiguous the lift's limiter meets them as the rendition's did. 24 bits
+# are its signal to a step (-138 dBFS). Full scale clips only what a lossy
+# decoder overshoots it by (the downmix is normalised): in a mix quiet
+# enough to be lifted those are peaks that the lift's limiter takes down by
+# more than the clip did. Written for the tracks a client offers only (the others are
+# packaged as before), and only where the temp folder keeps, with an upper
+# bound of them (float, _SIGNAL_BYTES_PER_SECOND each), more free than
+# _LIFT_TEMP_FLOOR bytes and _LIFT_TEMP_SHARE of its file system: it is a
+# node's own disk, which a pod is evicted from as it fills.
+_SIGNAL_CODEC = ("-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24",
+                 "-frame_size", "1024")
+_SIGNAL_BYTES_PER_SECOND = 48000 * 2 * 4
+_LIFT_TEMP_FLOOR = 30e9
+_LIFT_TEMP_SHARE = 0.15
 # How many tracks are lifted at once: each lift is a few ffmpeg runs of one
 # thread or two, and nothing else runs meanwhile (the CPUs the deployment
 # gives a packager).
@@ -1626,6 +1643,31 @@ def _audio_timing(path: Path, stream: str) -> dict[str, Any] | None:
     return streams[0] if len(streams) == 1 else None
 
 
+def _stereo_signals(probe: _Probe, tmpdir: Path, target: float | None,
+                    visible: set[int] | None) -> dict[int, Path]:
+    """The signals written beside the transmux for the loudness, by track:
+    of the tracks shown (`visible`; None: all), with a target, and where the
+    temp folder keeps the free space _SIGNAL_CODEC's comment says with an
+    upper bound of them written. None else, logged with the reason."""
+    tracks = [i for i in range(len(probe.audio)) if visible is None or i in visible]
+    if target is None or not tracks:
+        return {}
+    bound = probe.duration_ms / 1000 * _SIGNAL_BYTES_PER_SECOND * len(tracks)
+    try:
+        usage = shutil.disk_usage(tmpdir)
+    except OSError as e:
+        log.warning("packager.stereo.lift_skipped", reason="temp space unknown", error=str(e)[:200])
+        return {}
+    floor = max(_LIFT_TEMP_FLOOR, _LIFT_TEMP_SHARE * usage.total)
+    reason = ("length unknown" if probe.duration_ms <= 0
+              else "temp space" if usage.free - bound < floor else None)
+    if reason:
+        log.warning("packager.stereo.lift_skipped", reason=reason, tracks=len(tracks),
+                    free=usage.free, total=usage.total, bound=round(bound), floor=round(floor))
+        return {}
+    return {i: tmpdir / f"stereo{i}.nut" for i in tracks}
+
+
 def _lift_stereo(probe: _Probe, signals: dict[int, Path], transmuxed: Path,
                  target: float) -> dict[int, Path]:
     """The stereo renditions made again lifted, an MP4 each, by track
@@ -1779,9 +1821,10 @@ def _prepare_source(
     channels a downmix that stays under full scale), never by per-stream
     `-ac:a:N`, which silently no-ops for channel counts.
 
-    Loudness: with a `stereo_loudness`, the signal each stereo rendition
-    is made from (_stereo_chain) is written beside the MP4 in the same run
-    (asplit; the source is read once), and a rendition whose mix is quiet
+    Loudness: with a `stereo_loudness`, the signal each shown stereo
+    rendition is made from (_stereo_chain) is written beside the MP4 in the
+    same run (asplit; the source is read once) where the temp folder has the
+    space (_stereo_signals), and a rendition whose mix is quiet
     is made again from it, lifted, into an MP4 of its own (_lift_stereo):
     its entry names that file (`_input`), which shaka packages it from.
 
@@ -1823,8 +1866,7 @@ def _prepare_source(
         args += ["-tag:v", "hvc1"]
 
     encode_surround = {s.source_index for s in surround if s.mode == "encode"}
-    signals = ({i: tmpdir / f"stereo{i}.nut" for i in range(len(probe.audio))}
-               if stereo_loudness is not None else {})
+    signals = _stereo_signals(probe, tmpdir, stereo_loudness, audio_visible_indices)
     chains: list[str] = []
     for i, stream in enumerate(probe.audio):
         stereo = _stereo_split(stream, i) if i in signals else _stereo_filter(stream)
@@ -1862,10 +1904,9 @@ def _prepare_source(
     # global metadata (NO_GLOBAL_METADATA).
     args += ["-sn", "-dn", *NO_GLOBAL_METADATA, *_timeline_output_args(timeline, ts_offset),
              "-movflags", "+faststart", str(transmuxed)]
-    # The stereo renditions' signals, float as the filters make them, on the
-    # MP4's timeline: NUT keeps every sample's timestamp.
+    # The stereo renditions' signals (_SIGNAL_CODEC), on the MP4's timeline.
     for i, path in signals.items():
-        args += ["-map", f"[l{i}]", "-c:a", "pcm_f32le",
+        args += ["-map", f"[l{i}]", *_SIGNAL_CODEC,
                  *_timeline_output_args(timeline, ts_offset), "-f", "nut", str(path)]
     _run_ffmpeg_capturing("transmux", args)
     lifted = _lift_stereo(probe, signals, transmuxed, stereo_loudness) if signals else {}
