@@ -245,8 +245,14 @@ dialogue's level moves by under 0.5 dB, and the loudness range stays within
 are made as before (a stereo track's sample for sample), and so are all of
 a title's when the temp folder (a node's own disk) would keep less than
 30 GB and 15 % of its file system free with an upper bound of the signals
-(float, 1.4 GB an hour each) written (`packager.stereo.lift_skipped`); the
-5.1 companions and the copied tracks are never touched.
+written (FLAC's worst case, 24-bit PCM and its frames: 1.06 GB an hour each;
+`packager.stereo.lift_skipped`); the 5.1 companions and the copied tracks
+are never touched. The `package` step's details say it for the tracks a
+client offers, each counted once: ` st_lift=` lifted, ` st_keep=` made as
+before on purpose (at the target or above, too short, silent), ` st_skip=`
+made as before though it may be quiet (the temp space, a measurement or an
+encode that failed, a lift not kept for its true peak or its timing); with
+the setting off, ` st=off`.
 
 **Subtitles.** Sidecars are extracted exactly as before; PGS / VobSub /
 DVB stay sidecar-only because HLS can't carry them. The source's PGS and
