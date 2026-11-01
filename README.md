@@ -124,6 +124,13 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   authoring specification); never on a commentary, which no player should
   pick by itself. An audio description is one by its stream's disposition
   or by its title, as its record says.
+- Within each language the main audio is listed first, before an audio
+  description or a commentary, and the dialogue's subtitles before a forced
+  track, subtitles for the deaf and hard of hearing or a commentary's,
+  whatever order the original has them in (Apple's HLS authoring
+  specification): a player that takes the first track in its viewer's
+  language takes the main one. Each language keeps the places it has, and
+  `manifest.json` and `package.json` keep the original's order.
 - A rendition's NAME is the English name of its language: "English",
   "German", "No dialogue" for `zxx`, "Unknown" for `und`; with the script
   and the region its tag or its source title names in brackets, as the
@@ -154,7 +161,9 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   "English · Commentary", and an audio track for the blind and visually
   impaired (`visual_impaired` or `descriptions`, or such a title): "German
   · Audio description", unless its name says it already — the NAME says
-  what the record does. NAMEs are unique within a
+  what the record does. A title that says its track is no commentary ("No
+  commentary", "Kommentarlos", "sans commentaire") makes it none, for the
+  NAME, the default, the 5.1 and the record alike (record logic 9). NAMEs are unique within a
   group: a second "English" is "English (2)". The names of regions, scripts and
   languages, and which regions are a language's own, are CLDR's as the
   clients' `Intl.DisplayNames` gives them: `src/packager/regions.py`,
@@ -179,7 +188,8 @@ in group `audio`, as before. With `SURROUND_AUDIO` set (`eac3`; it is
 `off` unless the platform turns it on), every surround track — more than
 two channels, as a library record's essence counts surround — also gets
 a 5.1 E-AC-3 rendition in group `audio-surround`, the first per
-language, commentary excluded: a film in four languages keeps a 5.1 in
+language, commentaries and audio descriptions excluded (one first in its
+language would take its main track's 5.1): a film in four languages keeps a 5.1 in
 each, and a stereo film gets none. A track the language whitelist hides
 gets its companion too, hidden as its stereo rendition is (the package
 keeps what the original carries). An E-AC-3 5.1 (Atmos included) is
@@ -191,7 +201,9 @@ language's with " 5.1" ("German 5.1"). chino-stream serves the group
 only to a client whose caps include `eac3` (`internal/play/ladder.go`);
 `/play/info` lists the stereo renditions. In the stereo group,
 DEFAULT=YES goes to the first language of `PREFERRED_LANGUAGES`
-(default: the `packager.language_whitelist` order) that has a track. In
+(default: the `packager.language_whitelist` order) that has a track, to a
+track of it that is no commentary and no audio description, unless nothing
+else of the language is there. In
 the 5.1 group it goes to that track's 5.1 companion; when it has none,
 to the 5.1 rendition of its language, else of the first preferred
 language that has one, else to the first, a shown one before a hidden
