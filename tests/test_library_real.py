@@ -9,7 +9,10 @@ whole (the chain, every file's digest), and the catalog gets the v2
 handover. An extra of the title, with the transcoder's handoff on an
 HEVC ladder, lands in the title's extras/. A clip whose second English
 subtitle track is flagged for the hard of hearing, with no title, is
-packaged with that track sdh, as its source's stream is. When a checkout of the
+packaged with that track sdh, as its source's stream is; one whose second
+English audio track and subtitle track are flagged a commentary and whose
+German audio track is flagged for the visually impaired, with no title,
+with them a commentary and an audio description. When a checkout of the
 schemas repository is beside this one (or ZAENTRUM_SCHEMAS names one)
 whose schemas have the platform's additive fields, and a Python with
 jsonschema runs its validator (this one, or LIBRARY_V2_PYTHON), the
@@ -326,6 +329,73 @@ def test_a_subtitle_for_the_hard_of_hearing_by_its_disposition_alone(tmp_path: P
              if line.startswith("#EXT-X-MEDIA:TYPE=SUBTITLES")]
     assert [(m["NAME"], m.get("CHARACTERISTICS")) for m in media] == [
         ("English", None), ("English · SDH", hls.SDH_CHARACTERISTICS), ("German", None)]
+    _catalogs_part(Path(record["library"]["itemDir"]))
+    _validate(lib)
+
+
+def test_a_commentary_and_an_audio_description_by_their_disposition_alone(
+    tmp_path: Path,
+) -> None:
+    # The original's second English audio track and second English subtitle
+    # track are flagged a commentary, its German audio track for the
+    # visually impaired, none with a title that says so: the package's
+    # renditions made from them are a commentary and an audio description by
+    # those dispositions, as the source's streams are, and are named so in
+    # the master, so deleting the original costs none of them.
+    d = tmp_path / "clip"
+    folder = d / "incoming" / "Clip (2024)"
+    folder.mkdir(parents=True)
+    (d / "en.srt").write_text("1\n00:00:01,000 --> 00:00:03,000\nHello.\n")
+    (d / "comment.srt").write_text("1\n00:00:01,000 --> 00:00:03,000\nWe shot it in one take.\n")
+    src = folder / "Clip (2024).mkv"
+    _ff("-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=4",
+        *[a for f in (440, 550, 660) for a in (
+            "-f", "lavfi", "-i", f"sine=frequency={f}:sample_rate=48000:duration=4")],
+        "-i", str(d / "en.srt"), "-i", str(d / "comment.srt"),
+        "-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:a", "-map", "4", "-map", "5",
+        "-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error:keyint=48",
+        "-c:a", "aac", "-ac", "2", "-c:s", "srt",
+        "-metadata:s:a:0", "language=eng", "-metadata:s:a:1", "language=eng",
+        "-metadata:s:a:2", "language=ger", "-metadata:s:s:0", "language=eng",
+        "-metadata:s:s:1", "language=eng", "-disposition:a:0", "default",
+        "-disposition:a:1", "comment", "-disposition:a:2", "visual_impaired",
+        "-disposition:s:0", "0", "-disposition:s:1", "comment", str(src))
+    (folder / "Clip (2024).de.srt").write_text("1\n00:00:01,000 --> 00:00:02,000\nHallo.\n")
+    lib, work, original = _share(tmp_path / "run", src)
+    record = _record(lib, work, original)
+    catalog = Catalog()
+    worker._process_one(ClaimedItem.from_json(record), catalog,  # type: ignore[arg-type]
+                        pk.PackageOptions(surround_codec="off", hls_subtitles=True,
+                                          stereo_loudness=None))
+    assert [s for s, _ in catalog.written] == ["in_progress", "done"], catalog.written
+    vdir = Path(record["library"]["build"]["versionDir"])
+    source = json.loads((Path(record["library"]["source"]["recordDir"]) / "source.json")
+                        .read_text())
+    package = json.loads((vdir / "package.json").read_text())
+    assert [(s["index"], s["purpose"], s["purposeFrom"]) for s in source["streams"]
+            if s["type"] in ("audio", "subtitle")] == [
+        (1, "main", "assumed"), (2, "commentary", "disposition"),
+        (3, "description", "disposition"), (4, "dialogue", "assumed"),
+        (5, "commentary", "disposition")]
+    assert [(a["id"], a["sourceStreamIndex"], a["purpose"], a["purposeFrom"], a["default"])
+            for a in package["renditions"]["audio"]] == [
+        ("a0", 1, "main", "assumed", True), ("a1", 2, "commentary", "disposition", False),
+        ("a2", 3, "description", "disposition", False)]
+    assert [(s["id"], s.get("sourceStreamIndex"), s["purpose"], s["purposeFrom"])
+            for s in package["subtitles"]] == [
+        ("sub0", 4, "dialogue", "assumed"), ("sub1", 5, "commentary", "disposition"),
+        ("sub2", None, "dialogue", "assumed")]
+    counts = ("commentaryTracks", "commentarySubtitles", "audioDescriptionTracks")
+    assert {k: package["essence"][k] for k in counts} == {k: source["essence"][k] for k in counts} \
+        == dict.fromkeys(counts, 1)
+    assert rec.deletion_gate([source["essence"]], package["essence"]) == []
+    media = [hls.parse_attributes(line.split(":", 1)[1])
+             for line in (vdir / "hls" / "master.m3u8").read_text().splitlines()
+             if line.startswith("#EXT-X-MEDIA:")]
+    assert [(m["TYPE"], m["NAME"]) for m in media] == [
+        ("AUDIO", "English"), ("AUDIO", "English · Commentary"),
+        ("AUDIO", "German · Audio description"), ("SUBTITLES", "English"),
+        ("SUBTITLES", "English · Commentary"), ("SUBTITLES", "German")]
     _catalogs_part(Path(record["library"]["itemDir"]))
     _validate(lib)
 

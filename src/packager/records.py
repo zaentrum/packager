@@ -7,9 +7,10 @@ libv2_records.py, vendored byte for byte (tests/test_libv2_records.py
 guards the copy): the same code the migration writes its records with,
 so the two agree on every byte the deletion gate reads. What only the
 packager knows it adds before handing over: which stream of the original
-each rendition was made from, and whether that stream of a subtitle is
-for the deaf and hard of hearing. Where the records are written, and in
-which order, is library.py's business."""
+each rendition was made from, and what that stream's disposition says it
+is for — a subtitle for the deaf and hard of hearing, a commentary, an
+audio description. Where the records are written, and in which order, is
+library.py's business."""
 
 from __future__ import annotations
 
@@ -22,7 +23,14 @@ import structlog
 
 from . import libv2_records as rec
 from .katalog import ExtraLibrary, ItemLibrary
-from .packager import Built, PackageError, _hearing_impaired, _source_ordinals
+from .packager import (
+    Built,
+    PackageError,
+    _audio_marks,
+    _commentary,
+    _hearing_impaired,
+    _source_ordinals,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -118,9 +126,13 @@ def for_record(built: Built, probe: OriginalProbe, now: str) -> dict[str, Any]:
     hearing as the source record reads its disposition (hearingImpaired):
     the record logic makes it sdh, as the source's essence has it, though
     the transcoder's encode lost a flag Matroska has no word for
-    (captions). The transcoder's v0 carries the original's tracks in
-    order, so a track is found by its place among those of its codec
-    (packager._source_ordinals)."""
+    (captions). So too a rendition whose stream is a commentary
+    (commentary), and an audio one whose stream is for the blind and
+    visually impaired (visualImpaired: visual_impaired or descriptions):
+    the record makes it a commentary or an audio description, as the
+    source's essence counts it. The transcoder's v0 carries the original's
+    tracks in order, so a track is found by its place among those of its
+    codec (packager._source_ordinals)."""
     man = copy.deepcopy(built.manifest)
     man["packagedAt"] = now
     ren = man.get("renditions") or {}
@@ -137,6 +149,7 @@ def for_record(built: Built, probe: OriginalProbe, now: str) -> dict[str, Any]:
             a["sourceStreamIndex"] = audio[at[idx]]["index"]
             if rec.num(audio[at[idx]].get("channels")):
                 a["sourceChannels"] = rec.num(audio[at[idx]]["channels"])
+            a.update(_audio_marks(audio[at[idx]]))
     subtitles = _of_kind(probe, "subtitle")
     st = _source_ordinals(built.probe.subtitles, subtitles)
     for s in man.get("subtitles") or []:
@@ -147,6 +160,8 @@ def for_record(built: Built, probe: OriginalProbe, now: str) -> dict[str, Any]:
             s["sourceStreamIndex"] = subtitles[st[n]]["index"]
             if _hearing_impaired(subtitles[st[n]]):
                 s["hearingImpaired"] = True
+            if _commentary(subtitles[st[n]]):
+                s["commentary"] = True
     return man
 
 

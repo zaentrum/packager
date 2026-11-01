@@ -2070,6 +2070,9 @@ def _prepare_source(
             "codec": s.hls_codec,
             "language": _track_language(stream),
             "title": tags.get("title") or "",
+            # As its stereo rendition (_audio_meta_from_stream); never a
+            # commentary, which has no 5.1 (_surround_plan).
+            **_audio_marks(stream),
             # Always a 5.1: a copy is one (_surround_plan), an encode is made one.
             "channels": SURROUND_CHANNELS,
             "default": s.source_index == surround_default,
@@ -2808,15 +2811,31 @@ def _audio_display_name(meta: dict[str, Any], *, surround: bool = False) -> str:
     "No dialogue", "Unknown"), " 5.1" in the 5.1 group, then what the
     source's title says besides ("English · Commentary"). Not a title that
     only names a format ("AC3 5.1 @ 640 Kbps"): the track is AAC stereo
-    whatever the file had. A second track that reads the same is told
-    apart by hls.unique_names."""
-    return _track_display_name(meta.get("language"), meta.get("title"),
+    whatever the file had. One its record makes a commentary or an audio
+    description by its stream's disposition alone (commentary,
+    visualImpaired) is named as a title that says so is ("English ·
+    Commentary", "English · Audio description"), unless its name says it
+    already. A second track that reads the same is told apart by
+    hls.unique_names."""
+    name = _track_display_name(meta.get("language"), meta.get("title"),
                                layout=f" {SURROUND_LAYOUT}" if surround else "")
+    record = rec.audio_rendition(meta, 0)
+    if record["purposeFrom"] != "disposition":
+        return name
+    if record["purpose"] == "commentary" and not _COMMENTARY_WORDS.search(name):
+        name = f"{name} · Commentary"
+    elif record["purpose"] == "description" and not _DESCRIPTION_WORDS.search(name):
+        name = f"{name} · Audio description"
+    return name
 
 
 def _audio_meta_from_stream(
     idx: int, stream: dict[str, Any], transcoded: bool = False
 ) -> dict[str, Any]:
+    """An audio rendition's manifest entry, and what its stream's disposition
+    says it is for, as the record logic reads an original's stream
+    (libv2_records' audio_purpose): a commentary (`commentary`), for the
+    blind and visually impaired (`visualImpaired`); its record makes it so."""
     tags = stream.get("tags") or {}
     disp = stream.get("disposition") or {}
     return {
@@ -2824,6 +2843,7 @@ def _audio_meta_from_stream(
         "codec": STEREO_CODEC if transcoded else stream.get("codec_name", STEREO_CODEC),
         "language": _track_language(stream),
         "title": tags.get("title") or "",
+        **_audio_marks(stream),
         # Output channels: always 2 after the stereo downmix in
         # _prepare_source. Falls back to the source channel count only
         # for the (currently unreachable) passthrough path.
@@ -2887,6 +2907,29 @@ def _hearing_impaired(stream: dict[str, Any]) -> bool:
     return bool(disp.get("hearing_impaired") or disp.get("captions"))
 
 
+def _commentary(stream: dict[str, Any]) -> bool:
+    """Whether a stream's disposition says it is a commentary (comment), as
+    the record logic reads an original's stream (commentary by its
+    disposition)."""
+    return bool((stream.get("disposition") or {}).get("comment"))
+
+
+def _visual_impaired(stream: dict[str, Any]) -> bool:
+    """Whether an audio stream's disposition says it is for the blind and
+    visually impaired: visual_impaired, or descriptions (an audio
+    description), as the record logic reads an original's stream
+    (libv2_records' audio_purpose: description by its disposition)."""
+    disp = stream.get("disposition") or {}
+    return bool(disp.get("visual_impaired") or disp.get("descriptions"))
+
+
+def _audio_marks(stream: dict[str, Any]) -> dict[str, bool]:
+    """The marks an audio rendition's manifest entry carries of what its
+    stream's disposition says (commentary, visualImpaired): none for most."""
+    return {**({"commentary": True} if _commentary(stream) else {}),
+            **({"visualImpaired": True} if _visual_impaired(stream) else {})}
+
+
 def _extract_subtitles(
     src: Path, probe: _Probe, subs_dir: Path,
     *,
@@ -2914,9 +2957,11 @@ def _extract_subtitles(
 
     Returns the list of subtitle entries for the manifest. Each
     entry carries `format` so the catalog (and downstream clients)
-    can distinguish what's on disk, and `hearingImpaired` when its
+    can distinguish what's on disk, `hearingImpaired` when its
     stream's disposition says it is for the deaf and hard of hearing
-    (_hearing_impaired): its NAME says so, and its record makes it sdh.
+    (_hearing_impaired) and `commentary` when it says it is a commentary
+    (_commentary): its NAME says so, and its record makes it sdh or a
+    commentary.
 
     Every track is extracted regardless of the language whitelist
     (we don't lose data). `visible_indices` controls only the
@@ -2959,6 +3004,7 @@ def _extract_subtitles(
             "default": False,
             "forced": bool(disp.get("forced")),
             **({"hearingImpaired": True} if _hearing_impaired(s) else {}),
+            **({"commentary": True} if _commentary(s) else {}),
             # Client-side visibility hint. None means show every entry
             # (no whitelist configured); a set narrows to the source
             # indices the language filter accepted. We still write the
@@ -3698,6 +3744,13 @@ def _package_text_tracks(
 # with, as the record logic reads a title (libv2_records'
 # subtitle_purpose): "SDH", "CC", "Hearing impaired", "Closed captions".
 _SDH_WORDS = re.compile(r"\bsdh\b|\bcc\b|hearing|closed caption", re.IGNORECASE)
+# ... a commentary (subtitle_purpose, audio_purpose), and an audio
+# description (audio_purpose).
+_COMMENTARY_WORDS = re.compile(
+    r"commentary|kommentar|commentaire|comentario|commento|commentaar", re.IGNORECASE)
+_DESCRIPTION_WORDS = re.compile(
+    r"audio description|descriptive (video|audio)|audiodeskription|audiodescription",
+    re.IGNORECASE)
 
 
 def _subtitle_display_name(entry: dict[str, Any]) -> str:
@@ -3707,13 +3760,18 @@ def _subtitle_display_name(entry: dict[str, Any]) -> str:
     when its title did), and " · SDH" for one its record makes sdh whose
     name doesn't say so — its stream's disposition said it is for the deaf
     and hard of hearing (hearingImpaired): "English · SDH", as a title that
-    says so is named. A second track that reads the same is told apart by
-    hls.unique_names."""
+    says so is named; " · Commentary" for one its record makes a commentary
+    by its stream's disposition alone (commentary). A second track that
+    reads the same is told apart by hls.unique_names."""
     name = _track_display_name(entry.get("language"), entry.get("title"))
     if entry.get("forced") and "forced" not in name.casefold():
         name = f"{name} (forced)"
-    if _subtitle_purpose(entry) == "sdh" and not _SDH_WORDS.search(name):
+    record = rec.subtitle_rendition(entry, 0)
+    if record["purpose"] == "sdh" and not _SDH_WORDS.search(name):
         name = f"{name} · SDH"
+    elif (record["purpose"], record["purposeFrom"]) == ("commentary", "disposition") \
+            and not _COMMENTARY_WORDS.search(name):
+        name = f"{name} · Commentary"
     return name
 
 
