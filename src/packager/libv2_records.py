@@ -77,8 +77,9 @@ import copy, datetime, hashlib, json, os, re, shutil, subprocess, uuid
 # its source's essence; a manifest that says nothing of it gives the record it gave. 8: a video
 # rendition whose manifest entry says its init segment carries the original's HDR10 static metadata
 # (hdr10Metadata: its mdcv and clli boxes) says so in its record, and the package's essence has the
-# HDR10 metadata a source had when one does, as when its top rendition is the original's own stream
-# in PQ; an audio rendition whose entry says the stream it was made from is a commentary
+# HDR10 metadata a source had when every rendition in PQ, the top one among them, says so, as when its
+# top rendition is the original's own stream in PQ; an audio rendition whose entry says the stream it
+# was made from is a commentary
 # (commentary: its disposition said comment) or for the visually impaired (visualImpaired:
 # visual_impaired or descriptions), and a subtitle whose entry says its stream is a commentary
 # (commentary), are for that by their disposition, as the stream is in its source's essence; a
@@ -645,9 +646,10 @@ def package_essence(man, source=None):
     renditions.audioSurround count for the channels and the languages it carries; a track is counted
     once, by its stereo rendition, for what a track is for. A top video rendition that is the
     original's own stream, copied (encoder 'copy'), in PQ, carries the HDR10 metadata in its bitstream
-    when the original — source, its essence — had it, and so does a package with a video rendition
-    whose init segment carries the original's (hdr10Metadata), encoded or not; anything else re-encoded
-    is taken to have lost it."""
+    when the original — source, its essence — had it, and so does a package every video rendition of
+    which in PQ, the top one among them, says its init segment carries the original's (hdr10Metadata),
+    encoded or not. One in PQ that says nothing of it — one whose init segment could not take it — and
+    anything else re-encoded is taken to have lost it."""
     ren = man.get("renditions") or {}
     vids, auds = ren.get("video") or [], ren.get("audio") or []
     every = auds + (ren.get("audioSurround") or [])
@@ -655,7 +657,8 @@ def package_essence(man, source=None):
     v0 = vids[0] if vids else {}
     codec = v0.get("codec") or ""
     copied_pq = v0.get("encoder") == "copy" and v0.get("videoRange") == "PQ"
-    declared = any(x.get("hdr10Metadata") is True for x in vids)
+    declared = v0.get("videoRange") == "PQ" and all(
+        x.get("hdr10Metadata") is True for x in vids if x.get("videoRange") == "PQ")
     return {
         "maxAudioChannels": max([x.get("channels") or 0 for x in every], default=0),
         "surround": any((x.get("channels") or 0) > 2 for x in every),
@@ -1216,7 +1219,7 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
     audio rendition likewise (audio_purpose): a commentary (commentary), for the visually impaired
     (visualImpaired), then its title. A video rendition whose init segment carries the original's
     HDR10 static metadata (hdr10Metadata) says so, and the package's essence has it when the source's
-    has (package_essence). The playlist flags a reader could
+    has and every rendition in PQ, the top one among them, says so (package_essence). The playlist flags a reader could
     not follow are normalised, each with a note: a second default audio rendition is not one, a
     package with none has its first, a forced subtitle is never the default, and of the rest only
     the first default is one."""
