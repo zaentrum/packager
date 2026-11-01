@@ -83,8 +83,12 @@ import copy, datetime, hashlib, json, os, re, shutil, subprocess, uuid
 # (commentary: its disposition said comment) or for the visually impaired (visualImpaired:
 # visual_impaired or descriptions), and a subtitle whose entry says its stream is a commentary
 # (commentary), are for that by their disposition, as the stream is in its source's essence; a
-# manifest that says none of it gives the record it gave.
-LIBV2_RECORDS = 8
+# manifest that says none of it gives the record it gave. 9: a title that says its track is no
+# commentary — "No commentary", "without the director's commentary", "Kommentarlos", "ohne
+# Kommentar", "sans commentaire" — makes it none (says_commentary): its words were read as one, in
+# a source's streams and a package's renditions alike. A source recorded before keeps the essence it
+# was written with.
+LIBV2_RECORDS = 9
 
 NS = uuid.uuid5(uuid.NAMESPACE_URL, "https://zaentrum.github.io/schemas/library")
 PACKAGE_DIRS = ("hls", "subs", "trickplay", "trailers")
@@ -456,6 +460,24 @@ def dispositions(s):
     return out
 
 
+# The words a title says a track is a commentary with, and those that take them back: one of them
+# after a negation ("No commentary", "without the director's commentary", "ohne Kommentar", "keine
+# Kommentare", "sans commentaire", "sin comentarios", "senza commento", "zonder commentaar",
+# "non-commentary") or a word that says it itself ("Kommentarlos", "kommentarfrei",
+# "commentary-free").
+COMMENTARY_WORDS = r"commentary|kommentar|commentaire|comentario|commento|commentaar"
+NO_COMMENTARY_RE = re.compile(
+    r"\b(?:no|without|w/o|ohne|keine?[nrs]?|sans|sin|senza|zonder|geen)[\s\-:]+(?:[\w'’]+[\s\-]+){0,2}?"
+    r"(?:" + COMMENTARY_WORDS + r"|comments?)|\bnon[\s\-]?(?:" + COMMENTARY_WORDS + r")"
+    r"|kommentar(?:los|frei)|commentary[\s\-]?free", re.I)
+
+
+def says_commentary(title):
+    """Whether a title says its track is a commentary: one of COMMENTARY_WORDS that no negation
+    takes back (NO_COMMENTARY_RE)."""
+    return bool(re.search(COMMENTARY_WORDS, NO_COMMENTARY_RE.sub(" ", title or ""), re.I))
+
+
 def subtitle_purpose(s):
     d = s.get("disposition") or {}
     t = ((s.get("tags") or {}).get("title") or "").lower()
@@ -473,7 +495,7 @@ def subtitle_purpose(s):
         return "signs-songs", "title"
     if re.search(r"\bsdh\b|\bcc\b|hearing|closed caption", t):
         return "sdh", "title"
-    if re.search(r"commentary|kommentar|commentaire|comentario|commento|commentaar", t):
+    if says_commentary(t):
         return "commentary", "title"
     if re.search(r"\blyrics\b|karaoke", t):
         return "lyrics", "title"
@@ -487,7 +509,7 @@ def audio_purpose(s):
         return "commentary", "disposition"
     if d.get("visual_impaired") or d.get("descriptions"):
         return "description", "disposition"
-    if re.search(r"commentary|kommentar|commentaire|comentario|commento|commentaar", t):
+    if says_commentary(t):
         return "commentary", "title"
     if re.search(r"audio description|descriptive (video|audio)|audiodeskription|audiodescription", t):
         return "description", "title"
