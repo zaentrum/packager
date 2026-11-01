@@ -21,11 +21,12 @@ DOWNMIX_5_1 = ("pan=stereo|FL=0.4142*FL+0.2929*FC+0.2929*SL|FR=0.4142*FR+0.2929*
 
 
 def _a(lang: str, ch: int = 2, codec: str = "aac", title: str = "", default: bool = False,
-       comment: bool = False) -> dict:
+       comment: bool = False, described: bool = False) -> dict:
     return {"codec_name": codec, "channels": ch,
             **({"channel_layout": _LAYOUTS[ch]} if ch in _LAYOUTS else {}),
             "tags": {"language": lang, **({"title": title} if title else {})},
-            "disposition": {"default": int(default), "comment": int(comment)}}
+            "disposition": {"default": int(default), "comment": int(comment),
+                            "visual_impaired": int(described)}}
 
 
 @pytest.mark.parametrize(("tag", "key"), [
@@ -67,6 +68,41 @@ def test_default_skips_commentary_and_hidden_tracks() -> None:
     streams = [_a("eng", comment=True, default=True), _a("eng"), _a("jpn")]
     assert pk._pick_default_audio(streams, {0, 1, 2}, ["en"]) == 1
     assert pk._pick_default_audio(streams, {2}, []) == 2
+
+
+def test_an_audio_description_is_no_default_as_a_commentary_is_none() -> None:
+    # German preferred: the German audio description first in the file, by
+    # its disposition or its title, is never the default while the German
+    # main track is there; nor is an English commentary.
+    for ad in (_a("ger", described=True), _a("ger", title="Audiodeskription")):
+        streams = [ad, _a("ger"), _a("eng", default=True), _a("eng", comment=True)]
+        assert pk._pick_default_audio(streams, {0, 1, 2, 3}, ["de"]) == 1
+        assert pk._pick_default_audio(streams, {0, 1, 2, 3}, []) == 2
+        assert pk._pick_default_audio(streams, {0, 1, 2, 3}, ["en"]) == 2
+    # Where nothing else of the language is there, it is the one.
+    assert pk._pick_default_audio([_a("ger", described=True), _a("eng")], {0, 1}, ["de"]) == 0
+
+
+@pytest.mark.parametrize("title", [
+    "No commentary", "English - no director's commentary", "Kommentarlos",
+    "Deutsch (ohne Kommentar)", "Sans commentaire", "No comments",
+])
+def test_a_title_that_says_no_commentary_is_none(title: str) -> None:
+    # Its words say it is the main track: it is the default and has its 5.1,
+    # as the record reads it (libv2_records' says_commentary).
+    streams = [_a("eng", 6, "dts", title=title), _a("eng", 2, title="Commentary")]
+    assert not pk._is_commentary(streams[0]) and pk._is_commentary(streams[1])
+    assert pk._pick_default_audio(streams, {0, 1}, ["en"]) == 0
+    assert [t.source_index for t in pk._surround_plan(streams, {0, 1}, pk.PackageOptions())] == [0]
+
+
+def test_an_audio_description_gets_no_companion_its_main_track_does() -> None:
+    # An audio description in 5.1 first in its language would take its main
+    # track's 5.1: it is skipped, as a commentary is.
+    streams = [_a("ger", 6, "dts", described=True), _a("ger", 6, "dts"),
+               _a("eng", 6, "dts", title="Audio description"), _a("eng", 6, "ac3")]
+    plan = pk._surround_plan(streams, {0, 1, 2, 3}, pk.PackageOptions())
+    assert [t.source_index for t in plan] == [1, 3]
 
 
 def test_surround_plan_first_per_language_copy_or_encode() -> None:

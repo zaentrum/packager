@@ -1402,9 +1402,28 @@ def _visible_indices(
 
 
 def _is_commentary(stream: dict[str, Any]) -> bool:
+    """Whether an audio track is a commentary: its disposition says so
+    (comment), or its title has "comment" or "kommentar" in it that no
+    negation takes back — "No commentary", "Kommentarlos", "sans
+    commentaire" say a track is none, as the record logic reads them
+    (libv2_records' NO_COMMENTARY_RE)."""
     disp = stream.get("disposition") or {}
-    title = ((stream.get("tags") or {}).get("title") or "").lower()
+    title = rec.NO_COMMENTARY_RE.sub(" ", (stream.get("tags") or {}).get("title") or "").lower()
     return bool(disp.get("comment")) or "comment" in title or "kommentar" in title
+
+
+def _is_description(stream: dict[str, Any]) -> bool:
+    """Whether an audio track is an audio description, as the record logic
+    reads its stream (libv2_records' audio_purpose): by its disposition
+    (visual_impaired, descriptions) or its title."""
+    return rec.audio_purpose(stream)[0] == "description"
+
+
+def _is_main_audio(stream: dict[str, Any]) -> bool:
+    """Whether an audio track is for the film as it plays: no commentary
+    (_is_commentary) and no audio description (_is_description). Neither is
+    ever the default nor its language's 5.1 companion."""
+    return not (_is_commentary(stream) or _is_description(stream))
 
 
 def _pick_default_audio(
@@ -1413,10 +1432,12 @@ def _pick_default_audio(
     preferred: list[str],
 ) -> int | None:
     """The one audio track marked DEFAULT=YES: the first preferred
-    language that has a track wins; within a language, a visible
-    non-commentary track flagged default in the source, else the first
-    one. No preference match -> the source's default-flagged track, else
-    the first visible track."""
+    language that has a track wins; within a language, a visible track for
+    the film as it plays — no commentary, no audio description
+    (_is_main_audio) — flagged default in the source, else the first one. No
+    preference match -> the source's default-flagged track, else the first
+    visible track. A commentary or an audio description is the default only
+    where nothing else of its language is there."""
     if not streams:
         return None
 
@@ -1424,7 +1445,7 @@ def _pick_default_audio(
         s = streams[i]
         return (
             i not in visible,
-            _is_commentary(s),
+            not _is_main_audio(s),
             not (s.get("disposition") or {}).get("default"),
             i,
         )
@@ -1477,8 +1498,10 @@ def _surround_plan(
 ) -> list[_SurroundTrack]:
     """Which source tracks get a 5.1 companion: every surround track — more
     than two channels, as a record's essence counts surround — but a
-    commentary, the first such track per language (a second English one
-    would be a duplicate). A track hidden by the language whitelist gets
+    commentary or an audio description (_is_main_audio), the first such
+    track per language (a second English one would be a duplicate; an audio
+    description first in its language would take its main track's place).
+    A track hidden by the language whitelist gets
     its companion too, hidden as its stereo rendition is: the package
     keeps what the original carries. Stream-copied when the track already
     is a 5.1 of the target codec (an E-AC-3 5.1, Atmos included), encoded
@@ -1492,7 +1515,7 @@ def _surround_plan(
     seen: set[str] = set()
     for i, s in enumerate(streams):
         channels = int(s.get("channels") or 0)
-        if channels <= 2 or _is_commentary(s):
+        if channels <= 2 or not _is_main_audio(s):
             continue
         key = _lang_key(_track_language(s))
         if key in seen:
@@ -2071,7 +2094,8 @@ def _prepare_source(
             "language": _track_language(stream),
             "title": tags.get("title") or "",
             # As its stereo rendition (_audio_meta_from_stream); never a
-            # commentary, which has no 5.1 (_surround_plan).
+            # commentary or an audio description, which have no 5.1
+            # (_surround_plan).
             **_audio_marks(stream),
             # Always a 5.1: a copy is one (_surround_plan), an encode is made one.
             "channels": SURROUND_CHANNELS,
