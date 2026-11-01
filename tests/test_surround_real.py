@@ -9,15 +9,17 @@ rendition in group "audio"; the language of every surround track a client
 is offered gets one 5.1 E-AC-3 companion in group "audio-surround"
 (encoded, the 7.1 downmixed, the E-AC-3 5.1 copied bit for bit), with
 exactly one default; a stereo film gets none. A track the language
-settings hide gets none — unless it is the default one, whose companion
-is hidden as its stereo rendition is — and its stereo rendition is what it
-was, byte for byte. In both layouts: the legacy manifest.json, and the v2
-record, whose package.json validates against the schemas
-(validate-library-v2.py --check-checksums, where a schemas checkout and a
-Python with jsonschema are at hand) and whose essence no longer loses
-"surround" — nor "maxAudioChannels", but for the 7.1, whose two extra
-channels a 5.1 can't keep; a film whose only surround track is hidden
-carries no 5.1, and its record's deletion gate says so."""
+settings hide gets none where a shown one gets one — the default one
+keeps its own, hidden as its stereo rendition is — and its stereo
+rendition is what it was, byte for byte; where no track shown is
+surround, the first surround track keeps its 5.1, hidden, and no other.
+In both layouts: the legacy manifest.json, and the v2 record, whose
+package.json validates against the schemas (validate-library-v2.py
+--check-checksums, where a schemas checkout and a Python with jsonschema
+are at hand) and whose essence no longer loses "surround" — nor
+"maxAudioChannels", but for the 7.1, whose two extra channels a 5.1 can't
+keep — not even of a film whose surround tracks are all hidden, so its
+record's deletion gate doesn't hold the original for it."""
 
 from __future__ import annotations
 
@@ -95,11 +97,18 @@ def films(tmp_path_factory) -> dict[str, Path]:
         "stereo": _film(d / "Stereo (2024)" / "Stereo (2024).mkv",
                         [("aac", 2, "eng"), ("ac3", 2, "ger")]),
         # Of the catalog's whitelist (English, German) the English stereo
-        # alone: every surround track is hidden, of every kind a companion
-        # is made of.
+        # alone: every surround track is hidden — the first, which keeps its
+        # 5.1, and after it one of every kind a companion is made of.
         "hidden": _film(d / "Hidden (2024)" / "Hidden (2024).mkv", [
-            ("aac", 2, "eng"), ("ac3", 6, "fre"), ("flac", 8, "ita"), ("pcm_s24le", 6, "spa"),
-            ("aac", 6, "por"), ("eac3", 6, "jpn")]),
+            ("aac", 2, "eng"), ("eac3", 6, "jpn"), ("ac3", 6, "fre"), ("flac", 8, "ita"),
+            ("pcm_s24le", 6, "spa"), ("aac", 6, "por"), ("eac3", 6, "kor")]),
+        # A Japanese 5.1 and English: in stereo, in 5.1; and a French 5.1 beside.
+        "ja_en": _film(d / "Ja En (2024)" / "Ja En (2024).mkv",
+                       [("eac3", 6, "jpn"), ("aac", 2, "eng")]),
+        "ja_en51": _film(d / "Ja En51 (2024)" / "Ja En51 (2024).mkv",
+                         [("eac3", 6, "jpn"), ("ac3", 6, "eng")]),
+        "ja_fr_en": _film(d / "Ja Fr En (2024)" / "Ja Fr En (2024).mkv",
+                          [("eac3", 6, "jpn"), ("ac3", 6, "fre"), ("aac", 2, "eng")]),
     }
 
 
@@ -360,26 +369,31 @@ def _rendition_files(lib: Path, rid: str) -> dict[str, bytes]:
             for p in sorted(folder.iterdir())}
 
 
-def test_a_hidden_tracks_stereo_is_what_it_was_and_the_gate_names_the_5_1(
+def test_a_hidden_tracks_stereo_is_what_it_was_and_the_first_keeps_its_5_1(
     tmp_path: Path, films, monkeypatch,
 ) -> None:
-    # Every surround track hidden, of every kind a companion is made of: an
-    # AC-3 5.1, a FLAC 7.1, a PCM 5.1 and an AAC 5.1 (each encoded, from a
-    # split of its decoded signal), an E-AC-3 5.1 (copied). None gets a 5.1
-    # now; the stereo rendition of each is, byte for byte, the one a run
-    # that made the companions made.
+    # Every surround track hidden: the first, an E-AC-3 5.1, keeps its 5.1
+    # (copied), hidden as its stereo is; after it one of every kind a
+    # companion is made of — an AC-3 5.1, a FLAC 7.1, a PCM 5.1 and an AAC
+    # 5.1 (each encoded, from a split of its decoded signal), an E-AC-3 5.1
+    # (copied) — gets none now. The stereo rendition of each, and the kept
+    # 5.1, are byte for byte what a run that made every companion made.
     lib, package, source = _v2(tmp_path / "now", films["hidden"], "eac3", stereo_loudness=None)
     assert [(a["id"], a["language"], a["visible"], a["default"])
             for a in package["renditions"]["audio"]] == [
-        ("a0", "eng", True, True), ("a1", "fre", False, False), ("a2", "ita", False, False),
-        ("a3", "spa", False, False), ("a4", "por", False, False), ("a5", "jpn", False, False)]
-    assert "audioSurround" not in package["renditions"]
-    assert package["hls"]["audioGroups"] == ["audio"]
-    # What the package carries, its record says: no 5.1, which deleting the
-    # original costs.
+        ("a0", "eng", True, True), ("a1", "jpn", False, False), ("a2", "fre", False, False),
+        ("a3", "ita", False, False), ("a4", "spa", False, False), ("a5", "por", False, False),
+        ("a6", "kor", False, False)]
+    assert [(a["id"], a["language"], a["sourceStreamIndex"], a["sourceChannels"], a["visible"],
+             a["default"]) for a in package["renditions"]["audioSurround"]] == [
+        ("a7", "jpn", 2, 6, False, True)]
+    assert package["hls"]["audioGroups"] == ["audio", "audio-surround"]
+    # What the package carries, its record says: a 5.1, so deleting the
+    # original costs no surround — the 7.1's two extra channels and the
+    # lossless coding still, as with every companion made.
     assert (source["essence"]["surround"], source["essence"]["maxAudioChannels"]) == (True, 8)
-    assert (package["essence"]["surround"], package["essence"]["maxAudioChannels"]) == (False, 2)
-    assert _gate(source, package) == ["losslessAudio", "maxAudioChannels", "surround"]
+    assert (package["essence"]["surround"], package["essence"]["maxAudioChannels"]) == (True, 6)
+    assert _gate(source, package) == ["losslessAudio", "maxAudioChannels"]
     _validate(lib)
 
     plan = pk._surround_plan
@@ -390,9 +404,47 @@ def test_a_hidden_tracks_stereo_is_what_it_was_and_the_gate_names_the_5_1(
     monkeypatch.setattr(pk, "_surround_plan", every_track)
     before, made, _source = _v2(tmp_path / "before", films["hidden"], "eac3",
                                 stereo_loudness=None)
-    assert [(a["language"], a["sourceChannels"], a["visible"])
+    assert [(a["id"], a["language"], a["sourceChannels"], a["visible"])
             for a in made["renditions"]["audioSurround"]] == [
-        ("fre", 6, False), ("ita", 8, False), ("spa", 6, False), ("por", 6, False),
-        ("jpn", 6, False)]
-    for rid in ("a0", "a1", "a2", "a3", "a4", "a5"):
+        ("a7", "jpn", 6, False), ("a8", "fre", 6, False), ("a9", "ita", 8, False),
+        ("a10", "spa", 6, False), ("a11", "por", 6, False), ("a12", "kor", 6, False)]
+    assert _gate(_source, made) == ["losslessAudio", "maxAudioChannels"]
+    for rid in ("a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"):
         assert _rendition_files(lib, rid) == _rendition_files(before, rid), rid
+
+
+@pytest.mark.parametrize(("film", "stereo", "kept"), [
+    # The catalog shows English and German. The Japanese 5.1 is the only
+    # surround track: it keeps its 5.1, hidden, the 5.1 group's one default.
+    ("ja_en", [("a0", "jpn", False), ("a1", "eng", True)], [("a2", "jpn", 1, False, True)]),
+    # The English 5.1 is shown and gets its own: the hidden Japanese none.
+    ("ja_en51", [("a0", "jpn", False), ("a1", "eng", True)], [("a2", "eng", 2, True, True)]),
+    # Two hidden in surround, none shown: one 5.1, the first one's.
+    ("ja_fr_en", [("a0", "jpn", False), ("a1", "fre", False), ("a2", "eng", True)],
+     [("a3", "jpn", 1, False, True)]),
+])
+def test_a_hidden_track_keeps_its_5_1_where_no_shown_one_has_one(
+    tmp_path: Path, films, film: str, stereo: list[tuple], kept: list[tuple],
+) -> None:
+    lib, package, source = _v2(tmp_path, films[film], "eac3")
+    # Every track keeps its stereo rendition, hidden or shown as before; the
+    # English one is the default.
+    assert [(a["id"], a["language"], a["visible"]) for a in package["renditions"]["audio"]] == \
+        stereo
+    assert [a["language"] for a in package["renditions"]["audio"] if a["default"]] == ["eng"]
+    assert [(a["id"], a["language"], a["sourceStreamIndex"], a["visible"], a["default"])
+            for a in package["renditions"]["audioSurround"]] == kept
+    # The package keeps a 5.1 of the original's: deleting it costs nothing.
+    assert package["essence"]["surround"] is True
+    assert _gate(source, package) == []
+    _validate(lib)
+    root = lib / "movies" / ITEM[:2] / ITEM / "versions" / VERSION
+    rid = kept[0][0]
+    assert _decoded(root / "hls" / rid) == ("eac3", 6, "5.1(side)")
+    if kept[0][1] == "jpn":
+        # The Japanese E-AC-3 5.1 is copied, bit for bit.
+        joined = root / "hls" / rid / ".copy.mp4"
+        joined.write_bytes((root / "hls" / rid / "init.mp4").read_bytes() + b"".join(
+            s.read_bytes() for s in sorted((root / "hls" / rid).glob("seg-*.m4s"))))
+        assert _raw_eac3(joined, "0:a:0") == _raw_eac3(films[film], "0:a:0")
+        joined.unlink()

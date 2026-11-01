@@ -191,14 +191,18 @@ client is offered also gets a 5.1 E-AC-3 rendition in group
 `audio-surround`, the first per language, commentaries and audio
 descriptions excluded (one first in its language would take its main
 track's 5.1): a film in four languages keeps a 5.1 in each, and a stereo
-film gets none. A track the language whitelist hides gets none: no client
-offers it, and its stereo rendition is made as before, packet for packet.
-The default one (DEFAULT=YES, and played whatever the settings show) keeps
-its companion where it is hidden too — no track shown, or
-`PREFERRED_LANGUAGES` naming a hidden language — hidden as its stereo
-rendition is. A package whose only surround tracks are hidden carries no
-5.1, and its v2 record says so: its essence has no `surround`, and the
-deletion gate names it. An E-AC-3 5.1 (Atmos included) is
+film gets none. A track the language whitelist hides gets none where a
+track a client is offered gets one: no client offers it, and its stereo
+rendition is made as before, packet for packet. The default one
+(DEFAULT=YES, and played whatever the settings show) keeps its companion
+where it is hidden too — no track shown, or `PREFERRED_LANGUAGES` naming a
+hidden language. Where neither a track a client is offered nor the default
+one is surround — a Japanese 5.1 beside an English stereo, English shown —
+the first surround track for the film keeps its companion, hidden though
+it is, and no other does: the package keeps a 5.1 of an original that has
+one, so its v2 record's essence keeps `surround` and the deletion gate
+doesn't hold the original for it. A hidden track's companion is hidden as
+its stereo rendition is. An E-AC-3 5.1 (Atmos included) is
 stream-copied, bit for bit; anything else is encoded to a 5.1 at 448k: a
 7.1 downmixed (a 5.1 can't keep its two extra channels, which a v2
 record's deletion gate still names as lost), fewer channels upmixed.
@@ -731,8 +735,8 @@ and a client of its own:
 ```
 PUT /api/analyze/rules/packager
 {"version": "3f2a9c1", "rules": {"surroundAudio": "eac3", "surroundLayout": "5.1",
-  "surroundBitrate": "448k", "surroundTracks": "shown", "stereoAudio": "aac",
-  "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"]}}
+  "surroundBitrate": "448k", "surroundTracks": "shown", "preferredLanguages": [],
+  "stereoAudio": "aac", "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"]}}
 ```
 
 Every value is the one the process runs with: `SURROUND_AUDIO` (`off`: no
@@ -740,9 +744,14 @@ Every value is the one the process runs with: `SURROUND_AUDIO` (`off`: no
 for it, and a source track of it in the target codec is copied),
 `SURROUND_BITRATE` (what an encoded companion is made at;
 an E-AC-3 5.1 is copied as it is), which tracks get a companion
-(`shown`: those a client is offered and the default one, never one the
-language whitelist hides; a packager that doesn't say gave one to every
-surround track), the stereo rendition's codec and bit
+(`shown`: those a client is offered and the default one, a commentary or
+an audio description never; one the language whitelist hides gets none,
+but where none of those is surround, the first surround track for the
+film keeps its own, hidden, and no other — see "Audio"; a packager that
+doesn't say gave one to every surround track), the languages the default
+track is picked by (`PREFERRED_LANGUAGES` in its order, in lower case; `[]`
+when it is unset, and then the `packager.language_whitelist` order is),
+the stereo rendition's codec and bit
 rate (AAC at 192k, what its encode is made with), and the
 forms of image subtitles a package carries as they are, as the extraction
 writes them: PGS always, VobSub where `mkvextract` and `mkvmerge` are
@@ -788,7 +797,7 @@ Dockerfile
 | `SURROUND_AUDIO` | `off` | 5.1 companion codec: `eac3`, `ac3` or `off` (see "Audio"). chino-stream serves the `audio-surround` group only to clients that decode it |
 | `SURROUND_BITRATE` | `448k` | Bitrate of an encoded 5.1 companion |
 | `HLS_SUBTITLES` | `false` | Reference the WebVTT renditions from the master |
-| `PREFERRED_LANGUAGES` | (empty) | DEFAULT=YES language order, e.g. `de,en`; empty = whitelist order |
+| `PREFERRED_LANGUAGES` | (empty) | DEFAULT=YES language order, e.g. `de,en`; empty = whitelist order. The [rules report](#rules-report) names it |
 | `OLD_PACKAGE_GRACE_SECONDS` | `600` | How long a package replaced by a new one stays on disk for the requests that started on it (see "Packaging again"); keep it well above the NFS mounts' attribute cache time |
 | `IMAGE_VERSION` | (the image's) | The version the [rules report](#rules-report) names; the image build sets it, empty = the package's |
 | `WORK_ROOT` | `/var/lib/katalog/.work` | The library v2 work tree, on the library's share: the startup sweep clears dead runs in its `staging/` (see [Library v2](#library-v2)). A run's own paths come from its worker record |

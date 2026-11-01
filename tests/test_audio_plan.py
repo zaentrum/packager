@@ -149,12 +149,101 @@ def test_a_hidden_track_gets_no_companion_but_the_default_does() -> None:
                                                       default_index=1)] == [1]
     assert [s.source_index for s in pk._surround_plan(streams, set(), pk.PackageOptions(),
                                                       default_index=0)] == [0]
-    assert pk._surround_plan(streams, set(), pk.PackageOptions()) == []
+    assert [s.source_index for s in pk._surround_plan(streams, set(), pk.PackageOptions(),
+                                                      default_index=2)] == [2]
+    # Nothing shown, and no default given: the first surround track keeps
+    # its 5.1, and no other.
+    assert [s.source_index for s in pk._surround_plan(streams, set(), pk.PackageOptions())] == [0]
     # The default one is first of its language, though another of it comes
     # first in the file: the companion is the default's.
     two = [_a("fre", 6, "ac3"), _a("fre", 6, "dts", default=True)]
     assert [s.source_index for s in pk._surround_plan(two, set(), pk.PackageOptions(),
                                                       default_index=1)] == [1]
+
+
+def _companions(streams: list[dict], whitelist: list[str], preferred: tuple[str, ...] = (),
+                codec: str = "eac3") -> list[int]:
+    """The tracks that get a 5.1 companion as build_package plans them: those
+    the whitelist shows, the default one picked by the preferred languages
+    (else the whitelist's order)."""
+    visible = pk._visible_indices(streams, whitelist, keep_original_if_single=True)
+    default = pk._pick_default_audio(streams, visible, list(preferred) or whitelist)
+    return [t.source_index for t in pk._surround_plan(
+        streams, visible, pk.PackageOptions(surround_codec=codec), default)]
+
+
+@pytest.mark.parametrize(("streams", "companions"), [
+    # The only surround track is hidden: it keeps its 5.1, hidden; the
+    # English stereo is the default.
+    ([_a("jpn", 6, "eac3"), _a("eng", 2, "aac")], [0]),
+    # A shown one gets a 5.1: the hidden one gets none.
+    ([_a("jpn", 6, "eac3"), _a("eng", 6, "eac3")], [1]),
+    ([_a("eng", 6, "ac3"), _a("jpn", 6, "eac3")], [0]),
+    # Two hidden ones and nothing shown in surround: one 5.1, the first one's.
+    ([_a("jpn", 6, "eac3"), _a("fre", 6, "dts"), _a("eng", 2, "aac")], [0]),
+    ([_a("fre", 8, "truehd"), _a("jpn", 6, "eac3"), _a("eng", 2, "aac")], [0]),
+    # The first for the film: never a commentary's, never an audio
+    # description's; with nothing else in surround, none.
+    ([_a("jpn", 6, "eac3", comment=True), _a("fre", 6, "dts"), _a("eng", 2, "aac")], [1]),
+    ([_a("jpn", 6, "eac3", title="Audio Description"), _a("fre", 6, "dts"), _a("eng", 2)], [1]),
+    ([_a("jpn", 6, "eac3", comment=True), _a("fre", 6, "dts", described=True), _a("eng", 2)], []),
+    # A shown commentary in 5.1 gets none, so it is no shown 5.1: the hidden
+    # track keeps its own.
+    ([_a("jpn", 6, "eac3"), _a("eng", 6, "ac3", title="Commentary"), _a("eng", 2)], [0]),
+    # A stereo track first in its language takes nothing from the 5.1 after it.
+    ([_a("jpn", 2, "aac"), _a("jpn", 6, "eac3"), _a("eng", 2, "aac")], [1]),
+    # A stereo film has none.
+    ([_a("jpn", 2, "aac"), _a("eng", 2, "aac")], []),
+])
+def test_a_hidden_track_keeps_its_5_1_only_where_no_shown_one_has_one(
+    streams: list[dict], companions: list[int],
+) -> None:
+    assert _companions(streams, ["en"]) == companions
+    assert _companions(streams, ["en"], codec="off") == []
+
+
+def test_the_first_surround_track_is_the_default_one_where_it_is_hidden() -> None:
+    # PREFERRED_LANGUAGES naming a language the whitelist hides makes a
+    # hidden track the default: of hidden ones in surround, it keeps its 5.1
+    # (it is played whatever the settings show), not the first in the file.
+    streams = [_a("jpn", 6, "eac3"), _a("fre", 6, "dts"), _a("eng", 2, "aac")]
+    assert _companions(streams, ["en"], preferred=("fr",)) == [1]
+    assert _companions(streams, ["en"], preferred=("en", "fr")) == [0]
+    # Beside a shown 5.1 the hidden default keeps its own too.
+    both = [_a("jpn", 6, "eac3"), _a("eng", 6, "eac3")]
+    assert _companions(both, ["en"], preferred=("ja",)) == [0, 1]
+    # A whitelist that shows none of them: the default one's (English,
+    # preferred), else the first's.
+    three = [_a("jpn", 6, "eac3"), _a("fre", 6, "dts"), _a("eng", 6, "ac3")]
+    assert _companions(three, ["it"], preferred=("en",)) == [2]
+    assert _companions(three, ["it"]) == [0]
+
+
+def test_a_hidden_tracks_kept_5_1_is_hidden_and_the_groups_default(monkeypatch,
+                                                                   tmp_path: Path) -> None:
+    # The English stereo shown and the default; the Japanese 5.1 and the
+    # French 7.1 hidden. The Japanese keeps its 5.1 — hidden as its stereo
+    # is, the 5.1 group's one default — and the French gets none, its stereo
+    # its downmix as before.
+    calls: list[list[str]] = []
+    monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: calls.append(args))
+    audio = [_a("eng", 2, "aac"), _a("jpn", 6, "dts"), _a("fre", 8, "truehd")]
+    visible = pk._visible_indices(audio, ["en"], keep_original_if_single=True)
+    default = pk._pick_default_audio(audio, visible, ["en"])
+    assert (visible, default) == ({0}, 0)
+    surround = pk._surround_plan(audio, visible, pk.PackageOptions(), default_index=default)
+    _mp4, meta, surround_meta = pk._prepare_source(
+        Path("/m/src.mkv"), _probe(audio), tmp_path, audio_visible_indices=visible,
+        default_index=default, surround=surround,
+        surround_default=pk._pick_default_surround(surround, audio, default, ["en"], visible))
+    assert [(m["idx"], m["visible"], m["default"]) for m in meta] == [
+        (0, True, True), (1, False, False), (2, False, False)]
+    assert [(m["idx"], m["channels"], m["default"], m["visible"], m["mode"])
+            for m in surround_meta] == [(1, 6, True, False, "encode")]
+    graph = calls[0][calls[0].index("-filter_complex") + 1]
+    assert "[am1]aformat=sample_rates=48000:channel_layouts=5.1(side)|5.1[m1]" in graph
+    assert "[0:a:2]pan=stereo|FL=0.3204*FL+0.2265*FC+0.2265*BL+0.2265*SL|" in graph
+    assert "[am2]" not in graph and "[as2]" not in graph and "[m2]" not in graph
 
 
 @pytest.mark.parametrize(("channels", "codec", "mode"), [

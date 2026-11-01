@@ -33,8 +33,8 @@ def test_the_payload_is_the_catalogs_contract() -> None:
                         image_subtitles=["pgs", "vobsub"])
     assert got == {"version": "3f2a9c1", "rules": {
         "surroundAudio": "eac3", "surroundLayout": "5.1", "surroundBitrate": "448k",
-        "surroundTracks": "shown", "stereoAudio": "aac", "stereoBitrate": "192k",
-        "imageSubtitles": ["pgs", "vobsub"]}}
+        "surroundTracks": "shown", "preferredLanguages": [], "stereoAudio": "aac",
+        "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"]}}
 
 
 def test_the_stereo_codec_is_the_one_its_encode_is_made_with() -> None:
@@ -66,24 +66,49 @@ def test_the_layout_is_the_one_the_companion_is_made_in() -> None:
 
 def test_the_tracks_are_those_the_plan_gives_a_companion() -> None:
     # "shown": a track a client offers gets a 5.1 companion, and the default
-    # one; a track the language whitelist hides gets none
+    # one; a track the language whitelist hides gets none, but where none of
+    # those is surround, the first surround track keeps its own
     from packager import packager
 
     assert rules_payload(options(surround_audio="eac3"), None)["rules"]["surroundTracks"] == \
         packager.SURROUND_TRACKS == "shown"
     streams = [{"codec_name": "dts", "channels": 6, "tags": {"language": "eng"}},
                {"codec_name": "dts", "channels": 6, "tags": {"language": "fre"}},
-               {"codec_name": "dts", "channels": 6, "tags": {"language": "ger"}}]
+               {"codec_name": "dts", "channels": 6, "tags": {"language": "ger"}},
+               {"codec_name": "aac", "channels": 2, "tags": {"language": "ita"}}]
     plan = packager._surround_plan(streams, {0}, options(surround_audio="eac3"), default_index=2)
     assert [t.source_index for t in plan] == [0, 2]
+    plan = packager._surround_plan(streams, {3}, options(surround_audio="eac3"), default_index=3)
+    assert [t.source_index for t in plan] == [0]
+
+
+@pytest.mark.parametrize(("setting", "preferred"), [
+    ("", []),
+    ("de,en", ["de", "en"]),
+    (" DE , en,, ", ["de", "en"]),
+])
+def test_the_preferred_languages_are_those_the_default_is_picked_by(setting: str,
+                                                                    preferred: list[str]) -> None:
+    # PREFERRED_LANGUAGES as the packager reads it, in its order; empty when
+    # unset, and then the catalog's whitelist order picks the default
+    from packager import packager
+
+    opts = options(preferred_languages=setting)
+    assert rules_payload(opts, None)["rules"]["preferredLanguages"] == preferred
+    assert list(opts.preferred_languages) == preferred
+    streams = [{"codec_name": "aac", "channels": 2, "tags": {"language": "eng"}},
+               {"codec_name": "aac", "channels": 2, "tags": {"language": "ger"}}]
+    whitelist = ["en", "de"]
+    default = packager._pick_default_audio(streams, {0, 1}, preferred or whitelist)
+    assert default == (1 if preferred else 0)
 
 
 def test_the_payload_says_the_values_this_process_runs_with() -> None:
     # the platform's default is no companion; a bit rate set is the one sent
     got = rules_payload(options(surround_bitrate="640k"), None, image_subtitles=["pgs"])["rules"]
     assert got == {"surroundAudio": "off", "surroundLayout": "5.1", "surroundBitrate": "640k",
-                   "surroundTracks": "shown", "stereoAudio": "aac", "stereoBitrate": "192k",
-                   "imageSubtitles": ["pgs"]}
+                   "surroundTracks": "shown", "preferredLanguages": [], "stereoAudio": "aac",
+                   "stereoBitrate": "192k", "imageSubtitles": ["pgs"]}
 
 
 @pytest.mark.parametrize(("installed", "forms"), [

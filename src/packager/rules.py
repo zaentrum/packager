@@ -10,6 +10,7 @@ knows the rules only as a worker reports them, and assumes none:
     {"version": "<image commit or release>", "rules": {
       "surroundAudio": "eac3", "surroundLayout": "5.1",
       "surroundBitrate": "448k", "surroundTracks": "shown",
+      "preferredLanguages": ["de", "en"],
       "stereoAudio": "aac", "stereoBitrate": "192k",
       "imageSubtitles": ["pgs", "vobsub"]}}
 
@@ -17,9 +18,15 @@ Every value is the one this process runs with (README "Output", "Audio",
 "Configuration"): the 5.1 companion's codec (`off`: none), the layout it
 is made in (SURROUND_LAYOUT, which the encode asks ffmpeg for), the bit
 rate of an encoded companion, which tracks get one (SURROUND_TRACKS:
-`shown`, those a client offers and the default one, never a track the
-language whitelist hides), the codec and the bit rate of the stereo
-rendition (STEREO_CODEC, STEREO_BITRATE, which its encode is made with), and the forms of image
+`shown`, those a client offers and the default one, a commentary or an
+audio description never; a track the language whitelist hides gets none,
+but where none of those is surround, the first surround track for the
+film keeps its own, hidden, and no other: _surround_plan), the languages
+the default track is picked by, in their order (PREFERRED_LANGUAGES, as
+given, in lower case; empty when it is unset, and then the order of the
+catalog's packager.language_whitelist is: _pick_default_audio), the codec
+and the bit rate of the stereo rendition (STEREO_CODEC, STEREO_BITRATE,
+which its encode is made with), and the forms of image
 subtitles a package carries as they are — what the code really extracts:
 PGS (a `.sup` stream copy) always, VobSub (an `.idx` and `.sub` pair)
 only where mkvextract is installed, and from a Matroska file alone. DVB is
@@ -95,6 +102,7 @@ def rules_payload(options: PackageOptions, version: str | None,
             "surroundLayout": SURROUND_LAYOUT,
             "surroundBitrate": options.surround_bitrate,
             "surroundTracks": SURROUND_TRACKS,
+            "preferredLanguages": list(options.preferred_languages),
             "stereoAudio": STEREO_CODEC,
             "stereoBitrate": STEREO_BITRATE,
             "imageSubtitles": forms,

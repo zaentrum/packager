@@ -24,8 +24,9 @@ Design rules:
   the default one, additionally gets a 5.1 E-AC-3 (or AC-3) rendition,
   first per language, in group "audio-surround", shown or hidden as its
   stereo rendition is, one of more than six channels folded under full
-  scale (_surround_filter); one the language settings hide gets none
-  (_surround_plan).
+  scale (_surround_filter); one the language settings hide gets none,
+  but where none of those is surround, the first surround one for the
+  film keeps its own, hidden (_surround_plan).
   Exactly one rendition per group is DEFAULT=YES: the preferred-language track;
   in the 5.1 group its companion, else the 5.1 rendition of its
   language, else that of the first preferred language with one, else the
@@ -342,8 +343,9 @@ _LIFT_WORKERS = 4
 SURROUND_LAYOUT = "5.1"
 SURROUND_CHANNELS = 6
 # The tracks that get a companion: those a client offers, and the default
-# one ("shown"); a track the language whitelist hides gets none
-# (_surround_plan). The rules report names it (rules.py).
+# one ("shown"); a track the language whitelist hides gets none, but where
+# none of those is surround, the first surround track for the film keeps
+# its own, hidden (_surround_plan). The rules report names it (rules.py).
 SURROUND_TRACKS = "shown"
 _SURROUND_FORMAT = (
     f"aformat=sample_rates=48000:channel_layouts={SURROUND_LAYOUT}(side)|{SURROUND_LAYOUT}"
@@ -1509,24 +1511,29 @@ def _surround_plan(
     such track per language (a second English one would be a duplicate; an
     audio description first in its language would take its main track's
     place). A track the language whitelist hides, and that isn't the
-    default, gets none: no client offers it, and its stereo rendition is
-    made as before; a package whose only surround tracks are hidden so
-    carries no 5.1, which its record's essence says. The default one keeps
-    its companion where it is hidden too (no track shown, or a preferred
-    language the whitelist hides), hidden as its stereo rendition is.
-    Stream-copied when the track already is a 5.1 of the target codec (an
-    E-AC-3 5.1, Atmos included), encoded to 5.1 otherwise: DTS, TrueHD,
-    FLAC, PCM, AC-3 when the target is E-AC-3, a 7.1 downmixed, fewer
-    channels upmixed."""
+    default, gets none where one of those gets one: no client offers it,
+    and its stereo rendition is made as before. Where none of those is
+    surround, though, the first surround track for the film keeps its
+    companion, hidden though it is, and no other: a package keeps a 5.1 of
+    an original that has one, so its record's essence keeps surround and
+    the deletion gate doesn't hold the original for it. The default one
+    keeps its companion where it is hidden too (no track shown, or a
+    preferred language the whitelist hides). A hidden track's companion is
+    hidden as its stereo rendition is. Stream-copied when the track already
+    is a 5.1 of the target codec (an E-AC-3 5.1, Atmos included), encoded to
+    5.1 otherwise: DTS, TrueHD, FLAC, PCM, AC-3 when the target is E-AC-3, a
+    7.1 downmixed, fewer channels upmixed."""
     codec = (options.surround_codec or "off").lower()
     if codec not in _SURROUND_CODECS:
         return []
+    film = [i for i, s in enumerate(streams)
+            if int(s.get("channels") or 0) > 2 and _is_main_audio(s)]
+    offered = [i for i in film if i in visible or i == default_index]
     plan: list[_SurroundTrack] = []
     seen: set[str] = set()
-    for i, s in enumerate(streams):
+    for i in offered or film[:1]:
+        s = streams[i]
         channels = int(s.get("channels") or 0)
-        if channels <= 2 or not _is_main_audio(s) or (i not in visible and i != default_index):
-            continue
         key = _lang_key(_track_language(s))
         if key in seen:
             continue
