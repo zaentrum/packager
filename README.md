@@ -117,8 +117,13 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   VIDEO-RANGE (SDR/PQ/HLG) per rung, so a tone-mapped SDR rung of an
   HDR title is labelled as such.
 - Exactly one DEFAULT=YES per audio group. AUTOSELECT goes on the first
-  visible rendition of each language, so commentary is never
-  auto-picked.
+  visible rendition of each language that is its main audio, and on every
+  visible audio description, whose
+  `CHARACTERISTICS="public.accessibility.describes-video"` says what it is,
+  so that a player picks it where its viewer asks for one (Apple's HLS
+  authoring specification); never on a commentary, which no player should
+  pick by itself. An audio description is one by its stream's disposition
+  or by its title, as its record says.
 - A rendition's NAME is the English name of its language: "English",
   "German", "No dialogue" for `zxx`, "Unknown" for `und`; with the script
   and the region its tag or its source title names in brackets, as the
@@ -144,10 +149,12 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   `captions`, no title that says so) is named as a title that says so
   is, "English · SDH", unless its name says it already (SDH, CC,
   hearing); a forced one is named as forced. So is an audio or a subtitle
-  track that is a commentary by its stream's disposition alone (`comment`):
+  track that is a commentary by its stream's disposition alone (`comment`)
+  or by a title the NAME leaves out ("fr-commentaire", "Commentary (AC3)"):
   "English · Commentary", and an audio track for the blind and visually
-  impaired (`visual_impaired` or `descriptions`): "German · Audio
-  description", unless its name says it already. NAMEs are unique within a
+  impaired (`visual_impaired` or `descriptions`, or such a title): "German
+  · Audio description", unless its name says it already — the NAME says
+  what the record does. NAMEs are unique within a
   group: a second "English" is "English (2)". The names of regions, scripts and
   languages, and which regions are a language's own, are CLDR's as the
   clients' `Intl.DisplayNames` gives them: `src/packager/regions.py`,
@@ -296,8 +303,11 @@ every cue 100 ms after its frame against our fMP4 media, which start
 at 0. The master references them
 (TYPE=SUBTITLES, DEFAULT=NO, FORCED=YES on forced tracks, and on those
 for the deaf and hard of hearing, by their disposition or their title,
-`CHARACTERISTICS="public.accessibility.transcribes-spoken-dialog,public.accessibility.describes-music-and-sound"`)
-only with `HLS_SUBTITLES=true`, which is **off by default**. A track
+`CHARACTERISTICS="public.accessibility.transcribes-spoken-dialog,public.accessibility.describes-music-and-sound"`
+and AUTOSELECT=YES, beside the first track of their language, so that a
+player picks one where its viewer asks for it; AUTOSELECT on a forced
+track and on the first of each language for the dialogue, never on a
+commentary) only with `HLS_SUBTITLES=true`, which is **off by default**. A track
 whose stream's disposition says it is for the deaf and hard of hearing
 (`hearing_impaired` or `captions`) is `hearingImpaired: true` in the
 manifest, and one whose disposition says it is a commentary (`comment`)
