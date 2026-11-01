@@ -316,6 +316,27 @@ and the muxer builds the `hvcC` from the parameter sets of the first
 frame. Nothing is re-encoded; every other stream is copied exactly as
 before.
 
+**HDR10 static metadata.** An HDR10 original's mastering display colour
+volume and content light level are in its container (Matroska's
+`MasteringMetadata`, `MaxCLL`, `MaxFALL`; an MP4's `mdcv` and `clli`
+boxes) and in its bitstream's SEI. shaka-packager writes every init
+segment's sample entry with the decoder configuration (`hvcC`) and the
+colour (`colr`) alone, though the remux it reads has both boxes, and an
+encoded rung's bitstream may carry no SEI: a player that reads the
+metadata from the sample entry got none. So after shaka-packager, the
+init segment of every HEVC rung in PQ — a copy's and an encode's — gets
+the original's two boxes, as FFmpeg's MP4 muxer writes them, after `colr`
+(`packager/hdr10.py`): the values are the original's stream side data,
+else those of its first frames, whatever a rung's own bitstream carries.
+Every box around them grows by their size and nothing else moves (an init
+segment holds no media data and no offsets). Such a rung is
+`hdr10Metadata: true` in the manifest and in a v2 record's `package.json`
+(record logic 8), whose essence then has the HDR10 metadata its source's
+has, the rung a copy or an encode. The init segment of an SDR rung,
+an HLG one and every rung of an original without the metadata is
+shaka-packager's, byte for byte; one the packager can't read is left as it
+is, logged (`packager.hdr10.not_written`).
+
 **Compatibility.** Rendition dirs stay `vN` / `aN`, so the existing
 playback routes serve every rung and both audio groups. `renditions.video[0]`
 is still the top rung. Before a ladder is enabled, the playback service
