@@ -143,7 +143,11 @@ bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:
   of hearing by its stream's disposition alone (`hearing_impaired` or
   `captions`, no title that says so) is named as a title that says so
   is, "English · SDH", unless its name says it already (SDH, CC,
-  hearing); a forced one is named as forced. NAMEs are unique within a
+  hearing); a forced one is named as forced. So is an audio or a subtitle
+  track that is a commentary by its stream's disposition alone (`comment`):
+  "English · Commentary", and an audio track for the blind and visually
+  impaired (`visual_impaired` or `descriptions`): "German · Audio
+  description", unless its name says it already. NAMEs are unique within a
   group: a second "English" is "English (2)". The names of regions, scripts and
   languages, and which regions are a language's own, are CLDR's as the
   clients' `Intl.DisplayNames` gives them: `src/packager/regions.py`,
@@ -296,7 +300,9 @@ for the deaf and hard of hearing, by their disposition or their title,
 only with `HLS_SUBTITLES=true`, which is **off by default**. A track
 whose stream's disposition says it is for the deaf and hard of hearing
 (`hearing_impaired` or `captions`) is `hearingImpaired: true` in the
-manifest. The clients draw the
+manifest, and one whose disposition says it is a commentary (`comment`)
+`commentary: true`, as an audio track is (and `visualImpaired: true` for
+one for the blind and visually impaired). The clients draw the
 sidecars themselves, and the playback API doesn't route `sN/` yet.
 Turning it on changes the master only; the renditions are already on
 disk. In the manifest, at most one subtitle is `default`: a visible
@@ -636,7 +642,14 @@ and hard of hearing as the original's disposition says (`hearingImpaired`,
 which the record logic reads as that disposition): such a subtitle is
 `sdh` by `disposition` in `package.json`, its language one of the
 package's `sdhSubtitleLanguages` as it is of the source's, even where the
-transcoder's encode lost the flag (Matroska has none for `captions`). A
+transcoder's encode lost the flag (Matroska has none for `captions`). So
+too an audio or a subtitle track whose stream is a commentary
+(`commentary`) and an audio track for the blind and visually impaired
+(`visualImpaired`: `visual_impaired` or `descriptions`, which Matroska has
+no word for): such a track is a `commentary` or a `description` by
+`disposition`, counted in the package's `commentaryTracks`,
+`commentarySubtitles` and `audioDescriptionTracks` as the source's stream
+is. A
 subtitle made from a file that came with the
 original names its copy (`fromSidecar: "sources/<sourceId>/subtitle-<n>…"`):
 the file the copy was made from, or the copy itself, by its path, else a
