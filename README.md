@@ -186,13 +186,19 @@ track tagged `und` (unknown) or `zxx` (no dialogue) is always visible.
 **Audio.** Every source track becomes an AAC-LC 48 kHz stereo rendition
 in group `audio`, as before. With `SURROUND_AUDIO` set (`eac3`; it is
 `off` unless the platform turns it on), every surround track — more than
-two channels, as a library record's essence counts surround — also gets
-a 5.1 E-AC-3 rendition in group `audio-surround`, the first per
-language, commentaries and audio descriptions excluded (one first in its
-language would take its main track's 5.1): a film in four languages keeps a 5.1 in
-each, and a stereo film gets none. A track the language whitelist hides
-gets its companion too, hidden as its stereo rendition is (the package
-keeps what the original carries). An E-AC-3 5.1 (Atmos included) is
+two channels, as a library record's essence counts surround — that a
+client is offered also gets a 5.1 E-AC-3 rendition in group
+`audio-surround`, the first per language, commentaries and audio
+descriptions excluded (one first in its language would take its main
+track's 5.1): a film in four languages keeps a 5.1 in each, and a stereo
+film gets none. A track the language whitelist hides gets none: no client
+offers it, and its stereo rendition is made as before, packet for packet.
+The default one (DEFAULT=YES, and played whatever the settings show) keeps
+its companion where it is hidden too — no track shown, or
+`PREFERRED_LANGUAGES` naming a hidden language — hidden as its stereo
+rendition is. A package whose only surround tracks are hidden carries no
+5.1, and its v2 record says so: its essence has no `surround`, and the
+deletion gate names it. An E-AC-3 5.1 (Atmos included) is
 stream-copied, bit for bit; anything else is encoded to a 5.1 at 448k: a
 7.1 downmixed (a 5.1 can't keep its two extra channels, which a v2
 record's deletion gate still names as lost), fewer channels upmixed.
@@ -725,15 +731,18 @@ and a client of its own:
 ```
 PUT /api/analyze/rules/packager
 {"version": "3f2a9c1", "rules": {"surroundAudio": "eac3", "surroundLayout": "5.1",
-  "surroundBitrate": "448k", "stereoAudio": "aac", "stereoBitrate": "192k",
-  "imageSubtitles": ["pgs", "vobsub"]}}
+  "surroundBitrate": "448k", "surroundTracks": "shown", "stereoAudio": "aac",
+  "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"]}}
 ```
 
 Every value is the one the process runs with: `SURROUND_AUDIO` (`off`: no
 5.1 companion), the layout the companion is made in (an encode is asked
 for it, and a source track of it in the target codec is copied),
 `SURROUND_BITRATE` (what an encoded companion is made at;
-an E-AC-3 5.1 is copied as it is), the stereo rendition's codec and bit
+an E-AC-3 5.1 is copied as it is), which tracks get a companion
+(`shown`: those a client is offered and the default one, never one the
+language whitelist hides; a packager that doesn't say gave one to every
+surround track), the stereo rendition's codec and bit
 rate (AAC at 192k, what its encode is made with), and the
 forms of image subtitles a package carries as they are, as the extraction
 writes them: PGS always, VobSub where `mkvextract` and `mkvmerge` are
