@@ -27,8 +27,8 @@ from packager import library, records
 from packager import libv2_records as rec
 from packager.katalog import ClaimedItem
 
-# zaentrum/schemas ac56d0aae4a77df6a6b328727376446645e82c8a, tools/libv2_records.py
-SHA256 = "92792f5fb60b8c85607f89872d90a8d753d4ff2ead8dbc47a2da0700f8120baf"
+# zaentrum/schemas 5154e165285c3f8a844324fe128a73d966a59afb, tools/libv2_records.py
+SHA256 = "67991f7afa8009820a090c27083bd618069e9bdc412c0147d53376cbf784431a"
 LIBV2_RECORDS = 9
 
 GOLDEN = Path(__file__).parent / "fixtures" / "libv2_records"

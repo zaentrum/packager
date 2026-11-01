@@ -461,15 +461,18 @@ def dispositions(s):
 
 
 # The words a title says a track is a commentary with, and those that take them back: one of them
-# after a negation ("No commentary", "without the director's commentary", "ohne Kommentar", "keine
-# Kommentare", "sans commentaire", "sin comentarios", "senza commento", "zonder commentaar",
-# "non-commentary") or a word that says it itself ("Kommentarlos", "kommentarfrei",
-# "commentary-free").
+# right after a negation, or past an article or a possessive alone ("No commentary", "without the
+# director's commentary", "ohne Kommentar", "keine Kommentare", "sans commentaire", "sin comentarios",
+# "senza commento", "zonder commentaar", "non-commentary"), or a word that says it itself
+# ("Kommentarlos", "kommentarfrei", "commentary-free"). A negation of anything else leaves the
+# commentary one: "No-spoiler commentary", "Sin City commentary", "Without Remorse - Commentary".
 COMMENTARY_WORDS = r"commentary|kommentar|commentaire|comentario|commento|commentaar"
+_ARTICLE_OR_POSSESSIVE = (r"(?:the|any|a|an|audio|director(?:'|’)?s|des|del|di|van|de|der|die|das|le|la|el)"
+               r"[\s\-]+")
 NO_COMMENTARY_RE = re.compile(
-    r"\b(?:no|without|w/o|ohne|keine?[nrs]?|sans|sin|senza|zonder|geen)[\s\-:]+(?:[\w'’]+[\s\-]+){0,2}?"
+    r"\b(?:no|without|w/o|ohne|keine?[nrs]?|sans|sin|senza|zonder|geen)[\s\-:]+(?:" + _ARTICLE_OR_POSSESSIVE + r"){0,3}"
     r"(?:" + COMMENTARY_WORDS + r"|comments?)|\bnon[\s\-]?(?:" + COMMENTARY_WORDS + r")"
-    r"|kommentar(?:los|frei)|commentary[\s\-]?free", re.I)
+    r"|kommentar[\s\-]?(?:los|frei)|commentary[\s\-]?free", re.I)
 
 
 def says_commentary(title):
