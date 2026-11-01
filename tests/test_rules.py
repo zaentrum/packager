@@ -82,13 +82,16 @@ def test_the_tracks_are_those_the_plan_gives_a_companion() -> None:
     assert [t.source_index for t in plan] == [0]
 
 
-@pytest.mark.parametrize(("setting", "preferred"), [
-    ("", []),
-    ("de,en", ["de", "en"]),
-    (" DE , en,, ", ["de", "en"]),
+@pytest.mark.parametrize(("setting", "preferred", "default_index"), [
+    ("", [], 0),
+    ("de,en", ["de", "en"], 1),
+    (" DE , en,, ", ["de", "en"], 1),
+    # in the order set, not sorted: the catalog picks the default by it
+    ("ja,en", ["ja", "en"], 0),
 ])
 def test_the_preferred_languages_are_those_the_default_is_picked_by(setting: str,
-                                                                    preferred: list[str]) -> None:
+                                                                    preferred: list[str],
+                                                                    default_index: int) -> None:
     # PREFERRED_LANGUAGES as the packager reads it, in its order; empty when
     # unset, and then the catalog's whitelist order picks the default
     from packager import packager
@@ -100,7 +103,7 @@ def test_the_preferred_languages_are_those_the_default_is_picked_by(setting: str
                {"codec_name": "aac", "channels": 2, "tags": {"language": "ger"}}]
     whitelist = ["en", "de"]
     default = packager._pick_default_audio(streams, {0, 1}, preferred or whitelist)
-    assert default == (1 if preferred else 0)
+    assert default == default_index
 
 
 def test_the_payload_says_the_values_this_process_runs_with() -> None:
