@@ -96,6 +96,20 @@ def test_a_title_that_says_no_commentary_is_none(title: str) -> None:
     assert [t.source_index for t in pk._surround_plan(streams, {0, 1}, pk.PackageOptions())] == [0]
 
 
+@pytest.mark.parametrize("title", [
+    "Comentario del director", "Commento del regista", "Commentaar van de regisseur",
+    "Commentaire du réalisateur", "Director's Commentary", "Kommentar",
+])
+def test_a_commentary_in_any_language_the_record_reads_is_one(title: str) -> None:
+    # The packager reads a commentary's title as the record logic does
+    # (says_commentary): first in its language, it is neither the default nor
+    # that language's 5.1, whatever language its title is in.
+    streams = [_a("spa", 6, "dts", title=title), _a("spa", 6, "dts")]
+    assert pk._is_commentary(streams[0]) and not pk._is_commentary(streams[1])
+    assert pk._pick_default_audio(streams, {0, 1}, ["es"]) == 1
+    assert [t.source_index for t in pk._surround_plan(streams, {0, 1}, pk.PackageOptions())] == [1]
+
+
 def test_an_audio_description_gets_no_companion_its_main_track_does() -> None:
     # An audio description in 5.1 first in its language would take its main
     # track's 5.1: it is skipped, as a commentary is.

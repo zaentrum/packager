@@ -1402,14 +1402,13 @@ def _visible_indices(
 
 
 def _is_commentary(stream: dict[str, Any]) -> bool:
-    """Whether an audio track is a commentary: its disposition says so
-    (comment), or its title has "comment" or "kommentar" in it that no
-    negation takes back — "No commentary", "Kommentarlos", "sans
-    commentaire" say a track is none, as the record logic reads them
-    (libv2_records' NO_COMMENTARY_RE)."""
+    """Whether an audio track is a commentary, as the record logic reads its
+    stream: its disposition says so (comment), or its title does
+    (libv2_records' says_commentary: "Commentary", "Kommentar",
+    "Commentaire", "Comentario", "Commento", "Commentaar", unless a negation
+    takes it back, as "No commentary" and "Kommentarlos" do)."""
     disp = stream.get("disposition") or {}
-    title = rec.NO_COMMENTARY_RE.sub(" ", (stream.get("tags") or {}).get("title") or "").lower()
-    return bool(disp.get("comment")) or "comment" in title or "kommentar" in title
+    return bool(disp.get("comment")) or rec.says_commentary((stream.get("tags") or {}).get("title"))
 
 
 def _is_description(stream: dict[str, Any]) -> bool:
