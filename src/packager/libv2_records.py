@@ -74,8 +74,16 @@ import copy, datetime, hashlib, json, os, re, shutil, subprocess, uuid
 # full check holds its bytes to its name. Every record 5 and 6 write is the one before. 7: a subtitle
 # whose manifest entry says the stream it was made from is for the hard of hearing (hearingImpaired:
 # its disposition said hearing_impaired or captions) is sdh by that disposition, as the stream is in
-# its source's essence; a manifest that says nothing of it gives the record it gave.
-LIBV2_RECORDS = 7
+# its source's essence; a manifest that says nothing of it gives the record it gave. 8: a video
+# rendition whose manifest entry says its init segment carries the original's HDR10 static metadata
+# (hdr10Metadata: its mdcv and clli boxes) says so in its record, and the package's essence has the
+# HDR10 metadata a source had when one does, as when its top rendition is the original's own stream
+# in PQ; an audio rendition whose entry says the stream it was made from is a commentary
+# (commentary: its disposition said comment) or for the visually impaired (visualImpaired:
+# visual_impaired or descriptions), and a subtitle whose entry says its stream is a commentary
+# (commentary), are for that by their disposition, as the stream is in its source's essence; a
+# manifest that says none of it gives the record it gave.
+LIBV2_RECORDS = 8
 
 NS = uuid.uuid5(uuid.NAMESPACE_URL, "https://zaentrum.github.io/schemas/library")
 PACKAGE_DIRS = ("hls", "subs", "trickplay", "trailers")
@@ -637,7 +645,9 @@ def package_essence(man, source=None):
     renditions.audioSurround count for the channels and the languages it carries; a track is counted
     once, by its stereo rendition, for what a track is for. A top video rendition that is the
     original's own stream, copied (encoder 'copy'), in PQ, carries the HDR10 metadata in its bitstream
-    when the original — source, its essence — had it; anything re-encoded is taken to have lost it."""
+    when the original — source, its essence — had it, and so does a package with a video rendition
+    whose init segment carries the original's (hdr10Metadata), encoded or not; anything else re-encoded
+    is taken to have lost it."""
     ren = man.get("renditions") or {}
     vids, auds = ren.get("video") or [], ren.get("audio") or []
     every = auds + (ren.get("audioSurround") or [])
@@ -645,12 +655,14 @@ def package_essence(man, source=None):
     v0 = vids[0] if vids else {}
     codec = v0.get("codec") or ""
     copied_pq = v0.get("encoder") == "copy" and v0.get("videoRange") == "PQ"
+    declared = any(x.get("hdr10Metadata") is True for x in vids)
     return {
         "maxAudioChannels": max([x.get("channels") or 0 for x in every], default=0),
         "surround": any((x.get("channels") or 0) > 2 for x in every),
         "losslessAudio": False, "objectAudio": False, "maxVideoHeight": v0.get("height"),
         "videoBitDepth": 10 if codec.startswith(("hev1.2", "hvc1.2")) else (8 if codec else None),
-        "hdr10Metadata": bool(copied_pq and (source or {}).get("hdr10Metadata")), "dolbyVision": False,
+        "hdr10Metadata": bool((copied_pq or declared) and (source or {}).get("hdr10Metadata")),
+        "dolbyVision": False,
         "stereo3d": False, "interlaced": False,
         "audioLanguages": sorted({lang(x.get("language"))[0] for x in every if x.get("language")}),
         "subtitleLanguages": sorted({lang(x.get("language"))[0] for x in subs if x.get("language")}),
@@ -1040,12 +1052,16 @@ def video_rendition(v):
     for key in ("label", "encoder"):
         if text(v.get(key)):
             out[key] = text(v[key])
+    if v.get("hdr10Metadata") is True:
+        out["hdr10Metadata"] = True
     return out
 
 
 def audio_rendition(a, i):
     title = text(a.get("title")) or ""
-    purpose, purpose_from = audio_purpose({"disposition": {}, "tags": {"title": title}})
+    purpose, purpose_from = audio_purpose({"disposition": {"comment": bool(a.get("commentary")),
+                                                           "visual_impaired": bool(a.get("visualImpaired"))},
+                                           "tags": {"title": title}})
     out = {"id": text(a.get("id")) or f"a{i}", "dir": a.get("dir") or f"hls/a{i}", "codec": a.get("codec") or "",
            "language": rendition_language(a.get("language")), "title": title, "default": bool(a.get("default")),
            "channels": num(a.get("channels")) or 0, "bitrateBps": num(a.get("bitrateBps")) or 0,
@@ -1065,7 +1081,8 @@ def audio_rendition(a, i):
 def subtitle_rendition(s, i, from_sidecar=None):
     title = text(s.get("title")) or ""
     purpose, purpose_from = subtitle_purpose({"disposition": {"forced": bool(s.get("forced")),
-                                                              "hearing_impaired": bool(s.get("hearingImpaired"))},
+                                                              "hearing_impaired": bool(s.get("hearingImpaired")),
+                                                              "comment": bool(s.get("commentary"))},
                                               "tags": {"title": title}})
     out = {"id": text(s.get("id")) or f"sub{i}", "path": s.get("path") or f"subs/{i}.vtt",
            "language": rendition_language(s.get("language")), "title": title, "default": bool(s.get("default")),
@@ -1194,8 +1211,12 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
     file it was made from, as its source's sidecars[] names it (sources/<sourceId>/subtitle-<n>…),
     relative to the item folder. A subtitle is for what its manifest entry says, read as a source's
     stream is (subtitle_purpose): its forced flag, whether the stream it was made from is for the hard
-    of hearing (hearingImpaired, as that stream's disposition said), then its title — so a stream sdh
-    by its disposition alone is sdh in both essences. The playlist flags a reader could
+    of hearing (hearingImpaired, as that stream's disposition said) or a commentary (commentary), then
+    its title — so a stream sdh or a commentary by its disposition alone is so in both essences; an
+    audio rendition likewise (audio_purpose): a commentary (commentary), for the visually impaired
+    (visualImpaired), then its title. A video rendition whose init segment carries the original's
+    HDR10 static metadata (hdr10Metadata) says so, and the package's essence has it when the source's
+    has (package_essence). The playlist flags a reader could
     not follow are normalised, each with a note: a second default audio rendition is not one, a
     package with none has its first, a forced subtitle is never the default, and of the rest only
     the first default is one."""
