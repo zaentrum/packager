@@ -3494,6 +3494,26 @@ def _hdr10_metadata(inputs: PackageInputs, probe: _Probe, original: Path,
     return hdr10.of_original(inputs.primary.path, probe.video, probe.video_index)
 
 
+def _write_hdr10(videos: list[_StagedVideo], hls_dir: Path,
+                 metadata: hdr10.StaticMetadata | None) -> set[str]:
+    """Write `metadata` into the init segment of every HEVC rung in PQ
+    (hdr10.py), and return those rungs; none without metadata. All or
+    nothing: a rung whose init segment can't take the boxes fails the run
+    (PackageError), so that a package never says its rungs carry the
+    metadata while one of them lacks it."""
+    if metadata is None:
+        return set()
+    rungs = [v.rung.id for v in videos if _carries_hdr10(v.probe.video)]
+    failed = [rid for rid in rungs if not hdr10.write_into(hls_dir / rid / "init.mp4", metadata)]
+    log.info("packager.hdr10.boxes", rungs=rungs or None, failed=failed or None,
+             found_in=metadata.found_in, mastering=metadata.mastering is not None,
+             light_level=metadata.light_level is not None)
+    if failed:
+        raise PackageError(f"the init segment of {', '.join(failed)} can't take the original's "
+                           "HDR10 static metadata (packager.hdr10.not_written)")
+    return set(rungs)
+
+
 def _run_shaka_packager(
     primary: Path,
     videos: list[_StagedVideo],
@@ -3514,8 +3534,8 @@ def _run_shaka_packager(
 
     With `hdr10_metadata`, the init segment of every HEVC rung in PQ gets
     its mdcv and clli boxes, which shaka leaves out (hdr10.py), and its
-    manifest entry says so (`hdr10Metadata`); every other init segment is
-    shaka's as it wrote it.
+    manifest entry says so (`hdr10Metadata`), all of them or the run fails
+    (_write_hdr10); every other init segment is shaka's as it wrote it.
 
     shaka-packager selects streams by absolute MP4 stream index when
     given a number, or by type ("video"/"audio"/"text") to pick the first
@@ -3560,14 +3580,7 @@ def _run_shaka_packager(
     (out_root / scratch).unlink(missing_ok=True)
 
     # ---- the HDR10 static metadata shaka leaves out of the PQ rungs' init
-    with_hdr10: set[str] = set()
-    if hdr10_metadata is not None:
-        with_hdr10 = {v.rung.id for v in videos if _carries_hdr10(v.probe.video)
-                      and hdr10.write_into(hls_dir / v.rung.id / "init.mp4", hdr10_metadata)}
-        log.info("packager.hdr10.boxes", rungs=sorted(with_hdr10) or None,
-                 found_in=hdr10_metadata.found_in,
-                 mastering=hdr10_metadata.mastering is not None,
-                 light_level=hdr10_metadata.light_level is not None)
+    with_hdr10 = _write_hdr10(videos, hls_dir, hdr10_metadata)
 
     # ---- video
     video_meta: list[dict[str, Any]] = []

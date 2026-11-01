@@ -10,14 +10,16 @@ SEI. FFmpeg's MP4 muxer writes both boxes from a stream's side data, so the
 remux shaka-packager packages from has them, but shaka-packager rewrites
 every init segment's sample entry with the decoder configuration (`hvcC`)
 and the colour (`colr`) alone: none of its releases writes either box. A
-player that reads the metadata from the sample entry, as most do with
-fMP4 in HLS, gets none, and an encoded rung's bitstream may carry no SEI
-either.
+copied rung keeps the original's SEI, in its samples and wherever the
+encoder put it among `hvcC`'s parameter sets, but a player that reads the
+metadata from the sample entry, as most do with fMP4 in HLS, gets none
+there, and an encoded rung's bitstream may carry no SEI at all.
 
 So after shaka the packager writes the two boxes into the visual sample
 entry of every HEVC rung in PQ, with the original's values: its stream
-side data, else that of its first frames (the SEI). An encoded rung takes
-the original's whatever its own bitstream carries. The boxes are FFmpeg's
+side data, and what that leaves out from its first frames (the SEI). An
+encoded rung takes the original's whatever its own bitstream carries. The
+boxes are FFmpeg's
 (movenc.c): `clli` then `mdcv`, after `colr`, big-endian; every box around
 them grows by their size, and nothing else in the file moves. An init
 segment holds no media data and no chunk offsets, so nothing points past
@@ -76,7 +78,8 @@ class StaticMetadata:
     a source can carry one without the other."""
     mastering: tuple[int, ...] | None = None
     light_level: tuple[int, int] | None = None
-    # Where the values were read: "stream" (the container's) or "frames".
+    # Where the values were read: "stream" (the container's), "frames" (the
+    # first frames' SEI) or "stream+frames" (each kind from where it was).
     found_in: str = "stream"
 
     def boxes(self) -> bytes:
@@ -171,16 +174,38 @@ def _probe(args: list[str]) -> dict[str, Any] | None:
 def of_original(path: Path, stream: dict[str, Any] | None = None,
                 stream_index: int | None = None) -> StaticMetadata | None:
     """The static metadata of the original's video stream: its stream side
-    data (`stream`, its ffprobe entry, when the caller has one), else the
-    side data of its first frames. None when it has none."""
+    data (`stream`, its ffprobe entry, when the caller has one), and of the
+    two kinds what that leaves out — a container can say the mastering
+    display and leave the content light level to the SEI — from its first
+    frames (_first_frames). None when it has neither."""
     select = str(stream_index) if stream_index is not None else "v:0"
     if stream is None:
         data = _probe(["-select_streams", select, "-show_streams", str(path)])
         streams = (data or {}).get("streams") or []
         stream = streams[0] if streams and isinstance(streams[0], dict) else {}
     found = from_side_data(stream.get("side_data_list"))
-    if found is not None:
+    mastering = found.mastering if found is not None else None
+    light = found.light_level if found is not None else None
+    if mastering is not None and light is not None:
         return found
+    framed = _first_frames(path, select)
+    taken = False
+    if framed is not None and mastering is None and framed.mastering is not None:
+        mastering, taken = framed.mastering, True
+    if framed is not None and light is None and framed.light_level is not None:
+        light, taken = framed.light_level, True
+    if mastering is None and light is None:
+        return None
+    found_in = ("stream+frames" if found is not None and taken
+                else "frames" if taken else "stream")
+    return StaticMetadata(mastering, light, found_in)
+
+
+def _first_frames(path: Path, select: str) -> StaticMetadata | None:
+    """The static metadata of a stream's first frames (_FIRST_FRAMES), as
+    its decoder reads their SEI: the first mastering display and the first
+    content light level among them, each from whichever frame has it. None
+    when they hold neither."""
     data = _probe(["-select_streams", select, "-read_intervals", f"%+#{_FIRST_FRAMES}",
                    "-show_frames", "-show_entries", "frame=side_data_list", str(path)])
     mastering = light = None
@@ -189,8 +214,8 @@ def of_original(path: Path, stream: dict[str, Any] | None = None,
             continue
         got = from_side_data(frame.get("side_data_list"), "frames")
         if got is not None:
-            mastering = mastering or got.mastering
-            light = light or got.light_level
+            mastering = mastering if mastering is not None else got.mastering
+            light = light if light is not None else got.light_level
         if mastering is not None and light is not None:
             break
     if mastering is None and light is None:

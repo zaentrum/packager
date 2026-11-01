@@ -14,8 +14,10 @@ every frame decodes, and shaka-packager reads the rendition again.
 package.json says so per rung, its essence has the metadata, and deleting
 the original no longer costs it, where the encode's package lost it
 before. An original with the metadata in its bitstream alone gives its
-first frames'. The init segment of an SDR rung, of an HLG original and of
-a PQ original without the metadata is shaka-packager's, byte for byte."""
+first frames', and one whose container says one kind of it the other from
+them. A rung that can't take the boxes fails the run. The init segment of
+an SDR rung, of an HLG original and of a PQ original without the metadata
+is shaka-packager's, byte for byte."""
 
 from __future__ import annotations
 
@@ -89,8 +91,9 @@ def _in_frames(path: Path) -> list[str]:
 def films(tmp_path_factory) -> dict[str, Path]:
     """4 s 10-bit HEVC films with an English stereo track, each in its
     arrival folder: HDR10 (the metadata in the container and the
-    bitstream), SEI (in the bitstream alone), BARE (PQ, without it), HLG
-    and SDR. Skips where this ffmpeg makes them otherwise."""
+    bitstream), SEI (in the bitstream alone), PART (its container says the
+    mastering display alone, its bitstream both), BARE (PQ, without it),
+    HLG and SDR. Skips where this ffmpeg makes them otherwise."""
     d = tmp_path_factory.mktemp("hdr10")
     out: dict[str, Path] = {}
 
@@ -108,13 +111,20 @@ def films(tmp_path_factory) -> dict[str, Path]:
     # container too.
     film("HDR10", "-i", str(out["SEI"]), "-map", "0", "-c:v", "libx265", "-preset", "ultrafast",
          "-x265-params", X265)
+    # Encoded from frames that carry the mastering display alone, with
+    # MaxCLL and MaxFALL the encoder's own: the container says the one, the
+    # bitstream both.
+    film("PART", "-i", str(out["SEI"]), "-map", "0", "-vf",
+         "sidedata=mode=delete:type=CONTENT_LIGHT_LEVEL", "-c:v", "libx265", "-preset",
+         "ultrafast", "-x265-params", f"{X265}:max-cll=1404,1000")
     film("BARE", *picture, "-vf", f"{PQ},format=yuv420p10le", "-x265-params", X265)
     film("HLG", *picture, "-vf", f"{HLG},format=yuv420p10le", "-x265-params", X265)
     film("SDR", *picture, "-vf", f"{SDR},format=yuv420p10le", "-x265-params", X265)
     made = {name: (_stream(path).get("color_transfer"), _side_data(_stream(path).get(
         "side_data_list")), _in_frames(path)) for name, path in out.items()}
     want = {"HDR10": ("smpte2084", [LIGHT, MASTERING], [LIGHT, MASTERING]),
-            "SEI": ("smpte2084", [], [LIGHT, MASTERING]), "BARE": ("smpte2084", [], []),
+            "SEI": ("smpte2084", [], [LIGHT, MASTERING]),
+            "PART": ("smpte2084", [MASTERING], [LIGHT, MASTERING]), "BARE": ("smpte2084", [], []),
             "HLG": ("arib-std-b67", [], []), "SDR": ("bt709", [], [])}
     if made != want:
         pytest.skip(f"this ffmpeg makes other films than these tests need: {made}")
@@ -150,10 +160,10 @@ def _ladder(original: Path, inbox: Path) -> None:
                    "encoder": "hevc_nvenc"}]}))
 
 
-def _v2(tmp_path: Path, film: Path, *, ladder: bool = False) -> tuple[Path, Path, dict, dict]:
+def _run(tmp_path: Path, film: Path, *, ladder: bool = False) -> tuple[Path, Path, Catalog]:
     """One v2 run of film through the worker, on the transcoder's ladder or
-    from the original: the library root, the version folder, the package
-    record and the source record."""
+    from the original: the library root, the title's folder and what the
+    catalog was told."""
     lib, work = tmp_path / "library", tmp_path / "work"
     arrival = work / "incoming" / film.parent.name
     shutil.copytree(film.parent, arrival)
@@ -180,6 +190,13 @@ def _v2(tmp_path: Path, film: Path, *, ladder: bool = False) -> tuple[Path, Path
     catalog = Catalog()
     worker._process_one(ClaimedItem.from_json(record), catalog,  # type: ignore[arg-type]
                         pk.PackageOptions(surround_codec="off", stereo_loudness=None))
+    return lib, item_dir, catalog
+
+
+def _v2(tmp_path: Path, film: Path, *, ladder: bool = False) -> tuple[Path, Path, dict, dict]:
+    """One v2 run of film that is done: the library root, the version
+    folder, the package record and the source record."""
+    lib, item_dir, catalog = _run(tmp_path, film, ladder=ladder)
     assert [s for s, _ in catalog.written] == ["in_progress", "done"], catalog.written
     vdir = item_dir / "versions" / VERSION
     package = json.loads((vdir / "package.json").read_text())
@@ -312,6 +329,37 @@ def test_metadata_in_the_bitstream_alone_is_read_from_the_first_frames(
     assert source["essence"]["hdr10Metadata"] is package["essence"]["hdr10Metadata"] is False
     assert rec.deletion_gate([source["essence"]], package["essence"]) == []
     _validate(lib, hdr10=True)
+
+
+def test_what_the_container_leaves_out_comes_from_the_first_frames(
+    tmp_path: Path, films: dict[str, Path],
+) -> None:
+    # Its container says the mastering display, and MaxCLL and MaxFALL are
+    # in its SEI alone: the init segment gets both, as the original has them.
+    lib, vdir, package, source = _v2(tmp_path, films["PART"])
+    assert package["renditions"]["video"][0].get("hdr10Metadata") is True
+    init = (vdir / "hls" / "v0" / "init.mp4").read_bytes()
+    assert [k for k, _ in _children(init)] == [b"hvcC", b"colr", b"clli", b"mdcv"]
+    assert _played(vdir / "hls" / "v0", tmp_path)[0] == CLLI + MDCV
+    assert source["essence"]["hdr10Metadata"] is package["essence"]["hdr10Metadata"] is True
+    assert rec.deletion_gate([source["essence"]], package["essence"]) == []
+    _validate(lib, hdr10=True)
+
+
+def test_a_rung_that_cant_take_the_metadata_fails_the_run(
+    tmp_path: Path, films: dict[str, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Whichever PQ rung's init segment can't take the boxes, no package
+    # comes of the run: one would say its rungs carry the metadata while one
+    # of them lacks it, and its original could go.
+    write = hdr10.write_into
+    for rung in ("v0", "v1"):
+        monkeypatch.setattr(hdr10, "write_into", lambda path, metadata, rung=rung: (
+            path.parent.name != rung and write(path, metadata)))
+        lib, item_dir, catalog = _run(tmp_path / rung, films["HDR10"], ladder=True)
+        assert [s for s, _ in catalog.written] == ["in_progress", "failed"], catalog.written
+        assert f"init segment of {rung} can't take" in catalog.written[1][1]["error"]
+        assert not (item_dir / "versions").exists() and catalog.handovers == []
 
 
 @pytest.mark.parametrize("name", ["SDR", "HLG", "BARE"])

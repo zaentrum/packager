@@ -5,9 +5,12 @@ the form a frame gives it; they go into the sample entry after its colr,
 and every box around them grows by their size and nothing else moves; an
 init segment that holds them is left as it is, and one the module can't
 take — media data, chunk offsets, another track or sample entry — is left
-as it was. Which rungs get them, and from where, without running ffprobe.
-The real runs, through the packager and back through ffprobe, are in
-test_hdr10_real.py."""
+as it was, as is one whose write fails halfway. A value is rounded as
+FFmpeg rounds it. Which rungs get them — every HEVC rung in PQ, or the run
+fails — and from where: the container's, and what it leaves out from the
+first frames, each kind from the frame that has it; without running
+ffprobe. The real runs, through the packager and back through ffprobe, are
+in test_hdr10_real.py."""
 
 from __future__ import annotations
 
@@ -123,6 +126,18 @@ def test_what_side_data_does_not_say_is_not_written() -> None:
     assert hdr10.from_side_data([*FRAME_FORM, second]).light_level == (1404, 1000)
 
 
+def test_a_value_is_rounded_as_ffmpeg_rounds_it() -> None:
+    # A Matroska colour value is a 32-bit float: D65's 0.329 is
+    # 689963/2097152, a hair under 16450/50000. FFmpeg's av_rescale rounds
+    # it to the nearest, 16450, which the box then says; cut off, it would
+    # be 16449. Half of a unit goes up.
+    d65 = hdr10.from_side_data([{**MATROSKA_FORM[1], "white_point_y": "689963/2097152"}])
+    assert d65 is not None and d65.mastering is not None
+    assert d65.mastering[7] == 16450 and d65.boxes() == MDCV
+    half = hdr10.from_side_data([{**FRAME_FORM[0], "red_x": "1/100000"}])
+    assert half is not None and half.mastering is not None and half.mastering[4] == 1
+
+
 def children(segment: bytes) -> list[bytes]:
     """The types of the boxes in the sample entry of an init segment."""
     return sorted(hdr10.held_boxes(segment))
@@ -235,6 +250,25 @@ def test_writing_into_a_file(tmp_path: Path) -> None:
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_a_write_that_fails_halfway_leaves_the_init_segment_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The boxes go into a file beside it, which replaces it once whole: a
+    # disk that fills up halfway costs the boxes, never the init segment.
+    segment = tmp_path / "init.mp4"
+    segment.write_bytes(init())
+    write = Path.write_bytes
+
+    def halfway(path: Path, data: bytes) -> int:
+        write(path, data[:len(data) // 2])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_bytes", halfway)
+    assert not hdr10.write_into(segment, METADATA)
+    assert segment.read_bytes() == init()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["init.mp4"]
+
+
 # ---- which rungs, and from where
 
 def _stream(transfer: str | None, codec: str = "hevc", side_data: list | None = None) -> dict:
@@ -251,6 +285,35 @@ def _probe(stream: dict) -> pk._Probe:
 def _staged(rung: str, stream: dict) -> pk._StagedVideo:
     return pk._StagedVideo(VideoInput(rung, Path(f"/w/{rung}.mkv")), Path(f"/t/{rung}.mp4"),
                            _probe(stream))
+
+
+def test_every_pq_rung_takes_them_or_the_run_fails(tmp_path: Path) -> None:
+    hls = tmp_path / "hls"
+    videos = [_staged("v0", _stream("smpte2084")), _staged("v1", _stream("smpte2084")),
+              _staged("v2", _stream("bt709"))]
+
+    def fresh(broken: str | None = None) -> None:
+        for rung in ("v0", "v1", "v2"):
+            (hls / rung).mkdir(parents=True, exist_ok=True)
+            (hls / rung / "init.mp4").write_bytes(init(handler=b"soun") if rung == broken
+                                                  else init())
+
+    fresh()
+    assert pk._write_hdr10(videos, hls, METADATA) == {"v0", "v1"}
+    assert children((hls / "v0" / "init.mp4").read_bytes()) == \
+        children((hls / "v1" / "init.mp4").read_bytes()) == \
+        sorted([b"hvcC", b"colr", b"clli", b"mdcv"])
+    assert (hls / "v2" / "init.mp4").read_bytes() == init()
+    # One that can't take them, whichever it is, fails the run: a package
+    # never says its rungs carry the metadata while one of them lacks it.
+    for broken in ("v0", "v1"):
+        fresh(broken)
+        with pytest.raises(pk.PackageError, match=f"init segment of {broken} can't take"):
+            pk._write_hdr10(videos, hls, METADATA)
+    # Without metadata, nothing is written and none says it.
+    fresh()
+    assert pk._write_hdr10(videos, hls, None) == set()
+    assert all((hls / rung / "init.mp4").read_bytes() == init() for rung in ("v0", "v1", "v2"))
 
 
 def test_only_an_hevc_rung_in_pq_takes_them() -> None:
@@ -337,3 +400,37 @@ def test_without_stream_side_data_the_first_frames(monkeypatch: pytest.MonkeyPat
     [args] = calls
     assert args[:4] == ["-select_streams", "0", "-read_intervals", "%+#10"]
     assert "frame=side_data_list" in args
+
+
+def test_the_first_frames_give_each_kind_from_the_frame_that_has_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hdr10, "_probe", lambda args: {"frames": [
+        {"side_data_list": [FRAME_FORM[0]]}, {"side_data_list": []},
+        {"side_data_list": [FRAME_FORM[1]]}]})
+    got = hdr10.of_original(Path("/m/original.mkv"), _stream("smpte2084"), 0)
+    assert got is not None and got.boxes() == CLLI + MDCV and got.found_in == "frames"
+
+
+@pytest.mark.parametrize(("container", "frames"), [
+    ([MATROSKA_FORM[1]], [FRAME_FORM[1]]),   # the mastering display; MaxCLL in the SEI alone
+    ([MATROSKA_FORM[0]], FRAME_FORM),        # the content light level; the rest in the SEI
+])
+def test_what_the_container_leaves_out_comes_from_the_first_frames(
+    monkeypatch: pytest.MonkeyPatch, container: list[dict], frames: list[dict],
+) -> None:
+    calls: list[list[str]] = []
+
+    def probe(args: list[str]) -> dict:
+        calls.append(args)
+        return {"frames": [{"side_data_list": frames}]}
+
+    monkeypatch.setattr(hdr10, "_probe", probe)
+    got = hdr10.of_original(Path("/m/original.mkv"), _stream("smpte2084", side_data=container), 0)
+    assert got is not None and got.boxes() == CLLI + MDCV and got.found_in == "stream+frames"
+    assert len(calls) == 1
+    # What the frames don't have either stays out: the container's alone.
+    monkeypatch.setattr(hdr10, "_probe", lambda args: {"frames": []})
+    alone = hdr10.of_original(Path("/m/original.mkv"), _stream("smpte2084", side_data=container), 0)
+    assert alone is not None and alone.found_in == "stream"
+    assert alone.boxes() in (CLLI, MDCV)
