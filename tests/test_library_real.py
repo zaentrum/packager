@@ -329,6 +329,9 @@ def test_a_subtitle_for_the_hard_of_hearing_by_its_disposition_alone(tmp_path: P
              if line.startswith("#EXT-X-MEDIA:TYPE=SUBTITLES")]
     assert [(m["NAME"], m.get("CHARACTERISTICS")) for m in media] == [
         ("English", None), ("English · SDH", hls.SDH_CHARACTERISTICS), ("German", None)]
+    # A player may pick it by itself where its viewer asks for subtitles for
+    # the deaf and hard of hearing: it doesn't take the English one's place.
+    assert [m.get("AUTOSELECT") for m in media] == ["YES", "YES", "YES"]
     _catalogs_part(Path(record["library"]["itemDir"]))
     _validate(lib)
 
@@ -396,6 +399,12 @@ def test_a_commentary_and_an_audio_description_by_their_disposition_alone(
         ("AUDIO", "English"), ("AUDIO", "English · Commentary"),
         ("AUDIO", "German · Audio description"), ("SUBTITLES", "English"),
         ("SUBTITLES", "English · Commentary"), ("SUBTITLES", "German")]
+    # The audio description says it describes the video, and a player may
+    # pick it by itself where its viewer asks for one; a commentary no player
+    # picks by itself.
+    assert [(m.get("AUTOSELECT"), m.get("CHARACTERISTICS")) for m in media] == [
+        ("YES", None), (None, None), ("YES", hls.DESCRIBES_VIDEO), ("YES", None), (None, None),
+        ("YES", None)]
     _catalogs_part(Path(record["library"]["itemDir"]))
     _validate(lib)
 

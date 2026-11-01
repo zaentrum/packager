@@ -262,7 +262,9 @@ def test_language_name(tag, name) -> None:
     ("eng", "AC3 5.1 @ 640 Kbps", "English"),
     ("eng", "DTS-HD MA", "English"),
     ("eng", "AAC 2.0", "English"),
-    ("eng", "Commentary (AC3)", "English"),                  # as the clients have it
+    # The format goes, as the clients have it; the record reads a commentary
+    # in the title, and the NAME says what the record does.
+    ("eng", "Commentary (AC3)", "English · Commentary"),
     ("eng", "Stereo", "English"),
     ("eng", "Track 0", "English"),
     ("eng", "#2", "English"),

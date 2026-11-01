@@ -7,9 +7,11 @@ made from each was read by its title alone, so the deletion gate named
 them as lost. Its manifest entry now says so (commentary, visualImpaired),
 its NAME is the one a title that says so gets, and its record makes it a
 commentary or an audio description by its disposition, so deleting the
-original costs none of them. A title that says so is read as before, and a
-forced subtitle stays forced. The streams are made up; nothing runs ffmpeg
-or shaka-packager."""
+original costs none of them. A title that says so is read as before, its
+NAME saying what the record does where the title is a language's code, and
+a forced subtitle stays forced. In the master, an audio description says it
+describes the video and may be picked by itself; a commentary never is.
+The streams are made up; nothing runs ffmpeg or shaka-packager."""
 
 from __future__ import annotations
 
@@ -17,9 +19,9 @@ from pathlib import Path
 
 import pytest
 
+from packager import hls, records
 from packager import libv2_records as rec
 from packager import packager as pk
-from packager import records
 
 NOW = "2026-11-01T10:00:00Z"
 SOURCE = "0b6c3d2e-2222-4a2b-8c3d-4e5f60718293"
@@ -35,10 +37,17 @@ AUDIO = [
      ({"commentary": True}, "English · Director · Commentary", ("commentary", "disposition"))),
     (("aac", 2, "eng", "Commentary", {}),
      ({}, "English · Commentary", ("commentary", "title"))),
+    # Flagged a commentary and titled one: named so once.
+    (("aac", 2, "eng", "Commentary", {"comment": 1}),
+     ({"commentary": True}, "English · Commentary", ("commentary", "disposition"))),
     (("aac", 2, "ger", None, {"visual_impaired": 1}),
      ({"visualImpaired": True}, "German · Audio description", ("description", "disposition"))),
     (("aac", 2, "fre", "Audiodescription", {"descriptions": 1}),
      ({"visualImpaired": True}, "French · Audiodescription", ("description", "disposition"))),
+    # An audio description by a title its NAME leaves out, read as a code of
+    # the language: named as its record has it.
+    (("aac", 2, "fre", "fr-audiodescription", {}),
+     ({}, "French · Audio description", ("description", "title"))),
 ]
 # Its subtitle streams after them: (codec, language, title, disposition),
 # and the same of each.
@@ -53,6 +62,8 @@ SUBTITLES = [
      ({"commentary": True}, "German · Kommentar", ("commentary", "disposition"))),
     (("hdmv_pgs_subtitle", "spa", "Comentario del director", {}),
      ({}, "Spanish · Comentario del director", ("commentary", "title"))),
+    (("subrip", "fre", "fr-commentaire", {}),
+     ({}, "French · Commentary", ("commentary", "title"))),
 ]
 
 
@@ -155,7 +166,7 @@ def test_the_record_makes_them_so_and_deleting_the_original_costs_nothing(
         purpose for _, (_, _, purpose) in SUBTITLES]
     counts = ("commentaryTracks", "commentarySubtitles", "audioDescriptionTracks")
     assert {k: package["essence"][k] for k in counts} == {k: source["essence"][k] for k in counts} \
-        == {"commentaryTracks": 2, "commentarySubtitles": 3, "audioDescriptionTracks": 2}
+        == {"commentaryTracks": 3, "commentarySubtitles": 4, "audioDescriptionTracks": 3}
     assert [x for x in rec.deletion_gate([source["essence"]], package["essence"])
             if x in counts] == []
 
@@ -183,22 +194,62 @@ def test_without_the_marks_the_gate_names_them(monkeypatch: pytest.MonkeyPatch,
 
 
 def test_an_encode_that_lost_a_flag(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    # The transcoder's prepared.mkv keeps Matroska's flags (comment,
-    # visual_impaired) but has no word for an MP4's descriptions: v0 says
-    # nothing of the French audio description. Its NAME can't say so; its
-    # record, read from the original's own probe, still does.
+    # The transcoder's prepared.mkv has no word for an MP4's descriptions,
+    # and here kept no kind of its subtitle either: v0 says nothing of the
+    # French audio description or of the English commentary. Their NAMEs
+    # can't say so; their records, read from the original's own probe,
+    # still do.
     original = _raw([("aac", 2, "eng", None, {"default": 1}),
                      ("aac", 2, "fre", None, {"descriptions": 1})],
                     [("mov_text", "eng", None, {"comment": 1})])
     v0 = _probe(_raw([("aac", 2, "eng", None, {"default": 1}), ("aac", 2, "fre", None, {})],
-                     [("subrip", "eng", None, {"comment": 1})]))
+                     [("subrip", "eng", None, {})]))
     audio = _audio(v0)
     assert [pk._audio_display_name(a) for a in audio] == ["English", "French"]
     subs = _subtitles(monkeypatch, tmp_path / "subs", v0)
+    assert [pk._subtitle_display_name(s) for s in subs] == ["English"]
     source, package = _records(original, v0, audio, subs)
     assert [(a["sourceStreamIndex"], a["purpose"], a["purposeFrom"])
             for a in package["renditions"]["audio"]] == [
         (1, "main", "assumed"), (2, "description", "disposition")]
-    assert [(s["sourceStreamIndex"], s["purpose"]) for s in package["subtitles"]] == [
-        (3, "commentary")]
+    assert [(s["sourceStreamIndex"], s["purpose"], s["purposeFrom"])
+            for s in package["subtitles"]] == [(3, "commentary", "disposition")]
     assert rec.deletion_gate([source["essence"]], package["essence"]) == []
+
+
+def test_the_master_marks_an_audio_description_and_never_autoselects_a_commentary() -> None:
+    # Apple's HLS authoring specification: an audio description says it
+    # describes the video, and a player may pick it by itself (AUTOSELECT)
+    # where its viewer asks for one; a commentary no player should pick by
+    # itself. Neither takes the place of its language's main audio, the
+    # first visible one of it; a hidden one is never picked.
+    probe = _probe(_raw([a for a, _ in AUDIO], []))
+    assert [pk._audio_characteristics(e) for e in _audio(probe)] == [
+        hls.DESCRIBES_VIDEO if purpose == "description" else ""
+        for _, (_, _, (purpose, _)) in AUDIO]
+    metas = [
+        {"language": "ger", "title": "", "visualImpaired": True, "visible": True},
+        {"language": "ger", "title": "", "visible": True},
+        {"language": "eng", "title": "", "commentary": True, "visible": True},
+        {"language": "eng", "title": "Director's commentary", "visible": True},
+        {"language": "eng", "title": "", "visible": True},
+        {"language": "eng", "title": "", "visible": True},
+        {"language": "fre", "title": "Audio description", "visible": False},
+        {"language": "fre", "title": "", "visible": False},
+    ]
+    stats = hls.PlaylistStats(peak_bps=0, avg_bps=0, segments=1, target_duration=6, duration=6.0)
+    renditions = [hls.AudioRendition(f"a{i}/playlist.m3u8", "audio", pk._lang_key(m["language"]),
+                                     f"Track {i}", False, False, "2", "mp4a.40.2", stats,
+                                     pk._audio_characteristics(m))
+                  for i, m in enumerate(metas)]
+    done = pk._finish_group(renditions, metas)
+    assert [(r.autoselect, r.characteristics) for r in done] == [
+        (True, hls.DESCRIBES_VIDEO), (True, ""), (False, ""), (False, ""), (True, ""), (False, ""),
+        (False, hls.DESCRIBES_VIDEO), (False, "")]
+    lines = [line for line in hls.build_master([], {"audio": done}, None, []).splitlines()
+             if line.startswith("#EXT-X-MEDIA")]
+    assert lines[0] == (
+        '#EXT-X-MEDIA:TYPE=AUDIO,URI="a0/playlist.m3u8",GROUP-ID="audio",LANGUAGE="de",'
+        'NAME="Track 0",DEFAULT=NO,AUTOSELECT=YES,CHANNELS="2",'
+        'CHARACTERISTICS="public.accessibility.describes-video"')
+    assert "AUTOSELECT" not in lines[2] and "CHARACTERISTICS" not in lines[2]

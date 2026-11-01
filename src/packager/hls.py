@@ -187,6 +187,8 @@ class AudioRendition:
     channels: str
     codec: str
     stats: PlaylistStats
+    # CHARACTERISTICS (RFC 8216 4.3.4.1); '' for none.
+    characteristics: str = ""
 
 
 @dataclass(frozen=True)
@@ -207,6 +209,8 @@ class SubtitleRendition:
 # dialogue and describe the music and the sounds.
 SDH_CHARACTERISTICS = ("public.accessibility.transcribes-spoken-dialog,"
                        "public.accessibility.describes-music-and-sound")
+# ... and of an audio description: it describes the video.
+DESCRIBES_VIDEO = "public.accessibility.describes-video"
 
 
 def unique_names(names: list[str]) -> list[str]:
@@ -255,6 +259,8 @@ def build_master(
                 attrs.append("AUTOSELECT=YES")
             if r.channels:
                 attrs.append(f"CHANNELS={quoted(r.channels)}")
+            if r.characteristics:
+                attrs.append(f"CHARACTERISTICS={quoted(r.characteristics)}")
             out.append("#EXT-X-MEDIA:" + ",".join(attrs))
     if audio_groups:
         out.append("")

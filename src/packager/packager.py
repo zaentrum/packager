@@ -2812,19 +2812,18 @@ def _audio_display_name(meta: dict[str, Any], *, surround: bool = False) -> str:
     source's title says besides ("English · Commentary"). Not a title that
     only names a format ("AC3 5.1 @ 640 Kbps"): the track is AAC stereo
     whatever the file had. One its record makes a commentary or an audio
-    description by its stream's disposition alone (commentary,
-    visualImpaired) is named as a title that says so is ("English ·
-    Commentary", "English · Audio description"), unless its name says it
-    already. A second track that reads the same is told apart by
-    hls.unique_names."""
+    description — by its stream's disposition alone (commentary,
+    visualImpaired), or by a title its name leaves out ("fr-commentaire",
+    read as a language's code) — is named as a title that says so is
+    ("English · Commentary", "English · Audio description"), unless its name
+    says it already: the NAME says what package.json does. A second track
+    that reads the same is told apart by hls.unique_names."""
     name = _track_display_name(meta.get("language"), meta.get("title"),
                                layout=f" {SURROUND_LAYOUT}" if surround else "")
-    record = rec.audio_rendition(meta, 0)
-    if record["purposeFrom"] != "disposition":
-        return name
-    if record["purpose"] == "commentary" and not _COMMENTARY_WORDS.search(name):
+    purpose = rec.audio_rendition(meta, 0)["purpose"]
+    if purpose == "commentary" and not _COMMENTARY_WORDS.search(name):
         name = f"{name} · Commentary"
-    elif record["purpose"] == "description" and not _DESCRIPTION_WORDS.search(name):
+    elif purpose == "description" and not _DESCRIPTION_WORDS.search(name):
         name = f"{name} · Audio description"
     return name
 
@@ -3626,8 +3625,8 @@ def _run_shaka_packager(
             **made_by,
         })
 
-    # ---- audio (exactly one DEFAULT per group; AUTOSELECT on the first
-    # visible rendition per language, so commentary isn't auto-picked)
+    # ---- audio (exactly one DEFAULT per group; AUTOSELECT and the
+    # CHARACTERISTICS of an audio description: _finish_group)
     groups: dict[str, list[hls.AudioRendition]] = {}
     out_audio: dict[str, list[dict[str, Any]]] = {AUDIO_GROUP: [], SURROUND_GROUP: []}
     for n, (group, meta) in enumerate(audio_entries):
@@ -3642,6 +3641,7 @@ def _run_shaka_packager(
             name=meta.pop("_name"), default=bool(meta["default"]),
             autoselect=False, channels=media.get("CHANNELS", str(meta["channels"])),
             codec=codec, stats=stats,
+            characteristics=_audio_characteristics(meta),
         ))
         out_audio[group].append({
             **meta,
@@ -3676,19 +3676,39 @@ def _run_shaka_packager(
     return video_meta, out_audio[AUDIO_GROUP], out_audio[SURROUND_GROUP]
 
 
+def _audio_characteristics(meta: dict[str, Any]) -> str:
+    """The CHARACTERISTICS of an audio rendition (RFC 8216 4.3.4.1): an
+    audio description says it describes the video, as its record says what
+    it is for (audio_rendition's purpose: by its stream's disposition or by
+    its title); '' for any other."""
+    return hls.DESCRIBES_VIDEO if rec.audio_rendition(meta, 0)["purpose"] == "description" else ""
+
+
 def _finish_group(
     renditions: list[hls.AudioRendition], metas: list[dict[str, Any]],
 ) -> list[hls.AudioRendition]:
-    """Unique NAMEs, AUTOSELECT on the first visible rendition of each
-    language (plus the default)."""
+    """Unique NAMEs, and AUTOSELECT, as the record logic reads each
+    rendition (audio_rendition's purpose): on the first visible one of each
+    language that is the main audio (plus the default); on every visible
+    audio description, whose CHARACTERISTICS say it describes the video, so
+    that a player picks it where its viewer asks for one (Apple's HLS
+    authoring specification); never on a commentary, which a player should
+    not pick by itself. Neither takes the first one's place."""
     names = hls.unique_names([r.name for r in renditions])
     seen: set[str] = set()
     out: list[hls.AudioRendition] = []
     for r, name, meta in zip(renditions, names, metas, strict=True):
         key = _lang_key(r.language or meta.get("language"))
-        autoselect = bool(meta.get("visible", True)) and key not in seen
-        if autoselect:
-            seen.add(key)
+        visible = bool(meta.get("visible", True))
+        purpose = rec.audio_rendition(meta, 0)["purpose"]
+        if purpose == "description":
+            autoselect = visible
+        elif purpose == "commentary":
+            autoselect = False
+        else:
+            autoselect = visible and key not in seen
+            if autoselect:
+                seen.add(key)
         meta["name"] = name
         out.append(hls.AudioRendition(**{**r.__dict__, "name": name, "autoselect": autoselect}))
     return out
@@ -3699,7 +3719,13 @@ def _package_text_tracks(
 ) -> list[hls.SubtitleRendition]:
     """Segment every visible WebVTT sidecar into an HLS subtitle
     rendition at hls/sN/ (N = the sidecar's source index). Marks the
-    manifest entry with `hls`. PGS / VobSub / DVB stay sidecar-only."""
+    manifest entry with `hls`. PGS / VobSub / DVB stay sidecar-only.
+    AUTOSELECT, as the record logic reads each track (_subtitle_purpose): on
+    a forced one, and on the first of each language that is for the dialogue;
+    on every one for the deaf and hard of hearing, whose CHARACTERISTICS say
+    so, so that a player picks it where its viewer asks for one (Apple's HLS
+    authoring specification); never on a commentary. Neither takes the first
+    one's place."""
     renditions: list[hls.SubtitleRendition] = []
     seen: set[str] = set()
     for entry in subtitle_meta:
@@ -3736,9 +3762,15 @@ def _package_text_tracks(
             shutil.rmtree(out_root / "hls" / rid, ignore_errors=True)
             continue
         forced = bool(entry.get("forced"))
-        key = (_lang_key(lang), forced)
-        autoselect = forced or key not in seen
-        seen.add(key)
+        purpose = _subtitle_purpose(entry)
+        if purpose == "sdh":
+            autoselect = True
+        elif purpose == "commentary":
+            autoselect = False
+        else:
+            key = (_lang_key(lang), forced)
+            autoselect = forced or key not in seen
+            seen.add(key)
         entry["hls"] = f"hls/{rid}"
         renditions.append(hls.SubtitleRendition(
             uri=f"{rid}/playlist.m3u8",
@@ -3746,7 +3778,7 @@ def _package_text_tracks(
             name=name, forced=forced, autoselect=autoselect, stats=stats,
             # One for the deaf and hard of hearing says what it is for, as
             # its record does (sdh).
-            characteristics=hls.SDH_CHARACTERISTICS if _subtitle_purpose(entry) == "sdh" else "",
+            characteristics=hls.SDH_CHARACTERISTICS if purpose == "sdh" else "",
         ))
     names = hls.unique_names([r.name for r in renditions])
     return [hls.SubtitleRendition(**{**r.__dict__, "name": n})
@@ -3774,25 +3806,27 @@ def _subtitle_display_name(entry: dict[str, Any]) -> str:
     name doesn't say so — its stream's disposition said it is for the deaf
     and hard of hearing (hearingImpaired): "English · SDH", as a title that
     says so is named; " · Commentary" for one its record makes a commentary
-    by its stream's disposition alone (commentary). A second track that
-    reads the same is told apart by hls.unique_names."""
+    whose name doesn't say so — by its stream's disposition alone
+    (commentary), or by a title its name leaves out ("fr-commentaire", read
+    as a language's code). A second track that reads the same is told apart
+    by hls.unique_names."""
     name = _track_display_name(entry.get("language"), entry.get("title"))
     if entry.get("forced") and "forced" not in name.casefold():
         name = f"{name} (forced)"
     record = rec.subtitle_rendition(entry, 0)
     if record["purpose"] == "sdh" and not _SDH_WORDS.search(name):
         name = f"{name} · SDH"
-    elif (record["purpose"], record["purposeFrom"]) == ("commentary", "disposition") \
-            and not _COMMENTARY_WORDS.search(name):
+    elif record["purpose"] == "commentary" and not _COMMENTARY_WORDS.search(name):
         name = f"{name} · Commentary"
     return name
 
 
 def _subtitle_purpose(entry: dict[str, Any]) -> str:
     """What a subtitle track is for, as its record says (package.json's
-    purpose: "sdh", "forced", "dialogue", …): the record logic's reading of
-    its manifest entry, its forced flag first, then its hearingImpaired
-    mark, then its title. A forced track is forced, whatever else it is."""
+    purpose: "sdh", "forced", "commentary", "dialogue", …): the record
+    logic's reading of its manifest entry, its forced flag first, then its
+    hearingImpaired and commentary marks, then its title. A forced track is
+    forced, whatever else it is."""
     return rec.subtitle_rendition(entry, 0)["purpose"]
 
 
