@@ -10,7 +10,9 @@ pre-packaged item or fall through to on-demand transcode.
 Design rules:
 * Video is passthrough. We never re-encode here. Every rendition must be
   hevc/h264 (the transcoder produced or chose them); anything else fails
-  the package job.
+  the package job. The init segment of every HEVC rung in PQ gets the
+  original's HDR10 static metadata, which shaka-packager leaves out
+  (hdr10.py).
 * N video renditions -> one master with one variant per rendition and
   audio group, plus one I-frame playlist per rendition. The master is
   assembled by `packager.hls` from shaka's media playlists.
@@ -67,7 +69,7 @@ from typing import Any
 
 import structlog
 
-from . import hls, regions
+from . import hdr10, hls, regions
 from . import libv2_records as rec
 from .renditions import PackageInputs, VideoInput
 
@@ -785,6 +787,7 @@ def build_package(
             segment_seconds=segment_seconds,
             hls_subtitles=options.hls_subtitles,
             subtitle_meta=subtitle_meta,
+            hdr10_metadata=_hdr10_metadata(inputs, probe, Path(source_path), videos),
         )
 
     # Trickplay runs against the original source — only 1 frame
@@ -3417,6 +3420,34 @@ def _video_range(stream: dict[str, Any]) -> str:
     return {"smpte2084": "PQ", "arib-std-b67": "HLG"}.get(transfer, "SDR")
 
 
+def _carries_hdr10(stream: dict[str, Any]) -> bool:
+    """Whether a rung's init segment takes HDR10 static metadata: an HEVC
+    stream in PQ. Not an SDR one (a tone-mapped rung), not an HLG one."""
+    return stream.get("codec_name") == "hevc" and _video_range(stream) == "PQ"
+
+
+def _hdr10_metadata(inputs: PackageInputs, probe: _Probe, original: Path,
+                    videos: list[_StagedVideo]) -> hdr10.StaticMetadata | None:
+    """The HDR10 static metadata the PQ rungs' init segments get (hdr10.py):
+    the original's (`original`, the item's source), from its stream side
+    data, else its first frames', whatever a rung's own bitstream carries —
+    an encoded rung's, a copy the transcoder remuxed. v0 that is the
+    original is read as probed; v0's own stands in only where the original
+    isn't there or can't be probed. None when no rung is HEVC in PQ, or the
+    original has none."""
+    if not any(_carries_hdr10(v.probe.video) for v in videos):
+        return None
+    if original != inputs.primary.path and original.exists():
+        try:
+            source: _Probe | None = _ffprobe(original)
+        except (OSError, ValueError, subprocess.CalledProcessError) as e:
+            log.warning("packager.hdr10.original_probe_failed", error=str(e)[:200])
+            source = None
+        if source is not None and source.video:
+            return hdr10.of_original(original, source.video, source.video_index)
+    return hdr10.of_original(inputs.primary.path, probe.video, probe.video_index)
+
+
 def _run_shaka_packager(
     primary: Path,
     videos: list[_StagedVideo],
@@ -3427,12 +3458,18 @@ def _run_shaka_packager(
     segment_seconds: int = SEGMENT_SECONDS,
     hls_subtitles: bool = False,
     subtitle_meta: list[dict[str, Any]] | None = None,
+    hdr10_metadata: hdr10.StaticMetadata | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Package every video rung + audio rendition in one shaka run (media
     playlists + one I-frame playlist per rung), the WebVTT subtitles in
     one isolated run each, then assemble hls/master.m3u8. Returns the
     manifest entries for video, stereo audio and surround audio; the
     subtitle entries gain an `hls` dir when their rendition was written.
+
+    With `hdr10_metadata`, the init segment of every HEVC rung in PQ gets
+    its mdcv and clli boxes, which shaka leaves out (hdr10.py), and its
+    manifest entry says so (`hdr10Metadata`); every other init segment is
+    shaka's as it wrote it.
 
     shaka-packager selects streams by absolute MP4 stream index when
     given a number, or by type ("video"/"audio"/"text") to pick the first
@@ -3476,6 +3513,16 @@ def _run_shaka_packager(
     shaka = hls.read_shaka_master(out_root / scratch)
     (out_root / scratch).unlink(missing_ok=True)
 
+    # ---- the HDR10 static metadata shaka leaves out of the PQ rungs' init
+    with_hdr10: set[str] = set()
+    if hdr10_metadata is not None:
+        with_hdr10 = {v.rung.id for v in videos if _carries_hdr10(v.probe.video)
+                      and hdr10.write_into(hls_dir / v.rung.id / "init.mp4", hdr10_metadata)}
+        log.info("packager.hdr10.boxes", rungs=sorted(with_hdr10) or None,
+                 found_in=hdr10_metadata.found_in,
+                 mastering=hdr10_metadata.mastering is not None,
+                 light_level=hdr10_metadata.light_level is not None)
+
     # ---- video
     video_meta: list[dict[str, Any]] = []
     variants: list[hls.VideoVariant] = []
@@ -3510,6 +3557,9 @@ def _run_shaka_packager(
             "peakBitrateBps": stats.peak_bps,
             "hdr": video_range != "SDR",
             "videoRange": video_range,
+            # Its init segment carries the original's HDR10 static
+            # metadata (mdcv, clli), as nothing else says.
+            **({"hdr10Metadata": True} if v.rung.id in with_hdr10 else {}),
             "frameRate": rate,
             "segments": stats.segments,
             "targetDuration": stats.target_duration or segment_seconds,
