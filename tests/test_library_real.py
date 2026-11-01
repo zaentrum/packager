@@ -12,7 +12,10 @@ subtitle track is flagged for the hard of hearing, with no title, is
 packaged with that track sdh, as its source's stream is; one whose second
 English audio track and subtitle track are flagged a commentary and whose
 German audio track is flagged for the visually impaired, with no title,
-with them a commentary and an audio description. When a checkout of the
+with them a commentary and an audio description; and one whose German
+audio description and English SDH subtitles come first in the file has
+its German main track the default, with the German 5.1, and each
+language's main track first in the master. When a checkout of the
 schemas repository is beside this one (or ZAENTRUM_SCHEMAS names one)
 whose schemas have the platform's additive fields, and a Python with
 jsonschema runs its validator (this one, or LIBRARY_V2_PYTHON), the
@@ -405,6 +408,74 @@ def test_a_commentary_and_an_audio_description_by_their_disposition_alone(
     assert [(m.get("AUTOSELECT"), m.get("CHARACTERISTICS")) for m in media] == [
         ("YES", None), (None, None), ("YES", hls.DESCRIBES_VIDEO), ("YES", None), (None, None),
         ("YES", None)]
+    _catalogs_part(Path(record["library"]["itemDir"]))
+    _validate(lib)
+
+
+def test_the_main_track_is_the_default_and_comes_first_in_its_language(tmp_path: Path) -> None:
+    # German preferred, and the original has its German audio description
+    # first — both 5.1 — an English main track flagged default, an English
+    # commentary, and its English subtitles for the hard of hearing before
+    # the dialogue's. The German main track is the default and has the
+    # German 5.1, and in the master each language lists its main track first,
+    # so a player that takes the first one of the viewer's language takes it;
+    # package.json keeps the original's order.
+    d = tmp_path / "clip"
+    folder = d / "incoming" / "Clip (2024)"
+    folder.mkdir(parents=True)
+    (d / "sdh.srt").write_text("1\n00:00:01,000 --> 00:00:03,000\n[door creaks] Hello.\n")
+    (d / "en.srt").write_text("1\n00:00:01,000 --> 00:00:03,000\nHello.\n")
+    src = folder / "Clip (2024).mkv"
+    tones = "|".join(f"0.1*sin(2*PI*{110 * (k + 1)}*t)" for k in range(6))
+    _ff("-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=4",
+        *[a for _ in range(2) for a in (
+            "-f", "lavfi", "-i", f"aevalsrc=exprs={tones}:channel_layout=5.1:sample_rate=48000:"
+            "duration=4")],
+        *[a for f in (550, 660) for a in (
+            "-f", "lavfi", "-i", f"sine=frequency={f}:sample_rate=48000:duration=4")],
+        "-i", str(d / "sdh.srt"), "-i", str(d / "en.srt"),
+        "-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:a", "-map", "4:a", "-map", "5",
+        "-map", "6", "-c:v", "libx265", "-preset", "ultrafast", "-x265-params",
+        "log-level=error:keyint=48", "-c:a:0", "ac3", "-c:a:1", "ac3", "-c:a:2", "aac",
+        "-c:a:3", "aac", "-ac:a:2", "2", "-ac:a:3", "2", "-c:s", "srt",
+        *[a for i, lang in enumerate(("ger", "ger", "eng", "eng")) for a in (
+            f"-metadata:s:a:{i}", f"language={lang}")],
+        "-metadata:s:s:0", "language=eng", "-metadata:s:s:1", "language=eng",
+        "-disposition:a:0", "visual_impaired", "-disposition:a:1", "0",
+        "-disposition:a:2", "default", "-disposition:a:3", "comment",
+        "-disposition:s:0", "hearing_impaired", "-disposition:s:1", "0", str(src))
+    lib, work, original = _share(tmp_path / "run", src)
+    record = {**_record(lib, work, original), "subtitleFiles": []}
+    catalog = Catalog()
+    worker._process_one(ClaimedItem.from_json(record), catalog,  # type: ignore[arg-type]
+                        pk.PackageOptions(surround_codec="eac3", hls_subtitles=True,
+                                          stereo_loudness=None, preferred_languages=("de",)))
+    assert [s for s, _ in catalog.written] == ["in_progress", "done"], catalog.written
+    vdir = Path(record["library"]["build"]["versionDir"])
+    source = json.loads((Path(record["library"]["source"]["recordDir"]) / "source.json")
+                        .read_text())
+    package = json.loads((vdir / "package.json").read_text())
+    assert [(a["sourceStreamIndex"], a["purpose"], a["default"])
+            for a in package["renditions"]["audio"]] == [
+        (1, "description", False), (2, "main", True), (3, "main", False),
+        (4, "commentary", False)]
+    surround = package["renditions"]["audioSurround"]
+    assert [(a["sourceStreamIndex"], a["default"]) for a in surround] == [(2, True)]
+    assert [(s["sourceStreamIndex"], s["purpose"]) for s in package["subtitles"]] == [
+        (5, "sdh"), (6, "dialogue")]
+    assert rec.deletion_gate([source["essence"]], package["essence"]) == []
+    media = [hls.parse_attributes(line.split(":", 1)[1])
+             for line in (vdir / "hls" / "master.m3u8").read_text().splitlines()
+             if line.startswith("#EXT-X-MEDIA:")]
+    assert [(m["GROUP-ID"], m["NAME"], m["DEFAULT"], m.get("AUTOSELECT"),
+             m.get("CHARACTERISTICS")) for m in media] == [
+        ("audio", "German", "YES", "YES", None),
+        ("audio", "German · Audio description", "NO", "YES", hls.DESCRIBES_VIDEO),
+        ("audio", "English", "NO", "YES", None),
+        ("audio", "English · Commentary", "NO", None, None),
+        ("audio-surround", "German 5.1", "YES", "YES", None),
+        ("subs", "English", "NO", "YES", None),
+        ("subs", "English · SDH", "NO", "YES", hls.SDH_CHARACTERISTICS)]
     _catalogs_part(Path(record["library"]["itemDir"]))
     _validate(lib)
 

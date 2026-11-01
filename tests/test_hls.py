@@ -154,6 +154,19 @@ def test_golden_master() -> None:
     assert text == (GOLDEN / "master.m3u8").read_text()
 
 
+def test_the_default_audio_rendition_is_autoselect_whatever_else_it_is() -> None:
+    # RFC 8216 4.3.4.1: DEFAULT=YES requires AUTOSELECT=YES — a default that
+    # nothing else would select by itself (hidden, a commentary) says so too.
+    lines = [line for line in hls.build_master([], {"audio": [
+        hls.AudioRendition("a0/playlist.m3u8", "audio", "en", "English", True, False, "2",
+                           "mp4a.40.2", _stats(200, 100)),
+        hls.AudioRendition("a1/playlist.m3u8", "audio", "de", "German", False, False, "2",
+                           "mp4a.40.2", _stats(200, 100))]}, None, []).splitlines()
+        if line.startswith("#EXT-X-MEDIA:")]
+    assert ["DEFAULT=YES,AUTOSELECT=YES" in line for line in lines] == [True, False]
+    assert "AUTOSELECT" not in lines[1]
+
+
 def test_a_subtitle_rendition_for_the_hard_of_hearing_says_so() -> None:
     # RFC 8216 4.3.4.1: the UTIs of subtitles that transcribe the dialogue
     # and describe the music and the sounds; none on any other rendition.

@@ -65,7 +65,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import structlog
 
@@ -3679,7 +3679,13 @@ def _run_shaka_packager(
             "visible": meta.get("visible", True),
         })
     for group, renditions in groups.items():
-        groups[group] = _finish_group(renditions, out_audio[group])
+        finished = _finish_group(renditions, out_audio[group])
+        # The master lists a language's main audio first (_main_first);
+        # the manifest keeps the source's order.
+        groups[group] = _main_first(
+            finished, [_lang_key(r.language or m.get("language")) for r, m in
+                       zip(finished, out_audio[group], strict=True)],
+            [rec.audio_rendition(m, 0)["purpose"] == "main" for m in out_audio[group]])
 
     # ---- subtitles: WebVTT -> HLS renditions, one isolated shaka run
     # each so a cue file shaka rejects costs that track, not the package.
@@ -3743,15 +3749,11 @@ def _package_text_tracks(
 ) -> list[hls.SubtitleRendition]:
     """Segment every visible WebVTT sidecar into an HLS subtitle
     rendition at hls/sN/ (N = the sidecar's source index). Marks the
-    manifest entry with `hls`. PGS / VobSub / DVB stay sidecar-only.
-    AUTOSELECT, as the record logic reads each track (_subtitle_purpose): on
-    a forced one, and on the first of each language that is for the dialogue;
-    on every one for the deaf and hard of hearing, whose CHARACTERISTICS say
-    so, so that a player picks it where its viewer asks for one (Apple's HLS
-    authoring specification); never on a commentary. Neither takes the first
-    one's place."""
+    manifest entry with `hls`. PGS / VobSub / DVB stay sidecar-only. Their
+    NAMEs, AUTOSELECT and order in the master: _finish_subtitles."""
     renditions: list[hls.SubtitleRendition] = []
-    seen: set[str] = set()
+    purposes: list[str] = []
+    keys: list[str] = []
     for entry in subtitle_meta:
         if entry.get("format") != "webvtt" or not entry.get("visible", True):
             continue
@@ -3785,28 +3787,64 @@ def _package_text_tracks(
         if stats.segments == 0:
             shutil.rmtree(out_root / "hls" / rid, ignore_errors=True)
             continue
-        forced = bool(entry.get("forced"))
         purpose = _subtitle_purpose(entry)
+        entry["hls"] = f"hls/{rid}"
+        renditions.append(hls.SubtitleRendition(
+            uri=f"{rid}/playlist.m3u8",
+            language=media.get("LANGUAGE", _lang_key(lang) if lang != "und" else ""),
+            name=name, forced=bool(entry.get("forced")), autoselect=False, stats=stats,
+            # One for the deaf and hard of hearing says what it is for, as
+            # its record does (sdh).
+            characteristics=hls.SDH_CHARACTERISTICS if purpose == "sdh" else "",
+        ))
+        purposes.append(purpose)
+        keys.append(_lang_key(lang))
+    return _finish_subtitles(renditions, purposes, keys)
+
+
+def _finish_subtitles(
+    renditions: list[hls.SubtitleRendition], purposes: list[str], languages: list[str],
+) -> list[hls.SubtitleRendition]:
+    """Unique NAMEs, AUTOSELECT and the master's order of the subtitle
+    renditions, as the record logic reads each track (`purposes`:
+    _subtitle_purpose), `languages` their keys. AUTOSELECT on a forced one,
+    and on the first of each language that is for the dialogue; on every one
+    for the deaf and hard of hearing, whose CHARACTERISTICS say so, so that a
+    player picks it where its viewer asks for one (Apple's HLS authoring
+    specification); never on a commentary. Neither takes the first one's
+    place. In each language the dialogue comes first (_main_first)."""
+    names = hls.unique_names([r.name for r in renditions])
+    seen: set[tuple[str, bool]] = set()
+    out: list[hls.SubtitleRendition] = []
+    for r, name, purpose, language in zip(renditions, names, purposes, languages, strict=True):
         if purpose == "sdh":
             autoselect = True
         elif purpose == "commentary":
             autoselect = False
         else:
-            key = (_lang_key(lang), forced)
-            autoselect = forced or key not in seen
+            key = (language, r.forced)
+            autoselect = r.forced or key not in seen
             seen.add(key)
-        entry["hls"] = f"hls/{rid}"
-        renditions.append(hls.SubtitleRendition(
-            uri=f"{rid}/playlist.m3u8",
-            language=media.get("LANGUAGE", _lang_key(lang) if lang != "und" else ""),
-            name=name, forced=forced, autoselect=autoselect, stats=stats,
-            # One for the deaf and hard of hearing says what it is for, as
-            # its record does (sdh).
-            characteristics=hls.SDH_CHARACTERISTICS if purpose == "sdh" else "",
-        ))
-    names = hls.unique_names([r.name for r in renditions])
-    return [hls.SubtitleRendition(**{**r.__dict__, "name": n})
-            for r, n in zip(renditions, names, strict=True)]
+        out.append(hls.SubtitleRendition(**{**r.__dict__, "name": name, "autoselect": autoselect}))
+    return _main_first(out, languages, [p == "dialogue" for p in purposes])
+
+
+T = TypeVar("T")
+
+
+def _main_first(items: list[T], languages: list[str], mains: list[bool]) -> list[T]:
+    """`items` in the master's order: each language keeps the places its
+    items have, and within them its main ones (`mains`) come first, every
+    kind in the order it had. Apple's HLS authoring specification lists a
+    language's main rendition first, and a player that takes the first track
+    in its viewer's language takes the main one, not an audio description, a
+    commentary or subtitles for the deaf and hard of hearing before it."""
+    out = list(items)
+    for language in dict.fromkeys(languages):
+        places = [i for i, key in enumerate(languages) if key == language]
+        for place, i in zip(places, sorted(places, key=lambda i: not mains[i]), strict=True):
+            out[place] = items[i]
+    return out
 
 
 # The words a title says a subtitle is for the deaf and hard of hearing
