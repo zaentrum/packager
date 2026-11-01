@@ -20,10 +20,12 @@ Design rules:
   (group "audio" — what every browser decodes), one of more than two
   channels downmixed under full scale (_stereo_filter), one whose mix is
   quiet lifted to the stereo loudness (_lift_stereo). A source track with
-  more than two channels (with SURROUND_AUDIO) additionally gets a 5.1
-  E-AC-3 (or AC-3) rendition, first per language, in group
-  "audio-surround", shown or hidden as its stereo rendition is, one of
-  more than six channels folded under full scale (_surround_filter).
+  more than two channels (with SURROUND_AUDIO) that a client offers, or
+  the default one, additionally gets a 5.1 E-AC-3 (or AC-3) rendition,
+  first per language, in group "audio-surround", shown or hidden as its
+  stereo rendition is, one of more than six channels folded under full
+  scale (_surround_filter); one the language settings hide gets none
+  (_surround_plan).
   Exactly one rendition per group is DEFAULT=YES: the preferred-language track;
   in the 5.1 group its companion, else the 5.1 rendition of its
   language, else that of the first preferred language with one, else the
@@ -339,6 +341,10 @@ _LIFT_WORKERS = 4
 # report names it (rules.py).
 SURROUND_LAYOUT = "5.1"
 SURROUND_CHANNELS = 6
+# The tracks that get a companion: those a client offers, and the default
+# one ("shown"); a track the language whitelist hides gets none
+# (_surround_plan). The rules report names it (rules.py).
+SURROUND_TRACKS = "shown"
 _SURROUND_FORMAT = (
     f"aformat=sample_rates=48000:channel_layouts={SURROUND_LAYOUT}(side)|{SURROUND_LAYOUT}"
 )
@@ -720,7 +726,7 @@ def build_package(
     )
     preferred = list(options.preferred_languages) or list(language_whitelist or [])
     default_audio = _pick_default_audio(probe.audio, audio_visible, preferred)
-    surround = _surround_plan(probe.audio, audio_visible, options)
+    surround = _surround_plan(probe.audio, audio_visible, options, default_audio)
     default_surround = _pick_default_surround(surround, probe.audio, default_audio, preferred,
                                               audio_visible)
     log.info(
@@ -1494,19 +1500,24 @@ def _surround_plan(
     streams: list[dict[str, Any]],
     visible: set[int],
     options: PackageOptions,
+    default_index: int | None = None,
 ) -> list[_SurroundTrack]:
     """Which source tracks get a 5.1 companion: every surround track — more
-    than two channels, as a record's essence counts surround — but a
-    commentary or an audio description (_is_main_audio), the first such
-    track per language (a second English one would be a duplicate; an audio
-    description first in its language would take its main track's place).
-    A track hidden by the language whitelist gets
-    its companion too, hidden as its stereo rendition is: the package
-    keeps what the original carries. Stream-copied when the track already
-    is a 5.1 of the target codec (an E-AC-3 5.1, Atmos included), encoded
-    to 5.1 otherwise: DTS, TrueHD, FLAC, PCM, AC-3 when the target is
-    E-AC-3, a 7.1 downmixed, fewer channels upmixed. `visible` is not
-    consulted (see _surround_meta)."""
+    than two channels, as a record's essence counts surround — that a
+    client offers (`visible`) or that is the default one (`default_index`),
+    but a commentary or an audio description (_is_main_audio), the first
+    such track per language (a second English one would be a duplicate; an
+    audio description first in its language would take its main track's
+    place). A track the language whitelist hides, and that isn't the
+    default, gets none: no client offers it, and its stereo rendition is
+    made as before; a package whose only surround tracks are hidden so
+    carries no 5.1, which its record's essence says. The default one keeps
+    its companion where it is hidden too (no track shown, or a preferred
+    language the whitelist hides), hidden as its stereo rendition is.
+    Stream-copied when the track already is a 5.1 of the target codec (an
+    E-AC-3 5.1, Atmos included), encoded to 5.1 otherwise: DTS, TrueHD,
+    FLAC, PCM, AC-3 when the target is E-AC-3, a 7.1 downmixed, fewer
+    channels upmixed."""
     codec = (options.surround_codec or "off").lower()
     if codec not in _SURROUND_CODECS:
         return []
@@ -1514,7 +1525,7 @@ def _surround_plan(
     seen: set[str] = set()
     for i, s in enumerate(streams):
         channels = int(s.get("channels") or 0)
-        if channels <= 2 or not _is_main_audio(s):
+        if channels <= 2 or not _is_main_audio(s) or (i not in visible and i != default_index):
             continue
         key = _lang_key(_track_language(s))
         if key in seen:

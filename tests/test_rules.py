@@ -33,7 +33,8 @@ def test_the_payload_is_the_catalogs_contract() -> None:
                         image_subtitles=["pgs", "vobsub"])
     assert got == {"version": "3f2a9c1", "rules": {
         "surroundAudio": "eac3", "surroundLayout": "5.1", "surroundBitrate": "448k",
-        "stereoAudio": "aac", "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"]}}
+        "surroundTracks": "shown", "stereoAudio": "aac", "stereoBitrate": "192k",
+        "imageSubtitles": ["pgs", "vobsub"]}}
 
 
 def test_the_stereo_codec_is_the_one_its_encode_is_made_with() -> None:
@@ -63,11 +64,26 @@ def test_the_layout_is_the_one_the_companion_is_made_in() -> None:
     assert [t.mode for t in plan] == ["copy", "encode"]
 
 
+def test_the_tracks_are_those_the_plan_gives_a_companion() -> None:
+    # "shown": a track a client offers gets a 5.1 companion, and the default
+    # one; a track the language whitelist hides gets none
+    from packager import packager
+
+    assert rules_payload(options(surround_audio="eac3"), None)["rules"]["surroundTracks"] == \
+        packager.SURROUND_TRACKS == "shown"
+    streams = [{"codec_name": "dts", "channels": 6, "tags": {"language": "eng"}},
+               {"codec_name": "dts", "channels": 6, "tags": {"language": "fre"}},
+               {"codec_name": "dts", "channels": 6, "tags": {"language": "ger"}}]
+    plan = packager._surround_plan(streams, {0}, options(surround_audio="eac3"), default_index=2)
+    assert [t.source_index for t in plan] == [0, 2]
+
+
 def test_the_payload_says_the_values_this_process_runs_with() -> None:
     # the platform's default is no companion; a bit rate set is the one sent
     got = rules_payload(options(surround_bitrate="640k"), None, image_subtitles=["pgs"])["rules"]
     assert got == {"surroundAudio": "off", "surroundLayout": "5.1", "surroundBitrate": "640k",
-                   "stereoAudio": "aac", "stereoBitrate": "192k", "imageSubtitles": ["pgs"]}
+                   "surroundTracks": "shown", "stereoAudio": "aac", "stereoBitrate": "192k",
+                   "imageSubtitles": ["pgs"]}
 
 
 @pytest.mark.parametrize(("installed", "forms"), [

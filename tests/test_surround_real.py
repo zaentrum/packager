@@ -5,15 +5,19 @@ newer, and it has libx265 and the AC-3, E-AC-3 and FLAC encoders).
 A film in four languages — an English AC-3 5.1, a German FLAC 7.1, a
 French stereo AAC, a Spanish E-AC-3 5.1 and a second English 5.1 —, a
 plain 5.1 film and a stereo one. Every track becomes a stereo AAC
-rendition in group "audio"; every surround track's language gets one 5.1
-E-AC-3 companion in group "audio-surround" (encoded, the 7.1 downmixed,
-the E-AC-3 5.1 copied bit for bit), shown or hidden as its stereo
-rendition, with exactly one default; a stereo film gets none. In both
-layouts: the legacy manifest.json, and the v2 record, whose package.json
-validates against the schemas (validate-library-v2.py --check-checksums,
-where a schemas checkout and a Python with jsonschema are at hand) and
-whose essence no longer loses "surround" — nor "maxAudioChannels", but
-for the 7.1, whose two extra channels a 5.1 can't keep."""
+rendition in group "audio"; the language of every surround track a client
+is offered gets one 5.1 E-AC-3 companion in group "audio-surround"
+(encoded, the 7.1 downmixed, the E-AC-3 5.1 copied bit for bit), with
+exactly one default; a stereo film gets none. A track the language
+settings hide gets none — unless it is the default one, whose companion
+is hidden as its stereo rendition is — and its stereo rendition is what it
+was, byte for byte. In both layouts: the legacy manifest.json, and the v2
+record, whose package.json validates against the schemas
+(validate-library-v2.py --check-checksums, where a schemas checkout and a
+Python with jsonschema are at hand) and whose essence no longer loses
+"surround" — nor "maxAudioChannels", but for the 7.1, whose two extra
+channels a 5.1 can't keep; a film whose only surround track is hidden
+carries no 5.1, and its record's deletion gate says so."""
 
 from __future__ import annotations
 
@@ -26,9 +30,9 @@ from pathlib import Path
 import pytest
 from test_library_real import Catalog, _catalogs_part, _validate
 
+from packager import hdr10, worker
 from packager import libv2_records as rec
 from packager import packager as pk
-from packager import worker
 from packager.hls import parse_attributes
 from packager.katalog import ClaimedItem
 
@@ -90,6 +94,12 @@ def films(tmp_path_factory) -> dict[str, Path]:
         "six": _film(d / "Six (2024)" / "Six (2024).mkv", [("ac3", 6, "eng"), ("aac", 2, "ger")]),
         "stereo": _film(d / "Stereo (2024)" / "Stereo (2024).mkv",
                         [("aac", 2, "eng"), ("ac3", 2, "ger")]),
+        # Of the catalog's whitelist (English, German) the English stereo
+        # alone: every surround track is hidden, of every kind a companion
+        # is made of.
+        "hidden": _film(d / "Hidden (2024)" / "Hidden (2024).mkv", [
+            ("aac", 2, "eng"), ("ac3", 6, "fre"), ("flac", 8, "ita"), ("pcm_s24le", 6, "spa"),
+            ("aac", 6, "por"), ("eac3", 6, "jpn")]),
     }
 
 
@@ -133,23 +143,22 @@ def test_a_film_in_four_languages_keeps_a_5_1_per_surround_language(
 ) -> None:
     monkeypatch.setattr(pk, "PACKAGES_ROOT", tmp_path / "packages")
     manifest = pk.package_item(
-        ITEM, str(films["multi"]), "movie", title="multi", language_whitelist=["en", "de", "fr"],
+        ITEM, str(films["multi"]), "movie", title="multi", language_whitelist=["en", "de", "es"],
         options=pk.PackageOptions(surround_codec="eac3", preferred_languages=("en",)))
     root = tmp_path / "packages" / "movies" / ITEM[:2] / ITEM
     ren = manifest["renditions"]
     assert [(a["id"], a["language"], a["channels"], a["visible"], a["default"])
             for a in ren["audio"]] == [
         ("a0", "eng", 2, True, True), ("a1", "ger", 2, True, False),
-        ("a2", "fre", 2, True, False), ("a3", "spa", 2, False, False),
+        ("a2", "fre", 2, False, False), ("a3", "spa", 2, True, False),
         ("a4", "eng", 2, True, False)]
     # One 5.1 per surround language: the second English one has none, the
-    # stereo French none; the Spanish, hidden by the whitelist, has its own,
-    # hidden too.
+    # stereo French none.
     assert [(a["id"], a["idx"], a["language"], a["codec"], a["channels"], a["default"],
              a["visible"], a["mode"], a["group"], a["name"]) for a in ren["audioSurround"]] == [
         ("a5", 0, "eng", "ec-3", 6, True, True, "encode", "audio-surround", "English 5.1"),
         ("a6", 1, "ger", "ec-3", 6, False, True, "encode", "audio-surround", "German 5.1"),
-        ("a7", 3, "spa", "ec-3", 6, False, False, "copy", "audio-surround", "Spanish 5.1")]
+        ("a7", 3, "spa", "ec-3", 6, False, True, "copy", "audio-surround", "Spanish 5.1")]
     assert manifest["hls"]["audioGroups"] == ["audio", "audio-surround"]
 
     surround = [m for m in _media(root) if m["GROUP-ID"] == "audio-surround"]
@@ -157,7 +166,7 @@ def test_a_film_in_four_languages_keeps_a_5_1_per_surround_language(
              m["CHANNELS"]) for m in surround] == [
         ("a5/playlist.m3u8", "en", "English 5.1", "YES", "YES", "6"),
         ("a6/playlist.m3u8", "de", "German 5.1", "NO", "YES", "6"),
-        ("a7/playlist.m3u8", "es", "Spanish 5.1", "NO", None, "6")]
+        ("a7/playlist.m3u8", "es", "Spanish 5.1", "NO", "YES", "6")]
     stereo = [m for m in _media(root) if m["GROUP-ID"] == "audio"]
     assert sum(m["DEFAULT"] == "YES" for m in stereo) == 1
     variants = _variants(root)
@@ -190,6 +199,50 @@ def test_a_stereo_film_gets_no_companion(tmp_path: Path, monkeypatch, films) -> 
     assert [v["AUDIO"] for v in _variants(root)] == ["audio"]
 
 
+def test_a_track_the_language_settings_hide_gets_no_companion(
+    tmp_path: Path, monkeypatch, films,
+) -> None:
+    # Spanish is not in the whitelist: its E-AC-3 5.1 is packaged as its
+    # stereo rendition alone, hidden.
+    monkeypatch.setattr(pk, "PACKAGES_ROOT", tmp_path / "packages")
+    manifest = pk.package_item(
+        ITEM, str(films["multi"]), "movie", title="multi", language_whitelist=["en", "de", "fr"],
+        options=pk.PackageOptions(surround_codec="eac3", preferred_languages=("en",)))
+    ren = manifest["renditions"]
+    assert [(a["id"], a["language"], a["visible"]) for a in ren["audio"]] == [
+        ("a0", "eng", True), ("a1", "ger", True), ("a2", "fre", True), ("a3", "spa", False),
+        ("a4", "eng", True)]
+    assert [(a["id"], a["idx"], a["language"], a["visible"], a["default"])
+            for a in ren["audioSurround"]] == [
+        ("a5", 0, "eng", True, True), ("a6", 1, "ger", True, False)]
+    root = tmp_path / "packages" / "movies" / ITEM[:2] / ITEM
+    assert [m["LANGUAGE"] for m in _media(root) if m["GROUP-ID"] == "audio-surround"] == [
+        "en", "de"]
+    assert _decoded(root / "hls" / "a3") == ("aac", 2, "stereo")
+
+
+def test_the_default_track_keeps_its_companion_though_no_track_is_shown(
+    tmp_path: Path, monkeypatch, films,
+) -> None:
+    # A whitelist none of the film's four languages is in shows no track;
+    # the default one (English, preferred) plays all the same, and keeps
+    # its 5.1, hidden as its stereo rendition is. No other track has one.
+    monkeypatch.setattr(pk, "PACKAGES_ROOT", tmp_path / "packages")
+    manifest = pk.package_item(
+        ITEM, str(films["multi"]), "movie", title="multi", language_whitelist=["it"],
+        options=pk.PackageOptions(surround_codec="eac3", preferred_languages=("en",)))
+    ren = manifest["renditions"]
+    assert [(a["id"], a["visible"], a["default"]) for a in ren["audio"]] == [
+        ("a0", False, True), ("a1", False, False), ("a2", False, False), ("a3", False, False),
+        ("a4", False, False)]
+    assert [(a["id"], a["idx"], a["language"], a["visible"], a["default"], a["mode"])
+            for a in ren["audioSurround"]] == [("a5", 0, "eng", False, True, "encode")]
+    root = tmp_path / "packages" / "movies" / ITEM[:2] / ITEM
+    surround = [m for m in _media(root) if m["GROUP-ID"] == "audio-surround"]
+    assert [(m["LANGUAGE"], m["DEFAULT"]) for m in surround] == [("en", "YES")]
+    assert _decoded(root / "hls" / "a5") == ("eac3", 6, "5.1(side)")
+
+
 # ------------------------------------------------------------- the v2 record
 
 def _record(lib: Path, work: Path, original: Path) -> dict:
@@ -213,16 +266,17 @@ def _record(lib: Path, work: Path, original: Path) -> dict:
     }
 
 
-def _v2(tmp_path: Path, film: Path, surround: str) -> tuple[Path, dict, dict]:
-    """One v2 run of film through the worker: the library root, the
-    package record and the source record."""
+def _v2(tmp_path: Path, film: Path, surround: str, **options: object) -> tuple[Path, dict, dict]:
+    """One v2 run of film through the worker, the catalog's whitelist
+    English and German: the library root, the package record and the
+    source record."""
     lib, work = tmp_path / "library", tmp_path / "work"
     arrival = work / "incoming" / film.parent.name
     shutil.copytree(film.parent, arrival)
     record = _record(lib, work, arrival / film.name)
     catalog = Catalog()
     worker._process_one(ClaimedItem.from_json(record), catalog,  # type: ignore[arg-type]
-                        pk.PackageOptions(surround_codec=surround))
+                        pk.PackageOptions(surround_codec=surround, **options))  # type: ignore[arg-type]
     assert [s for s, _ in catalog.written] == ["in_progress", "done"], catalog.written
     item_dir = Path(record["library"]["itemDir"])
     package = json.loads((item_dir / "versions" / VERSION / "package.json").read_text())
@@ -239,15 +293,16 @@ def _gate(source: dict, package: dict) -> list[str]:
 def test_a_v2_record_carries_the_companions_and_validates(tmp_path: Path, films) -> None:
     lib, package, source = _v2(tmp_path, films["multi"], "eac3")
     ren = package["renditions"]
-    assert [a["id"] for a in ren["audio"]] == ["a0", "a1", "a2", "a3", "a4"]
+    assert [(a["id"], a["visible"]) for a in ren["audio"]] == [
+        ("a0", True), ("a1", True), ("a2", False), ("a3", False), ("a4", True)]
     # Each companion names the track of the original it was made from, and
-    # how many channels that track has.
+    # how many channels that track has. The Spanish 5.1, which the
+    # catalog's whitelist hides, has none.
     assert [(a["id"], a["language"], a["codec"], a["channels"], a["sourceStreamIndex"],
              a["sourceChannels"], a["default"], a["group"], a["name"], a["purpose"])
             for a in ren["audioSurround"]] == [
         ("a5", "eng", "ec-3", 6, 1, 6, True, "audio-surround", "English 5.1", "main"),
-        ("a6", "ger", "ec-3", 6, 2, 8, False, "audio-surround", "German 5.1", "main"),
-        ("a7", "spa", "ec-3", 6, 4, 6, False, "audio-surround", "Spanish 5.1", "main")]
+        ("a6", "ger", "ec-3", 6, 2, 8, False, "audio-surround", "German 5.1", "main")]
     assert package["hls"]["audioGroups"] == ["audio", "audio-surround"]
     # The package no longer loses surround. A 5.1 can't keep a 7.1's two
     # extra channels: those, and the FLAC's lossless coding, are the
@@ -279,3 +334,65 @@ def test_a_stereo_sources_v2_record_has_no_surround_group(tmp_path: Path, films)
     assert package["hls"]["audioGroups"] == ["audio"]
     assert _gate(source, package) == []
     _validate(lib)
+
+
+def _timeless(init: bytes) -> bytes:
+    """An init segment without the moments shaka-packager writes into it, the
+    time of its run: the creation and modification times of its mvhd, tkhd
+    and mdhd, zero."""
+    buf = bytearray(init)
+
+    def walk(start: int, end: int) -> None:
+        for pos, header, size, kind in hdr10._boxes(buf, start, end):
+            if kind in (b"moov", b"trak", b"mdia"):
+                walk(pos + header, pos + size)
+            elif kind in (b"mvhd", b"tkhd", b"mdhd"):
+                at, width = pos + header + 4, 8 if buf[pos + header] == 1 else 4
+                buf[at:at + 2 * width] = bytes(2 * width)
+
+    walk(0, len(buf))
+    return bytes(buf)
+
+
+def _rendition_files(lib: Path, rid: str) -> dict[str, bytes]:
+    folder = lib / "movies" / ITEM[:2] / ITEM / "versions" / VERSION / "hls" / rid
+    return {p.name: _timeless(p.read_bytes()) if p.name == "init.mp4" else p.read_bytes()
+            for p in sorted(folder.iterdir())}
+
+
+def test_a_hidden_tracks_stereo_is_what_it_was_and_the_gate_names_the_5_1(
+    tmp_path: Path, films, monkeypatch,
+) -> None:
+    # Every surround track hidden, of every kind a companion is made of: an
+    # AC-3 5.1, a FLAC 7.1, a PCM 5.1 and an AAC 5.1 (each encoded, from a
+    # split of its decoded signal), an E-AC-3 5.1 (copied). None gets a 5.1
+    # now; the stereo rendition of each is, byte for byte, the one a run
+    # that made the companions made.
+    lib, package, source = _v2(tmp_path / "now", films["hidden"], "eac3", stereo_loudness=None)
+    assert [(a["id"], a["language"], a["visible"], a["default"])
+            for a in package["renditions"]["audio"]] == [
+        ("a0", "eng", True, True), ("a1", "fre", False, False), ("a2", "ita", False, False),
+        ("a3", "spa", False, False), ("a4", "por", False, False), ("a5", "jpn", False, False)]
+    assert "audioSurround" not in package["renditions"]
+    assert package["hls"]["audioGroups"] == ["audio"]
+    # What the package carries, its record says: no 5.1, which deleting the
+    # original costs.
+    assert (source["essence"]["surround"], source["essence"]["maxAudioChannels"]) == (True, 8)
+    assert (package["essence"]["surround"], package["essence"]["maxAudioChannels"]) == (False, 2)
+    assert _gate(source, package) == ["losslessAudio", "maxAudioChannels", "surround"]
+    _validate(lib)
+
+    plan = pk._surround_plan
+
+    def every_track(streams, _visible, options, _default=None):
+        return plan(streams, set(range(len(streams))), options)
+
+    monkeypatch.setattr(pk, "_surround_plan", every_track)
+    before, made, _source = _v2(tmp_path / "before", films["hidden"], "eac3",
+                                stereo_loudness=None)
+    assert [(a["language"], a["sourceChannels"], a["visible"])
+            for a in made["renditions"]["audioSurround"]] == [
+        ("fre", 6, False), ("ita", 8, False), ("spa", 6, False), ("por", 6, False),
+        ("jpn", 6, False)]
+    for rid in ("a0", "a1", "a2", "a3", "a4", "a5"):
+        assert _rendition_files(lib, rid) == _rendition_files(before, rid), rid
