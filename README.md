@@ -686,7 +686,19 @@ too an audio or a subtitle track whose stream is a commentary
 no word for): such a track is a `commentary` or a `description` by
 `disposition`, counted in the package's `commentaryTracks`,
 `commentarySubtitles` and `audioDescriptionTracks` as the source's stream
-is. A
+is. A subtitle is forced, or for the deaf and hard of hearing, in
+`package.json` as the source record reads its stream (the record logic's
+own reading of the original's probe): one the source record calls forced
+by its disposition, its title ("Forced") or its content (a track neither
+says anything of, with a small fraction of the cues of the full track in
+its language: a few lines, such as the signs and the lines in another
+language) is `forced: true`, and one it calls `sdh` by its title is `sdh`
+whatever title the encode kept, so the package's `forcedSubtitleLanguages`
+and `sdhSubtitleLanguages` name every language of a track it carries that
+the source's do. A client shows a forced subtitle in the language of the
+audio it plays by itself. Only the record says so: the master's subtitle
+names, flags and order are made of each stream's own disposition and
+title, as before. A
 subtitle made from a file that came with the
 original names its copy (`fromSidecar: "sources/<sourceId>/subtitle-<n>…"`):
 the file the copy was made from, or the copy itself, by its path, else a
