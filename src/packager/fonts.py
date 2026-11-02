@@ -18,16 +18,7 @@ from __future__ import annotations
 
 import struct
 
-# What a font file is by its first four bytes: its sfnt version, a
-# collection's tag, or WOFF's signature.
-_MAGIC = {
-    b"\x00\x01\x00\x00": "ttf",
-    b"true": "ttf",
-    b"OTTO": "otf",
-    b"ttcf": "ttc",
-    b"wOFF": "woff",
-    b"wOF2": "woff2",
-}
+from .libv2_records import font_signature
 
 # The name table's names a script asks for a font by: its family (1), its
 # full name (4) and its PostScript name (6).
@@ -42,9 +33,11 @@ _MAX_TABLES = 512
 
 
 def font_format(data: bytes) -> str | None:
-    """The format a font file's bytes are: ttf, otf, ttc, woff or woff2;
+    """The format a font file's bytes are: ttf, otf, ttc, woff or woff2, by
+    the signature its first four bytes are, as the record logic reads one
+    (libv2_records.font_signature: a source tells a font by it alike);
     None for bytes that are none of them."""
-    return _MAGIC.get(bytes(data[:4]))
+    return font_signature(data)
 
 
 def font_names(data: bytes) -> list[str]:

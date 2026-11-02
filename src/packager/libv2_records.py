@@ -92,7 +92,12 @@ import copy, datetime, hashlib, json, os, re, shutil, subprocess, uuid
 # record too (styled_original), and the font files a manifest lists (fonts: [{path, format, names,
 # sourceStreamIndex}]) are listed in the package's record (font_file); the package's essence has styled
 # subtitles and fonts when it carries them, for every stream of its source that has them where the
-# source's streams are known (package_essence). A manifest without them gives the record it gave.
+# source's streams are known (package_essence). A manifest without them gives the record it gave. An
+# attachment is a font by a MIME type that names one in any of the words a font's carries (font,
+# opentype, truetype, sfnt), by a font's file name (.ttf .otf .ttc .woff .woff2), or, where neither says
+# so and no picture's MIME type says otherwise, by its first bytes — a font's signature (attachment_role;
+# attachment_heads reads them, and the stream then says it: signature) — in a source and as a package
+# carries it alike, so no font goes uncounted with its original.
 LIBV2_RECORDS = 10
 
 NS = uuid.uuid5(uuid.NAMESPACE_URL, "https://zaentrum.github.io/schemas/library")
@@ -127,6 +132,16 @@ STYLED_FORMATS = ("ass",)
 # What a package's font file is, by its bytes: TrueType, OpenType with CFF outlines, a collection of
 # either, WOFF and WOFF2. A file of a font attachment whose bytes are none of them has no format.
 FONT_FORMATS = ("ttf", "otf", "ttc", "woff", "woff2")
+# A font's signature, its first four bytes, and the format it says (font_signature).
+FONT_SIGNATURES = {b"\x00\x01\x00\x00": "ttf", b"true": "ttf", b"OTTO": "otf", b"ttcf": "ttc", b"wOFF": "woff",
+                   b"wOF2": "woff2"}
+# What says an attachment is a font (attachment_role): a MIME type in any of the words a font's carries —
+# font/ttf, font/otf, font/collection, application/x-truetype-font, application/vnd.ms-opentype,
+# application/font-sfnt, application/x-font-ttf — or a font's file name.
+FONT_MIME_RE = re.compile(r"font|opentype|truetype|sfnt", re.I)
+FONT_FILE_RE = re.compile(r"\.(ttf|otf|ttc|woff2?)$", re.I)
+# How many of an attachment's first bytes attachment_heads reads.
+HEAD_BYTES = 16
 
 
 # ---------------------------------------------------------------- small helpers
@@ -569,7 +584,57 @@ def bit_depth(s):
     return int(m.group(1)) if m else (8 if pf else None)
 
 
-def norm_stream(s):
+def font_signature(head):
+    """The font format a file's first bytes say it is (FONT_SIGNATURES), or None."""
+    return FONT_SIGNATURES.get(bytes(head or b"")[:4])
+
+
+def attachment_role(mime, filename, head=None):
+    """What an attachment is: a font by a MIME type that names one or a font's file name (FONT_MIME_RE,
+    FONT_FILE_RE); a cover by a picture's MIME type; else, where its first bytes were read (head), a font
+    when they are a font's signature; else other. A source counts a font as a font, and a package carries
+    every one it counts, so none leaves with its original unnoticed."""
+    if (mime and FONT_MIME_RE.search(str(mime))) or (filename and FONT_FILE_RE.search(str(filename).strip())):
+        return "font"
+    if mime and str(mime).strip().lower().startswith("image/"):
+        return "cover"
+    return "font" if font_signature(head) else "other"
+
+
+def attachment_heads(path, probe):
+    """The first bytes (HEAD_BYTES) of each attachment of the file at path that its probe gives no role
+    by itself — no font's MIME type or name, no picture's MIME type (attachment_role) —, by its stream
+    index: what tells a font by its signature. ffmpeg hands each to a pipe, read no further than that and
+    closed; an attachment ffmpeg can't read, or a file without ffmpeg, gives none. Nothing is written."""
+    out = {}
+    if not shutil.which("ffmpeg"):
+        return out
+    for s in (probe or {}).get("streams") or []:
+        tags = s.get("tags") or {}
+        index = s.get("index")
+        if s.get("codec_type") != "attachment" or not isinstance(index, int) or s.get("extradata_size") == 0 \
+                or attachment_role(tags.get("mimetype"), tags.get("filename")) != "other":
+            continue
+        try:
+            p = subprocess.Popen(["ffmpeg", "-nostdin", "-v", "quiet", "-y", f"-dump_attachment:{index}", "pipe:1",
+                                  "-i", path, "-map", f"0:{index}", "-c", "copy", "-t", "0", "-f", "null", "-"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            try:
+                head = p.stdout.read(HEAD_BYTES)
+            finally:
+                p.stdout.close()
+                p.kill()
+                p.wait(timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if head:
+            out[index] = head
+    return out
+
+
+def norm_stream(s, head=None):
+    """One stream of a probe as a record keeps it. head is an attachment's first bytes, where they were
+    read (attachment_heads): what its role is told by when its MIME type and its name say nothing."""
     t = s.get("codec_type")
     tags = s.get("tags") or {}
     language, raw = lang(tags.get("language"))
@@ -619,9 +684,10 @@ def norm_stream(s):
         return base
     if t == "attachment":
         fname, mime = tags.get("filename"), tags.get("mimetype")
-        role = "font" if (mime and "font" in mime) or (fname and re.search(r"\.(ttf|otf|ttc)$", fname, re.I)) \
-            else "cover" if (mime and mime.startswith("image/")) else "other"
+        role = attachment_role(mime, fname, head)
         base.update({"type": "attachment", "filename": text(fname), "mimetype": text(mime), "role": role})
+        if role == "font" and attachment_role(mime, fname) != "font":
+            base["signature"] = font_signature(head)
         return base
     base.update({"type": "data"})
     return base
@@ -888,13 +954,14 @@ def fidelity(streams, container):
     return {"class": "derivative" if evidence else "unknown", "fingerprint": fingerprint, "evidence": evidence}
 
 
-def probed(probe):
+def probed(probe, heads=None):
     """What a probe found in a file, in the terms a source record and an extra share: its container,
     every stream, whether it was already a re-encode, and its essence. The container's title tag is
-    not among them, in any case: it routinely names where the file came from."""
+    not among them, in any case: it routinely names where the file came from. heads are the first bytes
+    of the attachments the probe gives no role by itself, by stream index (attachment_heads)."""
     fmt = probe.get("format") or {}
     tags = {k: text(v) for k, v in (fmt.get("tags") or {}).items() if text(v) and str(k).lower() != "title"}
-    streams = [norm_stream(s) for s in probe.get("streams") or []]
+    streams = [norm_stream(s, (heads or {}).get(s.get("index"))) for s in probe.get("streams") or []]
     infer_forced_by_size(streams)
     duration = fmt.get("duration")
     container = {"format": fmt.get("format_name") or "",
@@ -996,7 +1063,7 @@ def sidecar_entry(source_id, n, path, arrival_name, language=None, forced=False)
 
 
 def source_record(source_id, name, size_bytes, *, taken_at, taken_by, library_path, qh1=None, mtime=None,
-                  probe=None, probe_version=None, sidecars=(), note=None, covers=()):
+                  probe=None, probe_version=None, sidecars=(), note=None, covers=(), heads=None):
     """sources/<sourceId>/source.json for one original, and the bytes of the ffprobe.json written
     beside it (None without a probe). Returns (record, probe bytes).
 
@@ -1012,7 +1079,11 @@ def source_record(source_id, name, size_bytes, *, taken_at, taken_by, library_pa
     covers, for a file that holds several episodes, is the item ids of the episodes it holds in
     episode order, the holder first — the episode whose folder keeps this source — as the database
     linked them; empty, as it is by default, for a file of one episode. It is written as given: the
-    record logic does not read it from the name, whose numbering is only what the release claimed."""
+    record logic does not read it from the name, whose numbering is only what the release claimed.
+
+    heads are the first bytes of the attachments the probe gives no role by itself, by stream index, as
+    attachment_heads() reads them from the original: an attachment that is a font by its signature alone
+    is one in the record, and its stream says so (signature)."""
     if qh1 is None and not text(note):
         raise ValueError("a source record without the original's fixity needs a note that says why it has none")
     covers = [str(c) for c in covers or ()]
@@ -1032,7 +1103,7 @@ def source_record(source_id, name, size_bytes, *, taken_at, taken_by, library_pa
     rec["labels"] = labels(name, folder)
     raw = None
     if probe:
-        facts = probed(probe)
+        facts = probed(probe, heads)
         raw = json_bytes(scrub_probe(probe, file["name"]))
         rec.update(container=facts["container"], fidelity=facts["fidelity"], streams=facts["streams"],
                    sidecars=list(sidecars), covers=covers, essence=facts["essence"],
@@ -1368,14 +1439,14 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
 # ---------------------------------------------------------------- extras/<extraId>/extra.json
 def extra_record(extra_id, *, created_at, created_by, kind, title, localized_titles=None, language=None,
                  season_number=None, origin=None, probe=None, probe_version=None, probed_at=None,
-                 original_files=(), originals=(), packaged_from=()):
+                 original_files=(), originals=(), packaged_from=(), heads=None):
     """extras/<extraId>/extra.json: what the extra is, as the catalog took it in, and what a probe of
     its original found. An extra of the platform keeps no original — it is deleted once the package is
     recorded — so original_files and originals stay empty, and packaged_from describes the original the
     package was made from: [{name, sizeBytes, fixity: {qh1}}], each named here as the library names an
     original, library_original_name() of the name it arrived under — the nth of several original-<n> —
     whatever name it is given. Without a language, the language spoken in its first audio track is the
-    extra's."""
+    extra's. heads, as a source record's (source_record), are its attachments' first bytes."""
     doc = {"schema": "zaentrum.library.extra/2", "extraId": extra_id, "createdAt": created_at,
            "createdBy": created_by, "kind": kind, "title": title, "localizedTitles": dict(localized_titles or {}),
            "language": language, "runtimeMs": None}
@@ -1389,7 +1460,7 @@ def extra_record(extra_id, *, created_at, created_by, kind, title, localized_tit
     if origin:
         doc["origin"] = origin
     if probe:
-        facts = probed(probe)
+        facts = probed(probe, heads)
         spoken = [x["language"] for x in facts["streams"] if x["type"] == "audio" and x.get("language")]
         doc.update(language=language or (spoken[0] if spoken else None), runtimeMs=facts["container"]["durationMs"],
                    **facts, probe={"tool": "ffprobe", "version": probe_version, "at": probed_at or created_at,

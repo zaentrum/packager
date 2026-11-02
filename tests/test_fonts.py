@@ -137,13 +137,12 @@ def test_every_font_attachment_is_one_run_over_the_originals_header(
         _attachment(5, "Example Serif Bold.TTF", "font/ttf", len(SERIF_BOLD)),
         _attachment(6, "notes.txt", "text/plain"),
         _attachment(7, "display.otf", "application/vnd.ms-opentype", len(otf), "otf"),
-        # OpenType by a MIME type that says no font, and by no name: the
-        # source record calls it none, and so it is taken as none
+        # OpenType by its MIME type alone, under no font's name
         _attachment(9, "display", "application/vnd.ms-opentype", len(otf)),
         _attachment(8, "packed.woff", "font/woff", 52),
     ]
     woff = b"wOFF" + bytes(48)
-    tools = Tools(monkeypatch, streams, {3: SANS, 5: SERIF_BOLD, 7: otf, 8: woff})
+    tools = Tools(monkeypatch, streams, {3: SANS, 5: SERIF_BOLD, 7: otf, 8: woff, 9: otf})
     subs, work = tmp_path / "subs", tmp_path / "work"
     work.mkdir()
     out = pk._extract_fonts(ORIGINAL, subs, work)
@@ -152,10 +151,12 @@ def test_every_font_attachment_is_one_run_over_the_originals_header(
          "-select_streams", "t", str(ORIGINAL)],
         ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
          "-dump_attachment:3", str(work / "font-3"), "-dump_attachment:5", str(work / "font-5"),
-         "-dump_attachment:7", str(work / "font-7"), "-dump_attachment:8", str(work / "font-8"),
+         "-dump_attachment:7", str(work / "font-7"), "-dump_attachment:9", str(work / "font-9"),
+         "-dump_attachment:8", str(work / "font-8"),
          "-i", str(ORIGINAL), "-map", "0:3", "-c", "copy", "-t", "0", "-f", "null", "-"],
     ]
-    # By the original's streams, a font by its MIME type or its name; each
+    # By the original's streams, a font by its MIME type (in any of a font's
+    # words) or its name; each
     # named by its place and what its bytes are, never by its file name.
     assert out == [
         {"path": "subs/fonts/0.ttf", "format": "ttf",
@@ -167,10 +168,13 @@ def test_every_font_attachment_is_one_run_over_the_originals_header(
         {"path": "subs/fonts/2.otf", "format": "otf",
          "names": ["Example Display", "Example Display Regular", "ExampleDisplay-Regular"],
          "sourceStreamIndex": 7},
-        {"path": "subs/fonts/3.woff", "format": "woff", "names": [], "sourceStreamIndex": 8},
+        {"path": "subs/fonts/3.otf", "format": "otf",
+         "names": ["Example Display", "Example Display Regular", "ExampleDisplay-Regular"],
+         "sourceStreamIndex": 9},
+        {"path": "subs/fonts/4.woff", "format": "woff", "names": [], "sourceStreamIndex": 8},
     ]
     assert {p.name: p.read_bytes() for p in (subs / "fonts").iterdir()} == {
-        "0.ttf": SANS, "1.ttf": SERIF_BOLD, "2.otf": otf, "3.woff": woff}
+        "0.ttf": SANS, "1.ttf": SERIF_BOLD, "2.otf": otf, "3.otf": otf, "4.woff": woff}
 
 
 def test_an_original_without_fonts_is_read_once_and_gives_none(
