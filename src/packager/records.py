@@ -9,8 +9,10 @@ so the two agree on every byte the deletion gate reads. What only the
 packager knows it adds before handing over: which stream of the original
 each rendition was made from, and what that stream's disposition says it
 is for — a subtitle for the deaf and hard of hearing, a commentary, an
-audio description. Where the records are written, and in which order, is
-library.py's business."""
+audio description — and, for a subtitle, what the record logic reads that
+stream as besides: forced, or for the deaf and hard of hearing, by its
+title or its content, as the source record has it. Where the records are
+written, and in which order, is library.py's business."""
 
 from __future__ import annotations
 
@@ -117,6 +119,35 @@ def _of_kind(probe: OriginalProbe, kind: str) -> list[dict[str, Any]]:
     return [s for s in probe.raw.get("streams") or [] if s.get("codec_type") == kind]
 
 
+def _subtitle_purposes(probe: OriginalProbe) -> dict[int, str]:
+    """What each subtitle stream of the original is for, by its index, as
+    its source record says: the record logic's reading of the probe
+    (libv2_records.probed), the one a source record's streams and essence
+    are made of — its disposition, else its title (subtitle_purpose), else,
+    for a track neither says anything of, its content: one with a small
+    fraction of the cues of the full track in its language is forced
+    (infer_forced_by_size)."""
+    return {s["index"]: s["purpose"] for s in rec.probed(probe.raw)["streams"]
+            if s["type"] == "subtitle"}
+
+
+def _as_recorded(entry: dict[str, Any], purpose: str | None) -> None:
+    """Mark a subtitle's manifest entry so that its record reads it as the
+    source record reads the stream it was made from (`purpose`), for the
+    languages the essences count. Forced, whatever made it so — its
+    disposition, its title, or its content: `forced`, the flag a client
+    shows a track by itself for, which the record reads first. For the deaf
+    and hard of hearing, where the entry isn't read so already, by the
+    disposition the caller marked (hearingImpaired) or by its title:
+    `hearingImpaired`. Nothing is taken away, and nothing else is marked: a
+    signs-and-songs track is so by its title alone, which its record reads
+    as the source record reads its stream's."""
+    if purpose == "forced":
+        entry["forced"] = True
+    elif purpose == "sdh" and rec.subtitle_rendition(entry, 0)["purpose"] != "sdh":
+        entry["hearingImpaired"] = True
+
+
 def for_record(built: Built, probe: OriginalProbe, now: str) -> dict[str, Any]:
     """The built package's manifest as its record is made of it: completed
     at `now`, the moment its chain closes (the version record's too), and
@@ -130,9 +161,18 @@ def for_record(built: Built, probe: OriginalProbe, now: str) -> dict[str, Any]:
     (commentary), and an audio one whose stream is for the blind and
     visually impaired (visualImpaired: visual_impaired or descriptions):
     the record makes it a commentary or an audio description, as the
-    source's essence counts it. The transcoder's v0 carries the original's
-    tracks in order, so a track is found by its place among those of its
-    codec (packager._source_ordinals)."""
+    source's essence counts it. A subtitle is forced, or for the deaf and
+    hard of hearing, as the source record reads its stream
+    (_subtitle_purposes, _as_recorded): one a source record calls forced
+    by its title ("Forced") or its content (a few lines beside the full
+    track in its language) is `forced` in the package's record as well, so
+    the package's essence names its language as the source's does, and a
+    client shows it by itself. Only the record is so: the built manifest —
+    the master's subtitle names, flags and order, and the default it picks
+    — keeps each stream's own disposition and title, as before. The
+    transcoder's v0 carries the original's tracks in order, so a track is
+    found by its place among those of its codec
+    (packager._source_ordinals)."""
     man = copy.deepcopy(built.manifest)
     man["packagedAt"] = now
     ren = man.get("renditions") or {}
@@ -152,6 +192,7 @@ def for_record(built: Built, probe: OriginalProbe, now: str) -> dict[str, Any]:
             a.update(_audio_marks(audio[at[idx]]))
     subtitles = _of_kind(probe, "subtitle")
     st = _source_ordinals(built.probe.subtitles, subtitles)
+    purposes = _subtitle_purposes(probe) if subtitles else {}
     for s in man.get("subtitles") or []:
         if s.get("external"):
             continue
@@ -162,6 +203,7 @@ def for_record(built: Built, probe: OriginalProbe, now: str) -> dict[str, Any]:
                 s["hearingImpaired"] = True
             if _commentary(subtitles[st[n]]):
                 s["commentary"] = True
+            _as_recorded(s, purposes.get(s["sourceStreamIndex"]))
     return man
 
 
