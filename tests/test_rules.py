@@ -34,7 +34,8 @@ def test_the_payload_is_the_catalogs_contract() -> None:
     assert got == {"version": "3f2a9c1", "rules": {
         "surroundAudio": "eac3", "surroundLayout": "5.1", "surroundBitrate": "448k",
         "surroundTracks": "shown", "preferredLanguages": [], "stereoAudio": "aac",
-        "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"]}}
+        "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"],
+        "styledSubtitles": ["ass"]}}
 
 
 def test_the_stereo_codec_is_the_one_its_encode_is_made_with() -> None:
@@ -111,7 +112,8 @@ def test_the_payload_says_the_values_this_process_runs_with() -> None:
     got = rules_payload(options(surround_bitrate="640k"), None, image_subtitles=["pgs"])["rules"]
     assert got == {"surroundAudio": "off", "surroundLayout": "5.1", "surroundBitrate": "640k",
                    "surroundTracks": "shown", "preferredLanguages": [], "stereoAudio": "aac",
-                   "stereoBitrate": "192k", "imageSubtitles": ["pgs"]}
+                   "stereoBitrate": "192k", "imageSubtitles": ["pgs"],
+                   "styledSubtitles": ["ass"]}
 
 
 @pytest.mark.parametrize(("installed", "forms"), [
@@ -128,6 +130,14 @@ def test_the_image_subtitles_are_those_the_code_carries(monkeypatch: pytest.Monk
                         lambda name: f"/usr/bin/{name}" if name in installed else None)
     assert image_subtitle_forms() == forms
     assert rules_payload(options(), None)["rules"]["imageSubtitles"] == forms
+
+
+def test_the_styled_subtitles_are_those_the_code_keeps_as_they_are() -> None:
+    # an ASS track's script beside its WebVTT copy, in the format its entry names
+    from packager import packager
+
+    assert rules_payload(options(), None)["rules"]["styledSubtitles"] == [
+        packager._sidecar(0, "ass").styled.rsplit(".", 1)[1]] == [packager.STYLED_FORMAT]
 
 
 def test_the_version_is_the_images(monkeypatch: pytest.MonkeyPatch) -> None:

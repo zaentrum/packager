@@ -12,7 +12,7 @@ knows the rules only as a worker reports them, and assumes none:
       "surroundBitrate": "448k", "surroundTracks": "shown",
       "preferredLanguages": ["de", "en"],
       "stereoAudio": "aac", "stereoBitrate": "192k",
-      "imageSubtitles": ["pgs", "vobsub"]}}
+      "imageSubtitles": ["pgs", "vobsub"], "styledSubtitles": ["ass"]}}
 
 Every value is the one this process runs with (README "Output", "Audio",
 "Configuration"): the 5.1 companion's codec (`off`: none), the layout it
@@ -30,7 +30,10 @@ which its encode is made with), and the forms of image
 subtitles a package carries as they are — what the code really extracts:
 PGS (a `.sup` stream copy) always, VobSub (an `.idx` and `.sub` pair)
 only where mkvextract is installed, and from a Matroska file alone. DVB is
-not carried (ffmpeg cannot write it), nor is XSUB.
+not carried (ffmpeg cannot write it), nor is XSUB. And the forms of styled
+subtitles a package carries as they are, with the fonts the original
+carries: ASS (an SSA track is one to ffmpeg), its script beside its WebVTT
+copy (packager.STYLED_FORMAT).
 
 The report goes at startup and every ten minutes, on a thread and a client
 of its own. A catalog that does not take it (404 or 405: older than the
@@ -52,6 +55,7 @@ import structlog
 from .packager import (
     STEREO_BITRATE,
     STEREO_CODEC,
+    STYLED_FORMAT,
     SURROUND_LAYOUT,
     SURROUND_TRACKS,
     PackageOptions,
@@ -106,6 +110,7 @@ def rules_payload(options: PackageOptions, version: str | None,
             "stereoAudio": STEREO_CODEC,
             "stereoBitrate": STEREO_BITRATE,
             "imageSubtitles": forms,
+            "styledSubtitles": [STYLED_FORMAT],
         },
     }
 
