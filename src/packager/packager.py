@@ -3448,9 +3448,12 @@ FONTS_DIR = "fonts"
 def _font_attachments(original: Path) -> list[dict[str, Any]]:
     """The font attachments of the original, as its source record reads
     them: each attachment stream the record logic calls a font
-    (libv2_records.norm_stream: a MIME type that says font, or a file name
-    that ends .ttf, .otf or .ttc), in the order of its streams. [] for an
-    original that holds none, or that ffprobe can't read."""
+    (libv2_records.attachment_role: a MIME type in any of the words a
+    font's carries, a font's file name, or, where neither says so and it
+    is no picture, its first bytes, a font's signature, read as
+    attachment_heads reads them for the record), in the order of its
+    streams. [] for an original that holds none, or that ffprobe can't
+    read."""
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams",
@@ -3462,8 +3465,10 @@ def _font_attachments(original: Path) -> list[dict[str, Any]]:
     except (OSError, ValueError, subprocess.CalledProcessError) as e:
         log.warning("packager.fonts.probe_failed", path=str(original), error=str(e)[:200])
         return []
-    return [s for s in streams if s.get("codec_type") == "attachment"
-            and isinstance(s.get("index"), int) and rec.norm_stream(s)["role"] == "font"]
+    attachments = [s for s in streams if s.get("codec_type") == "attachment"
+                   and isinstance(s.get("index"), int)]
+    heads = rec.attachment_heads(str(original), {"streams": attachments}) if attachments else {}
+    return [s for s in attachments if rec.norm_stream(s, heads.get(s["index"]))["role"] == "font"]
 
 
 def _extract_fonts(original: Path, subs_dir: Path, tmpdir: Path) -> list[dict[str, Any]]:
@@ -3475,7 +3480,8 @@ def _extract_fonts(original: Path, subs_dir: Path, tmpdir: Path) -> list[dict[st
     bin), the names a script asks for it by (fonts.font_names) and the
     original's stream it was taken from (sourceStreamIndex).
 
-    One ffmpeg run takes them all (-dump_attachment), opening the original
+    A font told by its first bytes alone is taken as any other. One ffmpeg
+    run takes them all (-dump_attachment), opening the original
     and reading its header alone: its output is nothing, the first font's
     stream copied for no time to the null muxer. A font is taken only
     when ffmpeg wrote all of it — as many bytes as ffprobe says the

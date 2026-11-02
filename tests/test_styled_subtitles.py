@@ -47,6 +47,8 @@ ASSET = "5ab70000-0000-4000-8000-0000000000f5"
 SANS = fontmaker.truetype("Example Sans")
 SERIF = fontmaker.truetype("Example Serif", "Bold")
 FAMILY = fontmaker.collection(("Example Display", "Regular"), ("Example Display", "Italic"))
+# A font attached under a MIME type and a name that say nothing: its first bytes tell it.
+MONO = fontmaker.opentype_header("Example Mono")
 
 STYLES = ("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
           "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, "
@@ -80,9 +82,10 @@ def _ff(*args: str) -> None:
 @pytest.fixture(scope="module")
 def clip(tmp_path_factory) -> Path:
     """The original, in its arrival folder, with a styled file beside it:
-    HEVC, a stereo AAC track, two ASS tracks and an SRT one, three fonts
-    attached (by the MIME types Matroska files carry them under, one of
-    them a collection) and a cover image."""
+    HEVC, a stereo AAC track, two ASS tracks and an SRT one, four fonts
+    attached (three by the MIME types Matroska files carry them under, one
+    of them a collection, and one under a MIME type and a name that say
+    nothing) and a cover image."""
     d = tmp_path_factory.mktemp("styled")
     (d / "dialogue.ass").write_text(DIALOGUE)
     (d / "signs.ass").write_text(SIGNS)
@@ -90,7 +93,8 @@ def clip(tmp_path_factory) -> Path:
     attached = {"sans.ttf": (SANS, "application/x-truetype-font", "Example Sans.ttf"),
                 "serif.ttf": (SERIF, "font/ttf", "Example Serif Bold.ttf"),
                 "cover.jpg": (b"\xff\xd8\xff\xe0 a cover", "image/jpeg", "cover.jpg"),
-                "display.ttc": (FAMILY, "font/collection", "Example Display.ttc")}
+                "display.ttc": (FAMILY, "font/collection", "Example Display.ttc"),
+                "data.bin": (MONO, "application/octet-stream", "data.bin")}
     args = ["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=4",
             "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4",
             "-i", str(d / "dialogue.ass"), "-i", str(d / "signs.ass"), "-i", str(d / "de.srt"),
@@ -223,9 +227,12 @@ def test_the_fonts_the_original_carries_are_taken_byte_for_byte_and_nothing_else
          "names": ["Example Display", "Example Display Regular", "ExampleDisplay-Regular",
                    "Example Display Italic", "ExampleDisplay-Italic"],
          "sourceStreamIndex": 8},
+        {"path": "subs/fonts/3.otf", "format": "otf",
+         "names": ["Example Mono", "Example Mono Regular", "ExampleMono-Regular"],
+         "sourceStreamIndex": 9},
     ]
     assert {p.name: p.read_bytes() for p in (vdir / "subs" / "fonts").iterdir()} == {
-        "0.ttf": SANS, "1.ttf": SERIF, "2.ttc": FAMILY}
+        "0.ttf": SANS, "1.ttf": SERIF, "2.ttc": FAMILY, "3.otf": MONO}
     # The fonts are files of the package: the chain lists them, every
     # digest holds.
     sums = (vdir / "checksums.sha256").read_text()
@@ -238,10 +245,12 @@ def test_the_gate_holds_the_original_for_no_style_and_no_font(packaged) -> None:
     vdir = item_dir / "versions" / VERSION
     source = json.loads((item_dir / "sources" / SOURCE / "source.json").read_text())
     package = json.loads((vdir / "package.json").read_text())
-    # The three fonts; the cover is an attached picture to ffprobe, a video
-    # stream no package takes for the film's.
-    assert [(s["index"], s.get("role")) for s in source["streams"]
-            if s["type"] == "attachment"] == [(5, "font"), (6, "font"), (8, "font")]
+    # The four fonts, the last by its first bytes, as its stream says; the
+    # cover is an attached picture to ffprobe, a video stream no package
+    # takes for the film's.
+    assert [(s["index"], s.get("role"), s.get("signature")) for s in source["streams"]
+            if s["type"] == "attachment"] == [
+        (5, "font", None), (6, "font", None), (8, "font", None), (9, "font", "otf")]
     assert [s["dispositions"].get("attachedPic", False) for s in source["streams"]
             if s["type"] == "video"] == [False, True]
     assert {k: source["essence"][k] for k in ("styledSubtitles", "fonts")} == {
@@ -262,7 +271,7 @@ def test_the_gate_holds_the_original_for_no_style_and_no_font(packaged) -> None:
     assert [k for k in rec.deletion_gate([source["essence"]], essence(plain, package["fonts"]))
             if k in ("styledSubtitles", "fonts")] == ["styledSubtitles"]
     assert [k for k in rec.deletion_gate([source["essence"]],
-                                         essence(package["subtitles"], package["fonts"][:2]))
+                                         essence(package["subtitles"], package["fonts"][:3]))
             if k in ("styledSubtitles", "fonts")] == ["fonts"]
 
 
@@ -293,6 +302,7 @@ def test_the_package_stores_manifest_says_the_same(
     assert [s.get("styled", {}).get("path") for s in manifest["subtitles"]] == [
         "subs/0.ass", "subs/1.ass", None, "subs/3.ass"]
     assert [(f["path"], f["sourceStreamIndex"]) for f in manifest["fonts"]] == [
-        ("subs/fonts/0.ttf", 5), ("subs/fonts/1.ttf", 6), ("subs/fonts/2.ttc", 8)]
+        ("subs/fonts/0.ttf", 5), ("subs/fonts/1.ttf", 6), ("subs/fonts/2.ttc", 8),
+        ("subs/fonts/3.otf", 9)]
     assert (root / "subs" / "fonts" / "2.ttc").read_bytes() == FAMILY
     assert (root / ".complete").exists()

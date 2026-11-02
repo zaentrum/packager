@@ -360,7 +360,14 @@ ends included, else its text in UTF-8, the same characters. A script
 ffmpeg can't copy costs that script only: its track keeps the WebVTT copy,
 and says nothing of a styled original. The fonts the original carries as
 attachments — every attachment the source record calls a font: a MIME type
-that says font, or a file name ending `.ttf`, `.otf` or `.ttc` — are taken
+in any of the words a font's carries (`font`, `opentype`, `truetype`,
+`sfnt`: `font/ttf`, `application/x-truetype-font`,
+`application/vnd.ms-opentype`, `application/font-sfnt` …), a file name
+ending `.ttf`, `.otf`, `.ttc`, `.woff` or `.woff2`, or, where neither says
+so and no picture's MIME type makes it a cover, its first bytes, a font's
+signature, which the record logic reads through a pipe from ffmpeg for
+the source record and for this alike (`attachment_heads`; the source's
+stream then says `signature`) — are taken
 out of the original (not the transcoder's encode, which carries none) in
 one more ffmpeg run that reads its header alone (`-dump_attachment`), each
 as its bytes are, into `subs/fonts/<n>.<format>`: `n` from 0 in the

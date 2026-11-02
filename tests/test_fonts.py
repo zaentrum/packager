@@ -19,6 +19,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from packager import fonts
+from packager import libv2_records as rec
 from packager import packager as pk
 
 SANS = fontmaker.truetype("Example Sans")
@@ -131,33 +132,48 @@ def test_every_font_attachment_is_one_run_over_the_originals_header(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     otf = fontmaker.opentype_header("Example Display")
+    other = fontmaker.opentype_header("Example Serif", "Italic")
     streams = [
         _attachment(3, "Example Sans.ttf", "application/x-truetype-font", len(SANS), "ttf"),
         _attachment(4, "cover.jpg", "image/jpeg"),
         _attachment(5, "Example Serif Bold.TTF", "font/ttf", len(SERIF_BOLD)),
         _attachment(6, "notes.txt", "text/plain"),
         _attachment(7, "display.otf", "application/vnd.ms-opentype", len(otf), "otf"),
-        # OpenType by its MIME type alone, under no font's name
-        _attachment(9, "display", "application/vnd.ms-opentype", len(otf)),
         _attachment(8, "packed.woff", "font/woff", 52),
+        # OpenType by its MIME type alone, under no font's name
+        _attachment(9, "display", "application/vnd.ms-opentype", len(other)),
+        # a font by its first bytes alone: its MIME type and its name say nothing
+        _attachment(10, "data.bin", "application/octet-stream", len(otf)),
     ]
     woff = b"wOFF" + bytes(48)
-    tools = Tools(monkeypatch, streams, {3: SANS, 5: SERIF_BOLD, 7: otf, 8: woff, 9: otf})
+    tools = Tools(monkeypatch, streams,
+                  {3: SANS, 5: SERIF_BOLD, 7: otf, 8: woff, 9: other, 10: otf})
+    read: list[list[int]] = []
+
+    def heads(path: str, probe: dict) -> dict[int, bytes]:
+        # what the record logic reads of the attachments the probe gives no role by itself
+        read.append([x["index"] for x in probe["streams"]])
+        assert path == str(ORIGINAL)
+        return {6: b"some notes, no f", 10: otf[:16]}
+
+    monkeypatch.setattr(pk.rec, "attachment_heads", heads)
     subs, work = tmp_path / "subs", tmp_path / "work"
     work.mkdir()
     out = pk._extract_fonts(ORIGINAL, subs, work)
+    assert read == [[3, 4, 5, 6, 7, 8, 9, 10]]
     assert tools.runs == [
         ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams",
          "-select_streams", "t", str(ORIGINAL)],
         ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
          "-dump_attachment:3", str(work / "font-3"), "-dump_attachment:5", str(work / "font-5"),
-         "-dump_attachment:7", str(work / "font-7"), "-dump_attachment:9", str(work / "font-9"),
-         "-dump_attachment:8", str(work / "font-8"),
+         "-dump_attachment:7", str(work / "font-7"), "-dump_attachment:8", str(work / "font-8"),
+         "-dump_attachment:9", str(work / "font-9"), "-dump_attachment:10", str(work / "font-10"),
          "-i", str(ORIGINAL), "-map", "0:3", "-c", "copy", "-t", "0", "-f", "null", "-"],
     ]
-    # By the original's streams, a font by its MIME type (in any of a font's
-    # words) or its name; each
-    # named by its place and what its bytes are, never by its file name.
+    # By the original's streams, a font by its MIME type, its name or its
+    # first bytes; each named by its place and what its bytes are, never by
+    # its file name.
+    display = ["Example Display", "Example Display Regular", "ExampleDisplay-Regular"]
     assert out == [
         {"path": "subs/fonts/0.ttf", "format": "ttf",
          "names": ["Example Sans", "Example Sans Regular", "ExampleSans-Regular"],
@@ -165,16 +181,16 @@ def test_every_font_attachment_is_one_run_over_the_originals_header(
         {"path": "subs/fonts/1.ttf", "format": "ttf",
          "names": ["Example Serif", "Example Serif Bold", "ExampleSerif-Bold"],
          "sourceStreamIndex": 5},
-        {"path": "subs/fonts/2.otf", "format": "otf",
-         "names": ["Example Display", "Example Display Regular", "ExampleDisplay-Regular"],
-         "sourceStreamIndex": 7},
-        {"path": "subs/fonts/3.otf", "format": "otf",
-         "names": ["Example Display", "Example Display Regular", "ExampleDisplay-Regular"],
+        {"path": "subs/fonts/2.otf", "format": "otf", "names": display, "sourceStreamIndex": 7},
+        {"path": "subs/fonts/3.woff", "format": "woff", "names": [], "sourceStreamIndex": 8},
+        {"path": "subs/fonts/4.otf", "format": "otf",
+         "names": ["Example Serif", "Example Serif Italic", "ExampleSerif-Italic"],
          "sourceStreamIndex": 9},
-        {"path": "subs/fonts/4.woff", "format": "woff", "names": [], "sourceStreamIndex": 8},
+        {"path": "subs/fonts/5.otf", "format": "otf", "names": display, "sourceStreamIndex": 10},
     ]
     assert {p.name: p.read_bytes() for p in (subs / "fonts").iterdir()} == {
-        "0.ttf": SANS, "1.ttf": SERIF_BOLD, "2.otf": otf, "3.otf": otf, "4.woff": woff}
+        "0.ttf": SANS, "1.ttf": SERIF_BOLD, "2.otf": otf, "3.woff": woff, "4.otf": other,
+        "5.otf": otf}
 
 
 def test_an_original_without_fonts_is_read_once_and_gives_none(
@@ -242,7 +258,10 @@ def test_ffmpeg_takes_the_fonts_out_byte_for_byte(tmp_path: Path) -> None:
              "serif.ttf": (SERIF_BOLD, "font/ttf", "Example Serif Bold.ttf"),
              "family.ttc": (ttc, "font/collection", "family.ttc"),
              "notes.txt": (b"some notes\n", "text/plain", "notes.txt"),
-             "display.otf": (otf, "application/vnd.ms-opentype", "Example Display.otf")}
+             "display.otf": (otf, "application/vnd.ms-opentype", "Example Display.otf"),
+             # a font by its first bytes alone, and one by its OpenType MIME type alone
+             "data.bin": (SANS, "application/octet-stream", "data.bin"),
+             "display": (otf, "application/vnd.ms-opentype", "display")}
     args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
             "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=10:duration=1",
             "-c:v", "libx264" if "libx264" in _encoders() else "mpeg4"]
@@ -255,11 +274,21 @@ def test_ffmpeg_takes_the_fonts_out_byte_for_byte(tmp_path: Path) -> None:
     out = pk._extract_fonts(original, tmp_path / "subs", tmp_path)
     assert [(f["path"], f["format"], f["sourceStreamIndex"]) for f in out] == [
         ("subs/fonts/0.ttf", "ttf", 1), ("subs/fonts/1.ttf", "ttf", 3),
-        ("subs/fonts/2.ttc", "ttc", 4), ("subs/fonts/3.otf", "otf", 6)]
-    assert [(tmp_path / f["path"]).read_bytes() for f in out] == [SANS, SERIF_BOLD, ttc, otf]
+        ("subs/fonts/2.ttc", "ttc", 4), ("subs/fonts/3.otf", "otf", 6),
+        ("subs/fonts/4.ttf", "ttf", 7), ("subs/fonts/5.otf", "otf", 8)]
+    assert [(tmp_path / f["path"]).read_bytes() for f in out] == [
+        SANS, SERIF_BOLD, ttc, otf, SANS, otf]
     assert out[2]["names"] == fonts.font_names(ttc)
     assert sorted(p.name for p in (tmp_path / "subs" / "fonts").iterdir()) == [
-        "0.ttf", "1.ttf", "2.ttc", "3.otf"]
+        "0.ttf", "1.ttf", "2.ttc", "3.otf", "4.ttf", "5.otf"]
+    # The source record counts the same: the one its bytes told says so, the
+    # text file is none.
+    probe = rec.ffprobe(str(original))
+    streams = rec.probed(probe, rec.attachment_heads(str(original), probe))["streams"]
+    assert [(x["index"], x["role"], x.get("signature")) for x in streams
+            if x["type"] == "attachment"] == [
+        (1, "font", None), (3, "font", None), (4, "font", None), (5, "other", None),
+        (6, "font", None), (7, "font", "ttf"), (8, "font", None)]
 
 
 def _encoders() -> str:

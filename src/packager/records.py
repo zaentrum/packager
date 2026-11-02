@@ -17,7 +17,7 @@ written, and in which order, is library.py's business."""
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -45,10 +45,13 @@ EXTRA_KINDS = frozenset({"featurette", "behind-the-scenes", "making-of", "delete
 
 @dataclass(frozen=True)
 class OriginalProbe:
-    """The verbatim probe of an original (libv2_records.FFPROBE_ARGS), and
-    the ffprobe that made it."""
+    """The verbatim probe of an original (libv2_records.FFPROBE_ARGS), the
+    ffprobe that made it, and the first bytes of the attachments the probe
+    gives no role by itself, by stream index (libv2_records.attachment_heads):
+    what tells a font by its signature alone."""
     raw: dict[str, Any]
     version: str | None
+    heads: dict[int, bytes] = field(default_factory=dict)
 
 
 def probe_original(path: Path) -> OriginalProbe:
@@ -58,7 +61,8 @@ def probe_original(path: Path) -> OriginalProbe:
     raw = rec.ffprobe(str(path))
     if not isinstance(raw, dict):
         raise PackageError(f"ffprobe can't read the original {path.name}, so it gets no record")
-    return OriginalProbe(raw=raw, version=rec.ffprobe_version())
+    return OriginalProbe(raw=raw, version=rec.ffprobe_version(),
+                         heads=rec.attachment_heads(str(path), raw))
 
 
 # ---------------------------------------------------------------- sources
@@ -75,13 +79,15 @@ def source_record(
     library does (file.name, original.<ext>), and the probe it returns for
     ffprobe.json names it so too, with no container title. A file that
     holds several episodes covers them as the worker record lists them,
-    this item, their holder, first."""
+    this item, their holder, first. An attachment the probe gives no role
+    by itself is a font in it when its first bytes are a font's signature
+    (probe.heads), as the package then carries it."""
     doc, probe_bytes = rec.source_record(
         lib.source.source_id, original.name, original.stat().st_size, taken_at=now,
         taken_by="packager", library_path=lib.source.library_path or original.name,
         qh1=fixity_qh1, mtime=rec.ts_of_mtime(str(original)),
         probe=probe.raw, probe_version=probe.version, sidecars=sidecars,
-        covers=list(lib.source.covers))
+        covers=list(lib.source.covers), heads=probe.heads)
     return doc, probe_bytes
 
 
@@ -281,4 +287,4 @@ def extra_record(
         and season >= 0 else None,
         origin=origin, probe=probe.raw, probe_version=probe.version, probed_at=now,
         packaged_from=[{"name": original_name, "sizeBytes": original.stat().st_size,
-                        "fixity": {"qh1": fixity_qh1}}])
+                        "fixity": {"qh1": fixity_qh1}}], heads=probe.heads)
