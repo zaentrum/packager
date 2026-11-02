@@ -87,8 +87,13 @@ import copy, datetime, hashlib, json, os, re, shutil, subprocess, uuid
 # commentary — "No commentary", "without the director's commentary", "Kommentarlos", "ohne
 # Kommentar", "sans commentaire" — makes it none (says_commentary): its words were read as one, in
 # a source's streams and a package's renditions alike. A source recorded before keeps the essence it
-# was written with.
-LIBV2_RECORDS = 9
+# was written with. 10: a subtitle whose manifest entry names the styled original the package keeps
+# beside it — the ASS/SSA script its text and styles came in (styled: {path, format}) — names it in its
+# record too (styled_original), and the font files a manifest lists (fonts: [{path, format, names,
+# sourceStreamIndex}]) are listed in the package's record (font_file); the package's essence has styled
+# subtitles and fonts when it carries them, for every stream of its source that has them where the
+# source's streams are known (package_essence). A manifest without them gives the record it gave.
+LIBV2_RECORDS = 10
 
 NS = uuid.uuid5(uuid.NAMESPACE_URL, "https://zaentrum.github.io/schemas/library")
 PACKAGE_DIRS = ("hls", "subs", "trickplay", "trailers")
@@ -116,6 +121,12 @@ SUBTITLE_COPY_RE = re.compile(r"^subtitle-[0-9]+\.[a-z]{2,8}(\.forced)?(\.sdh)?\
 ATTACHED_SUBTITLE_RE = re.compile(r"^subs/attached-([0-9a-f]{64})\.[a-z0-9]+(-[a-z0-9]+)*(\.forced)?(\.sdh)?\.vtt$")
 # The values HLS gives VIDEO-RANGE, as a video rendition's videoRange keeps them.
 VIDEO_RANGES = ("SDR", "PQ", "HLG")
+# The format of a subtitle's styled original: an ASS or SSA script, as libass reads either (its
+# [Script Info] says which), its text and styles as the stream or the file had them.
+STYLED_FORMATS = ("ass",)
+# What a package's font file is, by its bytes: TrueType, OpenType with CFF outlines, a collection of
+# either, WOFF and WOFF2. A file of a font attachment whose bytes are none of them has no format.
+FONT_FORMATS = ("ttf", "otf", "ttc", "woff", "woff2")
 
 
 # ---------------------------------------------------------------- small helpers
@@ -666,7 +677,7 @@ def source_essence(streams, chapters):
     }
 
 
-def package_essence(man, source=None):
+def package_essence(man, source=None, streams=None):
     """What a package carries, in the terms of a source's essence. The 5.1 companions under
     renditions.audioSurround count for the channels and the languages it carries; a track is counted
     once, by its stereo rendition, for what a track is for. A top video rendition that is the
@@ -674,7 +685,14 @@ def package_essence(man, source=None):
     when the original — source, its essence — had it, and so does a package every video rendition of
     which in PQ, the top one among them, says its init segment carries the original's (hdr10Metadata),
     encoded or not. One in PQ that says nothing of it — one whose init segment could not take it — and
-    anything else re-encoded is taken to have lost it."""
+    anything else re-encoded is taken to have lost it.
+
+    A package has styled subtitles when a subtitle keeps its styled original (styled), and fonts when
+    it lists a font file (fonts). Where the source's streams are given — a source record's streams —
+    it has them only when it carries them for every stream that has them: each styled subtitle stream
+    by a subtitle made from it that keeps its original, each font attachment by a font file taken from
+    it, both by sourceStreamIndex. A styled track kept as WebVTT alone, or a font left out, so leaves
+    the package without them, and the deletion gate names them."""
     ren = man.get("renditions") or {}
     vids, auds = ren.get("video") or [], ren.get("audio") or []
     every = auds + (ren.get("audioSurround") or [])
@@ -684,6 +702,13 @@ def package_essence(man, source=None):
     copied_pq = v0.get("encoder") == "copy" and v0.get("videoRange") == "PQ"
     declared = v0.get("videoRange") == "PQ" and all(
         x.get("hdr10Metadata") is True for x in vids if x.get("videoRange") == "PQ")
+    styled = {x.get("sourceStreamIndex") for x in subs if styled_original(x.get("styled"))}
+    fonts = {x.get("sourceStreamIndex") for x in (font_file(f) for f in man.get("fonts") or []) if x}
+
+    def carried(taken, has):
+        # every stream of the source that has it is one the package took it from
+        return bool(taken) and (streams is None or all(x.get("index") in taken for x in streams if has(x)))
+
     return {
         "maxAudioChannels": max([x.get("channels") or 0 for x in every], default=0),
         "surround": any((x.get("channels") or 0) > 2 for x in every),
@@ -696,7 +721,9 @@ def package_essence(man, source=None):
         "subtitleLanguages": sorted({lang(x.get("language"))[0] for x in subs if x.get("language")}),
         "subtitleTracks": len(subs),
         "imageSubtitles": any((x.get("format") or "") in ("pgs", "sup", "vobsub", "dvb") for x in subs),
-        "styledSubtitles": False, "fonts": False, "chapters": False,
+        "styledSubtitles": carried(styled, lambda x: x.get("type") == "subtitle" and x.get("styled")),
+        "fonts": carried(fonts, lambda x: x.get("type") == "attachment" and x.get("role") == "font"),
+        "chapters": False,
         "commentaryTracks": sum(1 for x in auds if x.get("purpose") == "commentary"),
         **track_essence(auds, subs, False),
     }
@@ -1123,8 +1150,35 @@ def subtitle_rendition(s, i, from_sidecar=None):
         out["name"] = text(s["name"])
     if text(s.get("hls")):
         out["hls"] = text(s["hls"])
+    styled = styled_original(s.get("styled"))
+    if styled:
+        out["styled"] = styled
     if from_sidecar:
         out["fromSidecar"] = from_sidecar
+    return out
+
+
+def styled_original(v):
+    """A subtitle's styled original as its record keeps it, {path, format}: the ASS/SSA script the
+    package keeps beside the subtitle's own file (path), its text and styles as the stream or the file
+    beside the original had them, in one of STYLED_FORMATS. None for an entry that names none, no path,
+    or a format a record does not know."""
+    if not isinstance(v, dict) or not text(v.get("path")) or v.get("format") not in STYLED_FORMATS:
+        return None
+    return {"path": text(v["path"]), "format": v["format"]}
+
+
+def font_file(f):
+    """A font file of the package as its record keeps it: its path; the format its bytes are, one of
+    FONT_FORMATS, or None for bytes that are none of them; the names a script asks for it by — its
+    family, full and PostScript names, as its name table gives them — each once, in their order; and the
+    stream of the original it was taken from (sourceStreamIndex). None for an entry without a path."""
+    if not isinstance(f, dict) or not text(f.get("path")):
+        return None
+    out = {"path": text(f["path"]), "format": f.get("format") if f.get("format") in FONT_FORMATS else None,
+           "names": list(dict.fromkeys(n for n in (text(x) for x in f.get("names") or []) if n))}
+    if f.get("sourceStreamIndex") is not None:
+        out["sourceStreamIndex"] = num(f["sourceStreamIndex"])
     return out
 
 
@@ -1244,7 +1298,11 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
     audio rendition likewise (audio_purpose): a commentary (commentary), for the visually impaired
     (visualImpaired), then its title. A video rendition whose init segment carries the original's
     HDR10 static metadata (hdr10Metadata) says so, and the package's essence has it when the source's
-    has and every rendition in PQ, the top one among them, says so (package_essence). The playlist flags a reader could
+    has and every rendition in PQ, the top one among them, says so (package_essence). A subtitle that
+    keeps its styled original names it (styled_original), and the font files the manifest lists are the
+    record's fonts (font_file), listed only when there are any; the package's essence has styled
+    subtitles and fonts when it carries them for every stream of the source that has them
+    (package_essence). The playlist flags a reader could
     not follow are normalised, each with a note: a second default audio rendition is not one, a
     package with none has its first, a forced subtitle is never the default, and of the rest only
     the first default is one."""
@@ -1258,6 +1316,7 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
     for i, s in enumerate(manifest.get("subtitles") or []):
         sid = text(s.get("id")) or f"sub{i}"
         subs.append(subtitle_rendition(s, i, sidecars.get(sid)))
+    fonts = [x for x in (font_file(f) for f in manifest.get("fonts") or []) if x]
     defaults = [a for a in audio if a["default"]]
     for a in defaults[1:]:
         a["default"] = False
@@ -1278,8 +1337,9 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
     renditions = {"video": video, "audio": audio}
     if surround:
         renditions["audioSurround"] = surround
-    pkg_essence = package_essence({"renditions": renditions, "subtitles": subs}, (source or {}).get("essence"))
     streams = (source or {}).get("streams") or []
+    pkg_essence = package_essence({"renditions": renditions, "subtitles": subs, "fonts": fonts},
+                                  (source or {}).get("essence"), streams)
     if streams:
         losses = losses_against(source.get("essence") or {}, pkg_essence, streams, renditions, subs)
     else:
@@ -1290,7 +1350,10 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
            "createdAt": ts(manifest.get("packagedAt")) or created_at,
            "packagedBy": text(manifest.get("packager")) or packaged_by or "unknown", "state": "complete",
            "role": role, "durationMs": num(manifest.get("durationMs")) or num(duration_ms) or 0,
-           "renditions": renditions, "subtitles": subs, "trickplay": trickplay(manifest.get("trickplay"))}
+           "renditions": renditions, "subtitles": subs}
+    if fonts:
+        doc["fonts"] = fonts
+    doc["trickplay"] = trickplay(manifest.get("trickplay"))
     hls = hls_block(manifest.get("hls"))
     if hls:
         doc["hls"] = hls
