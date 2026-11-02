@@ -69,10 +69,12 @@ def test_every_text_and_pgs_track_is_one_run_over_the_source(
     entries = pk._extract_subtitles(
         SRC, _probe("subrip", "ass", "hdmv_pgs_subtitle", "mov_text", "webvtt", "subrip"), subs,
         visible_indices={0, 2, 3, 4, 5})
+    # The ASS track's WebVTT copy, and its script as it is beside it.
     assert ffmpeg.runs == [[
         *HEAD,
         *_out(subs, 0, "-c:s", "webvtt", name="0.vtt"),
         *_out(subs, 1, "-c:s", "webvtt", name="1.vtt"),
+        *_out(subs, 1, "-c:s", "copy", "-f", "ass", name="1.ass"),
         *_out(subs, 2, "-c:s", "copy", "-f", "sup", name="2.sup"),
         *_out(subs, 3, "-c:s", "webvtt", name="3.vtt"),
         *_out(subs, 4, "-c:s", "webvtt", name="4.vtt"),
@@ -80,10 +82,90 @@ def test_every_text_and_pgs_track_is_one_run_over_the_source(
     ]]
     assert entries == [
         {"id": f"sub{i}", "language": "eng", "title": f"t{i}", "default": False,
-         "forced": i == 1, "visible": i != 1, "path": f"subs/{name}", "format": fmt}
+         "forced": i == 1, "visible": i != 1, "path": f"subs/{name}", "format": fmt,
+         **({"styled": {"path": "subs/1.ass", "format": "ass"}} if i == 1 else {})}
         for i, (name, fmt) in enumerate([("0.vtt", "webvtt"), ("1.vtt", "webvtt"),
                                          ("2.sup", "pgs"), ("3.vtt", "webvtt"),
                                          ("4.vtt", "webvtt"), ("5.vtt", "webvtt")])]
+
+
+def test_one_styled_track_is_one_run_with_its_script_beside_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    ffmpeg = Ffmpeg(monkeypatch)
+    subs = tmp_path / "subs"
+    [entry] = pk._extract_subtitles(SRC, _probe("ass"), subs)
+    assert ffmpeg.runs == [HEAD + _out(subs, 0, "-c:s", "webvtt", name="0.vtt")
+                           + _out(subs, 0, "-c:s", "copy", "-f", "ass", name="0.ass")]
+    assert (entry["path"], entry["format"], entry["styled"]) == (
+        "subs/0.vtt", "webvtt", {"path": "subs/0.ass", "format": "ass"})
+    assert sorted(p.name for p in subs.iterdir()) == ["0.ass", "0.vtt"]
+
+
+def test_a_script_ffmpeg_cant_copy_costs_its_styled_original_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # The pass fails; each track alone then works, but the second ASS
+    # track's script can't be copied: that track keeps its WebVTT copy,
+    # and says nothing of a styled original, which isn't there.
+    ffmpeg = Ffmpeg(monkeypatch, fails={"pass"})
+    real = ffmpeg.__call__
+
+    def run(args, **kw):
+        if args.count("-map") == 1 and args[-1].endswith("2.ass"):
+            ffmpeg.runs.append(args)
+            raise subprocess.CalledProcessError(1, args)
+        return real(args, **kw)
+
+    monkeypatch.setattr(pk.subprocess, "run", run)
+    subs = tmp_path / "subs"
+    with capture_logs() as logs:
+        entries = pk._extract_subtitles(SRC, _probe("ass", "subrip", "ass"), subs)
+    assert ffmpeg.runs[1:] == [
+        HEAD + _out(subs, 0, "-c:s", "webvtt", name="0.vtt"),
+        HEAD + _out(subs, 1, "-c:s", "webvtt", name="1.vtt"),
+        HEAD + _out(subs, 2, "-c:s", "webvtt", name="2.vtt"),
+        HEAD + _out(subs, 0, "-c:s", "copy", "-f", "ass", name="0.ass"),
+        HEAD + _out(subs, 2, "-c:s", "copy", "-f", "ass", name="2.ass"),
+    ]
+    assert [(e["id"], e["path"], e.get("styled")) for e in entries] == [
+        ("sub0", "subs/0.vtt", {"path": "subs/0.ass", "format": "ass"}),
+        ("sub1", "subs/1.vtt", None), ("sub2", "subs/2.vtt", None)]
+    assert sorted(p.name for p in subs.iterdir()) == ["0.ass", "0.vtt", "1.vtt", "2.vtt"]
+    assert [e["idx"] for e in logs if e["event"] == "packager.subs.styled_failed"] == [2]
+
+
+def test_a_track_ffmpeg_cant_convert_has_no_styled_original_either(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # Its WebVTT copy is what every client shows: without one the track is
+    # left out, and no script of it is copied.
+    ffmpeg = Ffmpeg(monkeypatch, fails={"pass", 0})
+    subs = tmp_path / "subs"
+    entries = pk._extract_subtitles(SRC, _probe("ass", "ass"), subs)
+    assert [args[-1] for args in ffmpeg.runs[1:]] == [
+        str(subs / "0.vtt"), str(subs / "1.vtt"), str(subs / "1.ass")]
+    assert [(e["id"], e.get("styled")) for e in entries] == [
+        ("sub1", {"path": "subs/1.ass", "format": "ass"})]
+
+
+def test_an_empty_script_is_no_styled_original(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # ffmpeg's ASS muxer writes the header whatever the events: an empty
+    # file is a script it didn't write.
+    real = Ffmpeg(monkeypatch).__call__
+
+    def run(args, **kw):
+        result = real(args, **kw)
+        (subs / "0.ass").write_bytes(b"")
+        return result
+
+    subs = tmp_path / "subs"
+    monkeypatch.setattr(pk.subprocess, "run", run)
+    [entry] = pk._extract_subtitles(SRC, _probe("ass"), subs)
+    assert "styled" not in entry
+    assert sorted(p.name for p in subs.iterdir()) == ["0.vtt"]
 
 
 def test_a_track_ffmpeg_cant_write_keeps_its_own_attempt(
@@ -321,17 +403,20 @@ def _pgs(path: Path) -> Path:
     return path
 
 
+TRACKS_ASS = (
+    "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\n"
+    "Style: Default,Example Sans,20\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, "
+    "MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.50,0:00:03.00,Default,,0,0,0,,"
+    "Hallo {\\i1}Welt{\\i0}\n")
+
+
 @pytest.fixture(scope="module")
 def tracks(tmp_path_factory) -> Path:
     """A source with SRT, ASS, PGS, VobSub, DVB and a forced SRT track."""
     d = tmp_path_factory.mktemp("tracks")
     (d / "en.srt").write_text("1\n00:00:01,000 --> 00:00:02,500\nHello.\n\n"
                               "2\n00:00:03,000 --> 00:00:04,000\nAgain.\n")
-    (d / "de.ass").write_text(
-        "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\n"
-        "Style: Default,Arial,20\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, "
-        "MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.50,0:00:03.00,Default,,0,0,0,,"
-        "Hallo {\\i1}Welt{\\i0}\n")
+    (d / "de.ass").write_text(TRACKS_ASS)
     pgs = _pgs(d / "box.sup")
     src = d / "tracks.mkv"
     subprocess.run([
@@ -372,23 +457,29 @@ def test_one_pass_writes_what_a_run_per_track_wrote(
     # VobSub is mkvextract's (test_mkvextract_writes_the_vobsub_pair).
     monkeypatch.setattr(pk.shutil, "which", lambda _name: None)
     one = pk._extract_subtitles(tracks, probe, tmp_path / "one")
-    # The source is read once for its PGS and text tracks; DVB keeps its
-    # attempt, which fails as ffmpeg sets it up, as always.
-    assert runs == [4, 1]
+    # The source is read once for its PGS and text tracks and the ASS
+    # track's script; DVB keeps its attempt, which fails as ffmpeg sets it
+    # up, as always.
+    assert runs == [5, 1]
 
-    # As before the one pass: every track in a run of its own.
+    # As before the one pass: every track in a run of its own, then the
+    # script.
     monkeypatch.setattr(pk, "_extract_together", lambda *_a: None)
     runs.clear()
     alone = pk._extract_subtitles(tracks, probe, tmp_path / "alone")
-    assert runs == [1] * 5
+    assert runs == [1] * 6
     assert one == alone
-    assert [(e["path"], e["format"], e["forced"]) for e in one] == [
-        ("subs/0.vtt", "webvtt", False), ("subs/1.vtt", "webvtt", False),
-        ("subs/2.sup", "pgs", False), ("subs/5.vtt", "webvtt", True)]
+    assert [(e["path"], e["format"], e["forced"], e.get("styled")) for e in one] == [
+        ("subs/0.vtt", "webvtt", False, None),
+        ("subs/1.vtt", "webvtt", False, {"path": "subs/1.ass", "format": "ass"}),
+        ("subs/2.sup", "pgs", False, None), ("subs/5.vtt", "webvtt", True, None)]
     assert _files(tmp_path / "one") == _files(tmp_path / "alone")
-    assert sorted(_files(tmp_path / "one")) == ["0.vtt", "1.vtt", "2.sup", "5.vtt"]
+    assert sorted(_files(tmp_path / "one")) == ["0.vtt", "1.ass", "1.vtt", "2.sup", "5.vtt"]
     files = _files(tmp_path / "one")
     assert b"Hello." in files["0.vtt"] and b"Welt" in files["1.vtt"]
+    # The script as the track holds it: its header and its event, the
+    # override tags in it.
+    assert files["1.ass"] == (TRACKS_ASS.encode())
     assert files["2.sup"].startswith(b"PG") and files["2.sup"].count(b"PG") >= 8
 
 

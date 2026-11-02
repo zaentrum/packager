@@ -34,7 +34,12 @@ Design rules:
 * Subtitles are extracted to sidecar files (WebVTT for text, native
   bitmap formats for PGS/VobSub/DVB) exactly as before; the subtitle
   files next to the source (the item record's subtitleFiles) are
-  converted to WebVTT and join them. WebVTT tracks are
+  converted to WebVTT and join them. A styled track (ASS/SSA), embedded
+  or a file, keeps its script as it is beside its WebVTT copy (N.ass,
+  the entry's `styled`), and the fonts the original carries as
+  attachments are taken into subs/fonts/ as their bytes are (the
+  manifest's `fonts`): a client that draws styles opts into both, every
+  other one shows the WebVTT copy as before. WebVTT tracks are
   additionally packaged as HLS subtitle renditions (hls/sN/); the master
   references them (TYPE=SUBTITLES, FORCED=YES where flagged) only when
   HLS_SUBTITLES is on, so clients that draw their own sidecar subtitles
@@ -74,6 +79,7 @@ import structlog
 
 from . import hdr10, hls, regions
 from . import libv2_records as rec
+from .fonts import font_format, font_names
 from .renditions import PackageInputs, VideoInput
 
 log = structlog.get_logger("packager")
@@ -530,7 +536,8 @@ def package_item(
     next to the source, [{"path": "/abs/movie.en.srt", "language": "eng",
     "label": "English", "forced": false}] (.srt, .vtt, .ass, .ssa). Each
     is converted to WebVTT and packaged after the source's own subtitle
-    tracks, as one of them (_subtitle_files, _convert_subtitle_files).
+    tracks, as one of them (_subtitle_files, _convert_subtitle_files); an
+    ASS or SSA script keeps itself beside its WebVTT copy (_styled_file).
 
     language_whitelist is a list of lowercased ISO 639-1/2 codes
     (`en`, `de`, `zh`, …). Tracks (audio + subtitle) whose language
@@ -782,6 +789,10 @@ def build_package(
         from_files = {e["id"]: sub_files[int(e["id"].removeprefix("sub")) - len(probe.subtitles)]
                       for e in converted}
         subtitle_meta += converted
+        # The fonts the original carries, which its styled subtitles are
+        # drawn with: the original's own, as a transcoder's encode of it
+        # (v0) carries none.
+        font_meta = _extract_fonts(Path(source_path), stage / "subs", tmpdir)
         audio_language = (_track_language(probe.audio[default_audio])
                           if default_audio is not None else None)
         default_subtitle = _pick_default_subtitle(subtitle_meta, audio_language)
@@ -830,6 +841,9 @@ def build_package(
             "audioSurround": surround_meta,
         },
         "subtitles": subtitle_meta,
+        # The fonts a styled subtitle is drawn with, where the original
+        # carried any; a client that shows the WebVTT copies needs none.
+        **({"fonts": font_meta} if font_meta else {}),
         "hls": {
             "master": "hls/master.m3u8",
             "segmentSeconds": segment_seconds,
@@ -894,9 +908,10 @@ def _open_staging(out_root: Path, grace_seconds: float) -> Path:
 def _verify_staged(stage: Path, manifest: dict[str, Any] | None = None) -> None:
     """Refuse a staged package that isn't whole: every playlist the master
     or the manifest names is there and ends (#EXT-X-ENDLIST), and every
-    init section, segment, sidecar and trickplay sprite they reference is
-    there, inside the package and, but for a sidecar (a track without a
-    cue extracts to an empty file), not empty. The manifest is the staged
+    init section, segment, sidecar, styled original, font and trickplay
+    sprite they reference is there, inside the package and, but for a
+    sidecar (a track without a cue extracts to an empty file), not empty.
+    The manifest is the staged
     manifest.json unless given (a library v2 package.json, which names its
     files under the same keys). Raises PackageError."""
     if manifest is None:
@@ -944,8 +959,12 @@ def _verify_staged(stage: Path, manifest: dict[str, Any] | None = None) -> None:
         need("", sub["path"], empty_ok=True)
         if sub.get("format") == "vobsub":
             need("", posixpath.splitext(sub["path"])[0] + ".sub", empty_ok=True)
+        if (sub.get("styled") or {}).get("path"):
+            need("", sub["styled"]["path"])
         if sub.get("hls") and (rel := need(sub["hls"], "playlist.m3u8")):
             playlists[rel] = sub["hls"]
+    for font in manifest.get("fonts") or []:
+        need("", font["path"])
     for rel, folder in playlists.items():
         text = (stage / rel).read_text()
         if "#EXT-X-ENDLIST" not in text:
@@ -2897,12 +2916,25 @@ class _Sidecar:
     """How one embedded subtitle stream becomes a sidecar file: its name
     in subs/, the manifest's `format` for it, ffmpeg's output options for
     it, and whether it is written in the one pass over the source with the
-    others (_extract_subtitles)."""
+    others (_extract_subtitles); for a styled stream, the name in subs/ of
+    its styled original, written beside it (_STYLED_OPTIONS)."""
     index: int             # among the source's subtitle streams
     name: str
     format: str
     options: tuple[str, ...]
     one_pass: bool
+    styled: str | None = None
+
+
+# A styled subtitle stream's original: the ASS script the stream carries,
+# stream-copied into ffmpeg's ASS muxer — its header (the script info and
+# the styles) and every event's text as the stream holds them, override
+# tags and all, each line ended as the muxer ends it (LF). Nothing is
+# encoded: libass draws the file as it would have drawn the stream. A
+# Matroska SSA track is an ASS stream to ffmpeg (its header says SSA), so
+# it is copied alike.
+_STYLED_OPTIONS = ("-c:s", "copy", "-f", "ass")
+STYLED_FORMAT = "ass"
 
 
 # Subtitle codecs that are bitmaps but not PGS: WebVTT can't be made of
@@ -2934,6 +2966,11 @@ def _sidecar(index: int, codec: str) -> _Sidecar:
         # DVB bitmap subs — rare outside broadcast recordings: a raw .dvb
         # file, for the same renderer-on-the-client story as PGS.
         return _Sidecar(index, f"{index}.dvb", "dvb", ("-c:s", "copy"), False)
+    if codec == "ass":
+        # ASS/SSA — its WebVTT copy, which every client shows, and beside it
+        # the script as it is (N.ass), for a client that draws styles.
+        return _Sidecar(index, f"{index}.vtt", "webvtt", ("-c:s", "webvtt"), True,
+                        styled=f"{index}.ass")
     return _Sidecar(index, f"{index}.vtt", "webvtt", ("-c:s", "webvtt"),
                     codec not in _SETUP_FAILS)
 
@@ -2978,6 +3015,9 @@ def _extract_subtitles(
     """Extract every embedded subtitle stream as a sidecar file in
     `subs_dir/`. Text codecs (subrip, ass, mov_text, etc) get
     transcoded to WebVTT — that's what HLS clients consume natively.
+    A styled stream (ASS/SSA) keeps its script as it is too, N.ass beside
+    its WebVTT copy N.vtt (_STYLED_OPTIONS), for a client that draws its
+    styles; the entry stays the WebVTT one, and says so in `styled`.
     Image codecs (PGS / VobSub / DVB) are stream-copied to their
     native container (.sup for PGS, .sub+.idx for VobSub, .dvb for
     DVB) so a client with an image-subtitle renderer can overlay
@@ -2986,10 +3026,13 @@ def _extract_subtitles(
     language. HLS can't carry the image formats; they stay sidecar-only.
 
     The PGS and text tracks are written in one ffmpeg run, one output
-    each: the source is read once, not once per track — a title with
-    dozens of tracks on slow storage took one full read of the file each.
+    each and one more for each styled original: the source is read once,
+    not once per track — a title with dozens of tracks on slow storage
+    took one full read of the file each.
     When that run fails, each track is extracted alone, as before, so a
-    track ffmpeg can't extract costs that track only. A track of a codec
+    track ffmpeg can't extract costs that track only, and then the styled
+    original of each that was, so a script ffmpeg can't copy costs that
+    original only: its track keeps the WebVTT copy. A track of a codec
     that fails while ffmpeg sets its outputs up keeps an attempt of its
     own (_SETUP_FAILS): DVB tracks so are never extracted, as ffmpeg can't
     write them. VobSub tracks are mkvextract's, all of them in one more
@@ -3001,7 +3044,8 @@ def _extract_subtitles(
     stream's disposition says it is for the deaf and hard of hearing
     (_hearing_impaired) and `commentary` when it says it is a commentary
     (_commentary): its NAME says so, and its record makes it sdh or a
-    commentary.
+    commentary; and `styled`, {path, format}, when its styled original is
+    beside it.
 
     Every track is extracted regardless of the language whitelist
     (we don't lose data). `visible_indices` controls only the
@@ -3016,14 +3060,26 @@ def _extract_subtitles(
     codecs = [s.get("codec_name", "") for s in probe.subtitles]
     sidecars = [_sidecar(i, codec) for i, codec in enumerate(codecs)]
     together = [c for c in sidecars if c.one_pass]
-    written = _extract_together(src, subs_dir, together) if len(together) > 1 else None
+    outputs = sum(2 if c.styled else 1 for c in together)
+    written = _extract_together(src, subs_dir, together) if outputs > 1 else None
+    styled = {c.index for c in together if c.styled} if written is not None else set()
     if written is None:
         written = {c.index for c in together if _extract_alone(src, subs_dir, c, codecs[c.index])}
+        styled = {c.index for c in together if c.styled and c.index in written
+                  and _extract_styled(src, subs_dir, c)}
     written |= _extract_vobsubs(src, subs_dir, [c for c in sidecars if c.format == "vobsub"],
                                 probe.subtitles)
     written |= {c.index for c in sidecars
                 if not c.one_pass and c.format != "vobsub"
                 and _extract_alone(src, subs_dir, c, codecs[c.index])}
+    for c in [c for c in together if c.index in styled]:
+        # ffmpeg's ASS muxer writes the script's header whatever events it
+        # has: an empty file is a script it didn't write
+        path = subs_dir / str(c.styled)
+        if c.index not in written or not path.is_file() or path.stat().st_size == 0:
+            log.warning("packager.subs.styled_failed", idx=c.index, error="no script written")
+            path.unlink(missing_ok=True)
+            styled.discard(c.index)
     out: list[dict[str, Any]] = []
     for c, s in zip(sidecars, probe.subtitles, strict=True):
         if c.index not in written:
@@ -3035,6 +3091,9 @@ def _extract_subtitles(
             log.info("packager.subs.vobsub_sidecar", idx=c.index)
         elif c.format == "dvb":
             log.info("packager.subs.dvb_sidecar", idx=c.index)
+        if c.index in styled:
+            log.info("packager.subs.styled_original", idx=c.index,
+                     bytes=(subs_dir / str(c.styled)).stat().st_size)
         tags = s.get("tags") or {}
         disp = s.get("disposition") or {}
         out.append({
@@ -3053,31 +3112,39 @@ def _extract_subtitles(
             "visible": visible_indices is None or c.index in visible_indices,
             "path": f"subs/{c.name}",
             "format": c.format,
+            **({"styled": {"path": f"subs/{c.styled}", "format": STYLED_FORMAT}}
+               if c.index in styled else {}),
         })
     return out
 
 
 def _extract_together(src: Path, subs_dir: Path, sidecars: list[_Sidecar]) -> set[int] | None:
     """Write every one of the sidecars in one ffmpeg run over the source,
-    an output each. Returns the indices it wrote — all of them — or None
-    when the run failed, with what it wrote removed."""
+    an output each, and the styled original of each that has one beside
+    it. Returns the indices it wrote — all of them, styled originals and
+    all — or None when the run failed, with what it wrote removed."""
     args = ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning", "-i", str(src)]
+    names = []
     for c in sidecars:
         args += ["-map", f"0:s:{c.index}", *c.options, str(subs_dir / c.name)]
+        names.append(c.name)
+        if c.styled:
+            args += ["-map", f"0:s:{c.index}", *_STYLED_OPTIONS, str(subs_dir / c.styled)]
+            names.append(c.styled)
     t0 = time.monotonic()
     try:
         result = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
     except OSError as e:
         result = subprocess.CompletedProcess(args, -1, "", str(e))
     stderr = (result.stderr or "").strip()
-    if result.returncode == 0 and all((subs_dir / c.name).is_file() for c in sidecars):
+    if result.returncode == 0 and all((subs_dir / name).is_file() for name in names):
         log.info("packager.subs.one_pass", tracks=len(sidecars),
                  elapsed_s=round(time.monotonic() - t0, 1), warnings=stderr[-300:] or None)
         return {c.index for c in sidecars}
     log.warning("packager.subs.one_pass_failed", tracks=len(sidecars), code=result.returncode,
                 error=stderr[-500:] or None)
-    for c in sidecars:
-        (subs_dir / c.name).unlink(missing_ok=True)
+    for name in names:
+        (subs_dir / name).unlink(missing_ok=True)
     return None
 
 
@@ -3169,6 +3236,23 @@ def _extract_alone(src: Path, subs_dir: Path, c: _Sidecar, codec: str) -> bool:
     return True
 
 
+def _extract_styled(src: Path, subs_dir: Path, c: _Sidecar) -> bool:
+    """Write a sidecar's styled original in a run of its own. False,
+    logged, when ffmpeg fails: the track keeps its WebVTT copy alone."""
+    target = subs_dir / str(c.styled)
+    try:
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
+             "-i", str(src), "-map", f"0:s:{c.index}", *_STYLED_OPTIONS, str(target)],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        log.warning("packager.subs.styled_failed", idx=c.index, error=str(e))
+        target.unlink(missing_ok=True)
+        return False
+    return True
+
+
 # The subtitle files next to a source the packager takes, by extension;
 # ffmpeg then reads each by its content. A file is read whole, so one far
 # larger than any subtitle file (a video by a wrong name) is refused.
@@ -3231,21 +3315,28 @@ def _convert_subtitle_files(
     (`first` of them), and return their manifest entries: those of an
     embedded WebVTT track, with the catalog's label for `title`, and
     `external`. They are segmented into HLS renditions like the embedded
-    ones. A file that can't be read or converted is left out, logged;
-    the package goes on without it."""
+    ones. A file that is an ASS or SSA script keeps it beside its WebVTT
+    copy too, subs_dir/N.ass (_styled_file), and says so in `styled`, as
+    a styled stream does. A file that can't be read or converted is left
+    out, logged; the package goes on without it."""
     if files:
         subs_dir.mkdir(parents=True, exist_ok=True)
     out: list[dict[str, Any]] = []
     for k, f in enumerate(files):
         n = first + k
         target = subs_dir / f"{n}.vtt"
+        styled = subs_dir / f"{n}.ass"
         try:
-            _convert_subtitle_file(f, target, tmpdir / f"subtitle-file-{n}{f.path.suffix.lower()}")
+            raw = _convert_subtitle_file(f, target,
+                                         tmpdir / f"subtitle-file-{n}{f.path.suffix.lower()}")
+            kept = _styled_file(raw, f.language, styled)
         except (OSError, PackageError) as e:
             log.warning("packager.subs.file_failed", idx=n, path=str(f.path), error=str(e)[:300])
             target.unlink(missing_ok=True)
+            styled.unlink(missing_ok=True)
             continue
-        log.info("packager.subs.file", idx=n, path=str(f.path), language=f.language)
+        log.info("packager.subs.file", idx=n, path=str(f.path), language=f.language,
+                 styled=kept or None)
         out.append({
             "id": f"sub{n}",
             "language": f.language,
@@ -3256,24 +3347,48 @@ def _convert_subtitle_files(
             "path": f"subs/{n}.vtt",
             "format": "webvtt",
             "external": True,
+            **({"styled": {"path": f"subs/{n}.ass", "format": STYLED_FORMAT}} if kept else {}),
         })
     return out
 
 
-def _convert_subtitle_file(f: _SubtitleFile, target: Path, utf8: Path) -> None:
+def _convert_subtitle_file(f: _SubtitleFile, target: Path, utf8: Path) -> bytes:
     """One subtitle file as WebVTT at target: its text decoded
     (_subtitle_text) and written to `utf8` as UTF-8, then through ffmpeg's
     WebVTT encoder, as the source's own text tracks are. ffmpeg reads SRT,
     ASS/SSA and WebVTT by their content, and fails on a file that is none
-    of them. Raises OSError or PackageError."""
+    of them. Returns the file's bytes, as it read them. Raises OSError or
+    PackageError."""
     size = f.path.stat().st_size
     if size > _SUBTITLE_FILE_MAX_BYTES:
         raise PackageError(f"{size} bytes: no subtitle file is that large")
-    utf8.write_text(_subtitle_text(f.path.read_bytes(), f.language), encoding="utf-8")
+    raw = f.path.read_bytes()
+    utf8.write_text(_subtitle_text(raw, f.language), encoding="utf-8")
     _run_ffmpeg_capturing(f"subtitle file {f.path.name}", [
         "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
         "-i", str(utf8), "-map", "0:s:0", "-c:s", "webvtt", "-f", "webvtt", str(target),
     ])
+    return raw
+
+
+def _styled_file(raw: bytes, language: str, target: Path) -> bool:
+    """Keep a subtitle file that is an ASS or SSA script at target, as it
+    is: one whose text, past the line breaks before it, begins with
+    [Script Info], as ffmpeg's ASS reader tells one by its content (an SRT
+    file under any name is none). A file in UTF-8, byte order mark and
+    all, is kept byte for byte; one in another encoding (UTF-16, a legacy
+    code page: _subtitle_text) as its text in UTF-8, which every player
+    reads, the same characters and line ends. False, and nothing written,
+    for a file that is no script. Raises OSError."""
+    if not _subtitle_text(raw, language).lstrip("\n").startswith("[Script Info]"):
+        return False
+    try:
+        raw.decode("utf-8")
+        data = raw
+    except UnicodeDecodeError:
+        data = _subtitle_text(raw, language, keep_line_ends=True).encode("utf-8")
+    target.write_bytes(data)
+    return True
 
 
 # The legacy code page a subtitle file that isn't UTF-8 is most likely in,
@@ -3302,11 +3417,12 @@ _BOMS = (
 )
 
 
-def _subtitle_text(raw: bytes, language: str = "und") -> str:
+def _subtitle_text(raw: bytes, language: str = "und", *, keep_line_ends: bool = False) -> str:
     """A subtitle file's text, decoded by its byte order mark (UTF-8,
     UTF-16, UTF-32), else as UTF-8, else in the legacy code page of its
     language (_LEGACY_ENCODINGS), else as Windows-1252, else as Latin-1,
-    which reads any bytes. Without the mark, with \\n line ends."""
+    which reads any bytes. Without the mark, with \\n line ends — or the
+    file's own, with keep_line_ends."""
     for bom, codec in _BOMS:
         if raw.startswith(bom):
             text = raw.decode(codec, errors="replace")
@@ -3320,7 +3436,97 @@ def _subtitle_text(raw: bytes, language: str = "und") -> str:
                 continue
         else:
             text = raw.decode("latin-1")
-    return text.lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n")
+    text = text.lstrip("﻿")
+    return text if keep_line_ends else text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+# Where a package keeps the fonts its original carried: in subs/, beside
+# the subtitles that are drawn with them (fonts/<n>.<format> there).
+FONTS_DIR = "fonts"
+
+
+def _font_attachments(original: Path) -> list[dict[str, Any]]:
+    """The font attachments of the original, as its source record reads
+    them: each attachment stream the record logic calls a font
+    (libv2_records.norm_stream: a MIME type that says font, or a file name
+    that ends .ttf, .otf or .ttc), in the order of its streams. [] for an
+    original that holds none, or that ffprobe can't read."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams",
+             "-select_streams", "t", str(original)],
+            capture_output=True, check=True, text=True, encoding="utf-8", errors="replace",
+            stdin=subprocess.DEVNULL,
+        )
+        streams = json.loads(out.stdout).get("streams") or []
+    except (OSError, ValueError, subprocess.CalledProcessError) as e:
+        log.warning("packager.fonts.probe_failed", path=str(original), error=str(e)[:200])
+        return []
+    return [s for s in streams if s.get("codec_type") == "attachment"
+            and isinstance(s.get("index"), int) and rec.norm_stream(s)["role"] == "font"]
+
+
+def _extract_fonts(original: Path, subs_dir: Path, tmpdir: Path) -> list[dict[str, Any]]:
+    """Take every font attachment of the original (_font_attachments) into
+    the package, its bytes as they are: subs/fonts/<n>.<format>, n from 0
+    in the order of the original's streams, format what the bytes are
+    (fonts.font_format; bin for bytes that are no font the format knows).
+    Returns the manifest's `fonts`: each file's path, its format (None for
+    bin), the names a script asks for it by (fonts.font_names) and the
+    original's stream it was taken from (sourceStreamIndex).
+
+    One ffmpeg run takes them all (-dump_attachment), opening the original
+    and reading its header alone: its output is nothing, the first font's
+    stream copied for no time to the null muxer. A font is taken only
+    when ffmpeg wrote all of it — as many bytes as ffprobe says the
+    attachment holds — and an attachment of no bytes not at all; either is
+    left out, logged, and the package then lacks a font its original
+    carried, which its record's essence says (fonts) and the deletion gate
+    names. The original is read, never changed: the fonts a transcoder's
+    encode of it (v0) left out are its own."""
+    attachments = _font_attachments(original)
+    want = []
+    for s in attachments:
+        if s.get("extradata_size") == 0:
+            log.warning("packager.fonts.failed", index=s["index"],
+                        error="the attachment holds no bytes")
+        else:
+            want.append(s)
+    if not want:
+        return []
+    dumps = {s["index"]: tmpdir / f"font-{s['index']}" for s in want}
+    args = ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error"]
+    for index, path in dumps.items():
+        args += [f"-dump_attachment:{index}", str(path)]
+    args += ["-i", str(original), "-map", f"0:{want[0]['index']}", "-c", "copy", "-t", "0",
+             "-f", "null", "-"]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", stdin=subprocess.DEVNULL)
+    except OSError as e:
+        result = subprocess.CompletedProcess(args, -1, "", str(e))
+    if result.returncode != 0:
+        log.warning("packager.fonts.dump_failed", code=result.returncode,
+                    error=(result.stderr or "").strip()[-500:] or None)
+    out: list[dict[str, Any]] = []
+    for s in want:
+        path, size = dumps[s["index"]], s.get("extradata_size")
+        got = path.stat().st_size if path.is_file() else 0
+        if got == 0 or (got != size if isinstance(size, int) else result.returncode != 0):
+            log.warning("packager.fonts.failed", index=s["index"],
+                        error=f"{got} bytes written of {size if isinstance(size, int) else '?'}")
+            continue
+        data = path.read_bytes()
+        fmt = font_format(data)
+        rel = f"{FONTS_DIR}/{len(out)}.{fmt or 'bin'}"
+        (subs_dir / FONTS_DIR).mkdir(parents=True, exist_ok=True)
+        (subs_dir / rel).write_bytes(data)
+        names = font_names(data)
+        log.info("packager.fonts.font", index=s["index"], path=f"subs/{rel}", format=fmt,
+                 bytes=len(data), names=names[:4] or None)
+        out.append({"path": f"subs/{rel}", "format": fmt, "names": names,
+                    "sourceStreamIndex": s["index"]})
+    return out
 
 
 def _generate_trickplay(src: Path, probe: _Probe, out_dir: Path) -> dict[str, Any] | None:

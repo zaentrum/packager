@@ -192,6 +192,76 @@ def test_subtitle_file_entries_follow_the_sources_own_tracks(
     assert pk._convert_subtitle_files(files[:1], subs, work, first=2) == []
 
 
+# -------------------------- subtitle files: a styled one keeps its script
+SCRIPT = ("[Script Info]\r\nScriptType: v4.00+\r\n\r\n[V4+ Styles]\r\nFormat: Name, "
+          "Fontname, Fontsize\r\nStyle: Default,Example Sans,20\r\n\r\n[Events]\r\nFormat: "
+          "Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\nDialogue: "
+          "0,0:00:01.00,0:00:02.50,Default,,0,0,0,,{\\i1}Grüße{\\i0} — «Ça va»\r\n")
+SSA = ("[Script Info]\nScriptType: v4.00\n\n[V4 Styles]\nFormat: Name, Fontname, Fontsize\n"
+       "Style: Default,Example Sans,20\n\n[Events]\nFormat: Marked, Start, End, Style, Name, "
+       "MarginL, MarginR, MarginV, Effect, Text\nDialogue: Marked=0,0:00:01.00,0:00:02.00,"
+       "Default,,0000,0000,0000,,Привет\n")
+
+
+def test_a_subtitle_file_that_is_a_script_keeps_it_beside_its_webvtt_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def ffmpeg(_label: str, args: list[str]) -> None:
+        Path(args[-1]).write_text("WEBVTT\n\n")
+
+    monkeypatch.setattr(pk, "_run_ffmpeg_capturing", ffmpeg)
+    folder = tmp_path / "media"
+    folder.mkdir()
+    bodies = {
+        # UTF-8 with its byte order mark and CRLF line ends: kept byte for byte
+        "a.de.ass": codecs.BOM_UTF8 + SCRIPT.encode("utf-8"),
+        # SSA in the Cyrillic code page: its text in UTF-8, as every player reads it
+        "a.ru.ssa": SSA.encode("cp1251"),
+        # SRT whatever its name says, and SRT by its name: no script
+        "a.fr.ass": b"1\n00:00:01,000 --> 00:00:02,000\nBonjour\n",
+        "a.en.srt": b"1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+        # a script after blank lines, as ffmpeg's ASS reader still takes one
+        "a.it.ass": b"\r\n\n" + SCRIPT.encode("utf-8"),
+    }
+    for name, body in bodies.items():
+        (folder / name).write_bytes(body)
+    languages = {"de": "ger", "ru": "rus", "fr": "fre", "en": "eng", "it": "ita"}
+    files = pk._subtitle_files([{"path": str(folder / name), "language": languages[name[2:4]]}
+                                for name in bodies], folder / "a.mkv")
+    subs, work = tmp_path / "stage" / "subs", tmp_path / "work"
+    work.mkdir()
+    entries = pk._convert_subtitle_files(files, subs, work, first=1)
+    assert [(e["id"], e["path"], e["format"], e.get("styled")) for e in entries] == [
+        ("sub1", "subs/1.vtt", "webvtt", {"path": "subs/1.ass", "format": "ass"}),
+        ("sub2", "subs/2.vtt", "webvtt", {"path": "subs/2.ass", "format": "ass"}),
+        ("sub3", "subs/3.vtt", "webvtt", None),
+        ("sub4", "subs/4.vtt", "webvtt", None),
+        ("sub5", "subs/5.vtt", "webvtt", {"path": "subs/5.ass", "format": "ass"}),
+    ]
+    assert sorted(p.name for p in subs.iterdir()) == [
+        "1.ass", "1.vtt", "2.ass", "2.vtt", "3.vtt", "4.vtt", "5.ass", "5.vtt"]
+    assert (subs / "1.ass").read_bytes() == bodies["a.de.ass"]
+    assert (subs / "2.ass").read_bytes() == SSA.encode("utf-8")
+    assert (subs / "5.ass").read_bytes() == bodies["a.it.ass"]
+
+
+@pytest.mark.parametrize(("raw", "kept"), [
+    (SCRIPT.encode("utf-16"), SCRIPT.encode("utf-8")),  # its byte order mark read, not kept
+    (SCRIPT.encode("utf-8"), SCRIPT.encode("utf-8")),
+    (SCRIPT.replace("\r\n", "\n").encode("cp1252"), SCRIPT.replace("\r\n", "\n").encode("utf-8")),
+    (b"[Script Info]", b"[Script Info]"),
+    (b" [Script Info]\n", None),  # as ffmpeg's reader tells one: not past a space
+    (b"WEBVTT\n\n00:01.000 --> 00:02.000\nHi\n", None),
+    (b"", None),
+], ids=["utf-16", "utf-8", "cp1252", "bare", "space first", "webvtt", "empty"])
+def test_a_script_is_kept_as_it_is_or_as_its_text_in_utf8(
+    tmp_path: Path, raw: bytes, kept: bytes | None,
+) -> None:
+    target = tmp_path / "0.ass"
+    assert pk._styled_file(raw, "und", target) is (kept is not None)
+    assert (target.read_bytes() if target.exists() else None) == kept
+
+
 # ------------------------------------- subtitle files: WebVTT, by ffmpeg
 def _convert(tmp_path: Path, name: str, raw: bytes, language: str = "und") -> str:
     (tmp_path / name).write_bytes(raw)
