@@ -97,6 +97,8 @@ hls/v0/ v1/ …   init.mp4 seg-NNNNN.m4s playlist.m3u8 iframes.m3u8
 hls/a0/ a1/ …   init.mp4 seg-NNNNN.m4s playlist.m3u8
 hls/s0/ s2/ …   seg-NNNNN.vtt playlist.m3u8   (WebVTT tracks only)
 subs/N.vtt|.sup|.idx|.dvb                sidecars: the source's tracks, then its subtitle files
+subs/N.ass                              a styled track's script, beside its WebVTT copy N.vtt
+subs/fonts/<n>.ttf|.otf|.ttc|…          the fonts the original carries, as their bytes are
 trickplay/  manifest.json  .complete
 .next/                                  a run's staging folder, same layout
 hls.old-<stamp>/ subs.old-<stamp>/ …    replaced, until its grace period ends
@@ -344,6 +346,60 @@ the audio's language isn't known (`und`, `zxx`). The source's default
 flag doesn't count: ffmpeg flags the first subtitle default when a file
 has several and flags none, which showed German subtitles by themselves
 on an English film.
+
+**Styled subtitles and their fonts.** A styled track (ASS/SSA: ffprobe's
+`ass`, which a Matroska SSA track is too) keeps its script as it is beside
+its WebVTT copy: `subs/N.ass`, written in the same run over the source by
+a stream copy into ffmpeg's ASS muxer (`-c:s copy -f ass`), never an
+encode — the script's header (its info and its styles) and every event's
+text, override tags and all, as the track holds them, each line ended
+with LF. A subtitle file beside the source that is a script (its text
+begins with `[Script Info]`, as ffmpeg tells one) keeps it too, as
+`subs/N.ass`: byte for byte when it is UTF-8, its byte order mark and line
+ends included, else its text in UTF-8, the same characters. A script
+ffmpeg can't copy costs that script only: its track keeps the WebVTT copy,
+and says nothing of a styled original. The fonts the original carries as
+attachments — every attachment the source record calls a font: a MIME type
+that says font, or a file name ending `.ttf`, `.otf` or `.ttc` — are taken
+out of the original (not the transcoder's encode, which carries none) in
+one more ffmpeg run that reads its header alone (`-dump_attachment`), each
+as its bytes are, into `subs/fonts/<n>.<format>`: `n` from 0 in the
+original's stream order, the format what the bytes are (`ttf`, `otf`,
+`ttc`, `woff`, `woff2`, else `bin`), never the name it was attached under.
+A font whose bytes ffmpeg didn't write whole (fewer than ffprobe says the
+attachment holds) is left out, logged. No other attachment is taken: a
+cover is a picture, an NFO is text.
+
+What a client sees is what it saw: the subtitle entry stays the WebVTT
+one, and the script and the fonts are references beside it a client opts
+into. In `manifest.json` and `package.json` alike:
+
+```json
+"subtitles": [
+  {"id": "sub2", "language": "eng", "title": "Signs", "path": "subs/2.vtt", "format": "webvtt",
+   "…": "…", "styled": {"path": "subs/2.ass", "format": "ass"}}],
+"fonts": [
+  {"path": "subs/fonts/0.ttf", "format": "ttf",
+   "names": ["Example Sans", "Example Sans Regular", "ExampleSans-Regular"],
+   "sourceStreamIndex": 7}]
+```
+
+`styled` is left out of a subtitle without one, and `fonts` out of a
+package with none. `styled.format` is `ass` for an ASS or an SSA script
+(its `[Script Info]` says which; libass reads both). A font's `names` are
+those a style or an override tag (`\fn`) asks for it by, read from its
+name table as libass matches them: the family and the full names of its
+Windows platform, the family name of its Macintosh one where it has no
+Windows one, and its PostScript name; a collection's, every face's; none
+for WOFF and WOFF2. A player that draws styles (libass, JASSUB in a
+browser) loads a font by them, or every font when it can't, and draws the
+script with them; a path is relative to the package folder, as every path
+of the manifest is. The record logic keeps both in `package.json`
+(record logic 10), and the package's essence has `styledSubtitles` and
+`fonts` when it carries them for every styled stream and every font
+attachment of the original: the deletion gate holds the original for
+neither, and holds it still for a package that kept a styled track as
+WebVTT alone, or left a font out.
 
 **HEVC parameter sets.** Some files carry an HEVC decoder configuration
 (the Matroska CodecPrivate) that names no VPS, SPS or PPS: they are in
@@ -705,7 +761,13 @@ the file the copy was made from, or the copy itself, by its path, else a
 copy of the same bytes — never by a name. No subtitle is `default` in
 `package.json`, as no subtitle is DEFAULT=YES in the master: the record
 forbids a forced track flagged default, which `manifest.json` uses to say
-"show it by itself".
+"show it by itself". A subtitle's styled original and the package's fonts
+are in `package.json` as the manifest names them ("Styled subtitles and
+their fonts"): a styled original by the stream its subtitle was made from,
+a font by the original's attachment it was taken from
+(`sourceStreamIndex`), so the package's essence has `styledSubtitles` and
+`fonts` only when every styled stream and every font attachment of the
+source record is carried so.
 
 **HEVC only.** A v2 package's video is HEVC: the original's copied, or
 the transcoder's HEVC encode of it. A v0 in another codec fails the run;
@@ -748,7 +810,8 @@ and a client of its own:
 PUT /api/analyze/rules/packager
 {"version": "3f2a9c1", "rules": {"surroundAudio": "eac3", "surroundLayout": "5.1",
   "surroundBitrate": "448k", "surroundTracks": "shown", "preferredLanguages": [],
-  "stereoAudio": "aac", "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"]}}
+  "stereoAudio": "aac", "stereoBitrate": "192k", "imageSubtitles": ["pgs", "vobsub"],
+  "styledSubtitles": ["ass"]}}
 ```
 
 Every value is the one the process runs with: `SURROUND_AUDIO` (`off`: no
@@ -768,7 +831,10 @@ rate (AAC at 192k, what its encode is made with), and the
 forms of image subtitles a package carries as they are, as the extraction
 writes them: PGS always, VobSub where `mkvextract` and `mkvmerge` are
 installed (the image has them), from a Matroska file alone. DVB and XSUB
-are not carried. `version` is the image's, `IMAGE_VERSION` (the image
+are not carried. `styledSubtitles` are the forms of styled subtitles a
+package carries as they are, with the fonts the original carries: ASS
+(an SSA track is one to ffmpeg), its script beside its WebVTT copy.
+`version` is the image's, `IMAGE_VERSION` (the image
 build sets it to the release tag or the commit), else the package's.
 
 A catalog older than the route answers 404 or 405: the packager says so
@@ -787,7 +853,8 @@ src/packager/rules.py       # the report of the rules it runs with
 src/packager/worker.py      # consumer loop: one item at a time, serial packaging
 src/packager/extras.py      # the extras' consumer loop: trailers and other bonus material
 src/packager/renditions.py  # reads the transcoder handoff (renditions.json)
-src/packager/packager.py    # ffmpeg remux + shaka-packager + trickplay + subtitles
+src/packager/packager.py    # ffmpeg remux + shaka-packager + trickplay + subtitles + fonts
+src/packager/fonts.py       # what a font attachment is, and the names it answers to
 src/packager/hls.py         # master playlist assembly + RFC 8216 bit rates
 src/packager/library.py     # library v2: staging, the chain, the renames into the record
 src/packager/records.py     # library v2: what source.json, version.json, package.json, extra.json say
