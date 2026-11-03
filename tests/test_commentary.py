@@ -102,13 +102,13 @@ def _audio(probe: pk._Probe) -> list[dict]:
 
 def _subtitles(monkeypatch: pytest.MonkeyPatch, folder: Path, probe: pk._Probe) -> list[dict]:
     """The manifest's subtitle entries, as _extract_subtitles makes them."""
-    def together(_src: Path, subs: Path, sidecars: list) -> set[int]:
+    def together(_src: Path, subs: Path, sidecars: list, _timeout: float) -> set[int]:
         for c in sidecars:
             (subs / c.name).write_text("WEBVTT\n\n00:01.000 --> 00:02.000\nWell.\n")
         return {c.index for c in sidecars}
 
     monkeypatch.setattr(pk, "_extract_together", together)
-    monkeypatch.setattr(pk, "_extract_alone", lambda src, subs, c, codec: (
+    monkeypatch.setattr(pk, "_extract_alone", lambda src, subs, c, codec, timeout: (
         (subs / c.name).write_bytes(b"\x50\x47") and True))
     return pk._extract_subtitles(Path("/m/original.mkv"), probe, folder)
 

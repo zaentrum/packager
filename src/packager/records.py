@@ -56,13 +56,19 @@ class OriginalProbe:
 
 def probe_original(path: Path) -> OriginalProbe:
     """Probe an original for its record. Raises PackageError when ffprobe
-    can't read it: a record written once is never written without the
-    probe that describes its file."""
+    can't read it, and when ffmpeg gives none of the first bytes of an
+    attachment in time (libv2_records.AttachmentTimeout): a record written
+    once is never written without the probe that describes its file."""
     raw = rec.ffprobe(str(path))
     if not isinstance(raw, dict):
         raise PackageError(f"ffprobe can't read the original {path.name}, so it gets no record")
-    return OriginalProbe(raw=raw, version=rec.ffprobe_version(),
-                         heads=rec.attachment_heads(str(path), raw))
+    try:
+        heads = rec.attachment_heads(str(path), raw)
+    except rec.AttachmentTimeout as e:
+        # what an attachment is can't be told: a record that counted a font
+        # as none would let it go with the original
+        raise PackageError(f"the original {path.name} gets no record this time: {e}") from e
+    return OriginalProbe(raw=raw, version=rec.ffprobe_version(), heads=heads)
 
 
 # ---------------------------------------------------------------- sources

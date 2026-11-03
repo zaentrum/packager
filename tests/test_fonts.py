@@ -8,10 +8,13 @@ all. The fonts are made here (fontmaker.py)."""
 
 from __future__ import annotations
 
+import http.server
 import json
+import re
 import shutil
 import struct
 import subprocess
+import threading
 from pathlib import Path
 
 import fontmaker
@@ -168,7 +171,8 @@ def test_every_font_attachment_is_one_run_over_the_originals_header(
          "-dump_attachment:3", str(work / "font-3"), "-dump_attachment:5", str(work / "font-5"),
          "-dump_attachment:7", str(work / "font-7"), "-dump_attachment:8", str(work / "font-8"),
          "-dump_attachment:9", str(work / "font-9"), "-dump_attachment:10", str(work / "font-10"),
-         "-i", str(ORIGINAL), "-map", "0:3", "-c", "copy", "-t", "0", "-f", "null", "-"],
+         "-i", str(ORIGINAL), "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-t", "0",
+         "-f", "null", "-"],
     ]
     # By the original's streams, a font by its MIME type, its name or its
     # first bytes; each named by its place and what its bytes are, never by
@@ -242,6 +246,55 @@ def test_an_original_ffprobe_cant_read_has_no_fonts(
     assert pk._extract_fonts(ORIGINAL, tmp_path / "subs", tmp_path) == []
 
 
+def test_a_probe_or_a_run_that_runs_over_its_time_gives_no_fonts_and_says_so(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # A storage that stalls: ffprobe of the attachments, the record logic's
+    # read of their first bytes, or the run that takes the fonts out, each
+    # killed at its time; the package goes on without the fonts, and its
+    # record's essence says so.
+    def stalled(args, **kw):
+        raise subprocess.TimeoutExpired(args, kw["timeout"])
+
+    monkeypatch.setattr(pk.subprocess, "run", stalled)
+    with capture_logs() as logs:
+        assert pk._extract_fonts(ORIGINAL, tmp_path / "subs", tmp_path) == []
+    assert [e["error"] for e in logs if e["event"] == "packager.fonts.probe_failed"] == [
+        f"ffprobe ran over {round(pk._FONT_PROBE_TIMEOUT)} s: killed"]
+
+    Tools(monkeypatch, [_attachment(3, "data.bin", "application/octet-stream", 9)], {3: b"x" * 9})
+
+    def no_heads(path: str, probe: dict) -> dict[int, bytes]:
+        raise rec.AttachmentTimeout(
+            f"ffmpeg gave no first bytes of attachment 3 of {path} within 120 s")
+
+    monkeypatch.setattr(pk.rec, "attachment_heads", no_heads)
+    with capture_logs() as logs:
+        assert pk._extract_fonts(ORIGINAL, tmp_path / "subs", tmp_path) == []
+    assert [e["error"] for e in logs if e["event"] == "packager.fonts.probe_failed"] == [
+        f"ffmpeg gave no first bytes of attachment 3 of {ORIGINAL} within 120 s"]
+
+    monkeypatch.setattr(pk.rec, "attachment_heads", lambda _path, _probe: {})
+    tools = Tools(monkeypatch, [_attachment(3, "a.ttf", "font/ttf", len(SANS))], {3: SANS},
+                  short={3})
+    real = tools.__call__
+
+    def dump_stalls(args, **kw):
+        if args[0] == "ffmpeg":
+            real(args, **kw)  # half of the font written, then the storage stalls
+            assert kw["timeout"] == pk._FONT_DUMP_TIMEOUT
+            raise subprocess.TimeoutExpired(args, kw["timeout"])
+        return real(args, **kw)
+
+    monkeypatch.setattr(pk.subprocess, "run", dump_stalls)
+    with capture_logs() as logs:
+        assert pk._extract_fonts(ORIGINAL, tmp_path / "subs", tmp_path) == []
+    assert [e.get("error") for e in logs if e["event"] == "packager.fonts.dump_failed"] == [
+        f"ran over {round(pk._FONT_DUMP_TIMEOUT)} s: killed"]
+    assert [e["error"] for e in logs if e["event"] == "packager.fonts.failed"] == [
+        f"{len(SANS) // 2} bytes written of {len(SANS)}"]
+
+
 # ------------------------------------------------------------- with ffmpeg
 
 needs_ffmpeg = pytest.mark.skipif(
@@ -294,3 +347,82 @@ def test_ffmpeg_takes_the_fonts_out_byte_for_byte(tmp_path: Path) -> None:
 def _encoders() -> str:
     return subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True,
                           stdin=subprocess.DEVNULL).stdout
+
+
+class _CountingServer:
+    """An HTTP server of one folder, ranges and all, that counts the bytes it
+    sends: what ffmpeg reads of a file it opens through it."""
+
+    def __init__(self, folder: Path) -> None:
+        counter = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                path = folder / self.path.lstrip("/")
+                size = path.stat().st_size
+                start, end = 0, size - 1
+                m = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range", ""))
+                if m:
+                    start, end = int(m.group(1)), int(m.group(2)) if m.group(2) else size - 1
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                else:
+                    self.send_response(200)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(end - start + 1))
+                self.end_headers()
+                with path.open("rb") as f:
+                    f.seek(start)
+                    left = end - start + 1
+                    try:
+                        while left > 0 and (chunk := f.read(min(65536, left))):
+                            self.wfile.write(chunk)
+                            left -= len(chunk)
+                            counter.sent += len(chunk)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+
+        self.sent = 0
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def url(self, name: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}/{name}"
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("video", [True, False])
+def test_taking_the_fonts_out_reads_the_originals_header_not_the_whole_of_it(
+    tmp_path: Path, video: bool,
+) -> None:
+    # An original far larger than its header, with a font attached: the run
+    # that takes it out ends at its first video (else audio) packet, so it
+    # reads a fraction of the file, never all of it, as a font's stream
+    # copied to the null muxer did.
+    protocols = subprocess.run(["ffmpeg", "-hide_banner", "-protocols"], capture_output=True,
+                               text=True, stdin=subprocess.DEVNULL).stdout.split()
+    if not {"http", "tcp"} <= set(protocols):
+        pytest.skip("ffmpeg reads no http")
+    (tmp_path / "sans.ttf").write_bytes(SANS)
+    picture = ["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=16"] if video else []
+    raw = ["-c:v", "rawvideo", "-pix_fmt", "yuv420p"] if video else []
+    # of 37 MB with a picture, of 23 MB without
+    sound = f"sine=frequency=440:duration={16 if video else 120}"
+    subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", *picture,
+                    "-f", "lavfi", "-i", sound, *raw,
+                    "-c:a", "pcm_s16le", "-ac", "2", "-attach", str(tmp_path / "sans.ttf"),
+                    "-metadata:s:t:0", "mimetype=font/ttf",
+                    "-metadata:s:t:0", "filename=Example Sans.ttf", str(tmp_path / "original.mkv")],
+                   check=True)
+    size = (tmp_path / "original.mkv").stat().st_size
+    index = 2 if video else 1
+    server = _CountingServer(tmp_path)
+    try:
+        result = pk._dump_attachments(server.url("original.mkv"), {index: tmp_path / "font"})
+    finally:
+        server.server.shutdown()
+    assert (tmp_path / "font").read_bytes() == SANS, result.stderr
+    assert server.sent < size * 0.4, f"{server.sent} of {size} bytes read"

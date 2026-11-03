@@ -81,7 +81,7 @@ def _probe(raw: dict) -> pk._Probe:
 def _entries(monkeypatch: pytest.MonkeyPatch, subs: Path, probe: pk._Probe) -> list[dict]:
     """The manifest's entries of v0's subtitle tracks, as _extract_subtitles
     makes them: the one ffmpeg pass writes a cue file for each."""
-    def together(_src: Path, folder: Path, sidecars: list) -> set[int]:
+    def together(_src: Path, folder: Path, sidecars: list, _timeout: float) -> set[int]:
         for c in sidecars:
             (folder / c.name).write_text("WEBVTT\n\n00:01.000 --> 00:02.000\n[door creaks]\n")
         return {c.index for c in sidecars}

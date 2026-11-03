@@ -102,6 +102,70 @@ def test_one_styled_track_is_one_run_with_its_script_beside_it(
     assert sorted(p.name for p in subs.iterdir()) == ["0.ass", "0.vtt"]
 
 
+def test_an_ssa_stream_keeps_its_script_beside_its_webvtt_copy_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # A stream ffprobe calls SSA (a NUT file's) is styled as an ASS one is,
+    # as its source record counts it: its script beside its WebVTT copy,
+    # written by ffmpeg's ASS encoder, which an ASS stream's copy is not.
+    ffmpeg = Ffmpeg(monkeypatch)
+    subs = tmp_path / "subs"
+    entries = pk._extract_subtitles(SRC, _probe("ssa", "ass"), subs)
+    assert ffmpeg.runs == [HEAD + _out(subs, 0, "-c:s", "webvtt", name="0.vtt")
+                           + _out(subs, 0, "-c:s", "ass", "-f", "ass", name="0.ass")
+                           + _out(subs, 1, "-c:s", "webvtt", name="1.vtt")
+                           + _out(subs, 1, "-c:s", "copy", "-f", "ass", name="1.ass")]
+    assert [(e["path"], e.get("styled")) for e in entries] == [
+        ("subs/0.vtt", {"path": "subs/0.ass", "format": "ass"}),
+        ("subs/1.vtt", {"path": "subs/1.ass", "format": "ass"})]
+
+
+def test_a_run_that_runs_over_its_time_fails_the_title_or_costs_its_track(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # Each run has its time, by the source's length: the one pass that runs
+    # over fails the title (a storage that stalls stalls every run after
+    # it); a track's own run, or its script's, costs that track's file.
+    ffmpeg = Ffmpeg(monkeypatch)
+    real = ffmpeg.__call__
+    times: list[float] = []
+
+    def stalls(args, **kw):
+        times.append(kw["timeout"])
+        raise subprocess.TimeoutExpired(args, kw["timeout"])
+
+    monkeypatch.setattr(pk.subprocess, "run", stalls)
+    subs = tmp_path / "subs"
+    with pytest.raises(pk.PackageError, match="the subtitles' extraction ran over 660 s"):
+        pk._extract_subtitles(SRC, _probe("ass", "subrip"), subs)
+    assert times == [pk._SUBS_TIMEOUT + pk._SUBS_TIMEOUT_PER_SECOND * 60]
+    assert not list(subs.iterdir())
+    # a probe that says a duration of months gets the longest time, no more
+    times.clear()
+    months = _probe("ass", "subrip")
+    months.duration_ms = 8_589_934_590
+    with pytest.raises(pk.PackageError, match=f"ran over {round(pk._SUBS_TIMEOUT_MAX)} s"):
+        pk._extract_subtitles(SRC, months, tmp_path / "months")
+    assert times == [pk._SUBS_TIMEOUT_MAX]
+
+    def script_stalls(args, **kw):
+        if args.count("-map") == 1 and args[-1].endswith("0.ass"):
+            raise subprocess.TimeoutExpired(args, kw["timeout"])
+        if args.count("-map") == 1 and args[-1].endswith("1.vtt"):
+            raise subprocess.TimeoutExpired(args, kw["timeout"])
+        return real(args, **kw)
+
+    ffmpeg.fails = {"pass"}
+    monkeypatch.setattr(pk.subprocess, "run", script_stalls)
+    with capture_logs() as logs:
+        entries = pk._extract_subtitles(SRC, _probe("ass", "subrip"), tmp_path / "alone")
+    assert [(e["path"], e.get("styled")) for e in entries] == [("subs/0.vtt", None)]
+    assert [(e["event"], e["idx"], e["error"]) for e in logs
+            if e["event"] in ("packager.subs.failed", "packager.subs.styled_failed")] == [
+        ("packager.subs.failed", 1, "ran over 660 s: killed"),
+        ("packager.subs.styled_failed", 0, "ran over 660 s: killed")]
+
+
 def test_a_script_ffmpeg_cant_copy_costs_its_styled_original_only(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

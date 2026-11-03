@@ -73,12 +73,12 @@ def _entries(monkeypatch: pytest.MonkeyPatch, subs: Path, probe: pk._Probe) -> l
         if c.format == "vobsub":
             (folder / c.name).with_suffix(".sub").write_bytes(b"x")
 
-    def together(_src: Path, folder: Path, sidecars: list) -> set[int]:
+    def together(_src: Path, folder: Path, sidecars: list, _timeout: float = 0) -> set[int]:
         for c in sidecars:
             write(folder, c)
         return {c.index for c in sidecars}
 
-    def alone(_src: Path, folder: Path, c, _codec: str) -> bool:
+    def alone(_src: Path, folder: Path, c, _codec: str, _timeout: float) -> bool:
         write(folder, c)
         return True
 

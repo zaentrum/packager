@@ -203,3 +203,40 @@ def test_the_startup_sweep_clears_only_what_dead_runs_left(tmp_path: Path, monke
         [*package, pk.STAGING_DIR, f"hls.old-{now}"])
     assert {item: live(item) for item in (dead, busy, early)} == before
     assert handoff.exists()
+
+
+def _styled(stage: Path) -> None:
+    """The staged package's subtitle keeping its styled original, and a font
+    the original carried, both named in its manifest."""
+    manifest = json.loads((stage / pk.MANIFEST_FILE).read_text())
+    manifest["subtitles"][0]["styled"] = {"path": "subs/0.ass", "format": "ass"}
+    manifest["fonts"] = [{"path": "subs/fonts/0.ttf", "format": "ttf", "names": ["Example Sans"],
+                          "sourceStreamIndex": 5}]
+    (stage / pk.MANIFEST_FILE).write_text(json.dumps(manifest))
+    (stage / "subs" / "0.ass").write_text("[Script Info]\nScriptType: v4.00+\n")
+    (stage / "subs" / "fonts").mkdir()
+    (stage / "subs" / "fonts" / "0.ttf").write_bytes(b"\x00\x01\x00\x00 a font")
+
+
+def test_a_package_with_its_styled_original_and_its_font_passes(item) -> None:
+    _root, stage = item
+    _styled(stage)
+    pk._verify_staged(stage)
+
+
+@pytest.mark.parametrize(("change", "named"), [
+    (lambda s: (s / "subs/0.ass").unlink(), "subs/0.ass"),
+    (lambda s: (s / "subs/0.ass").write_bytes(b""), "subs/0.ass (empty)"),
+    (lambda s: (s / "subs/fonts/0.ttf").unlink(), "subs/fonts/0.ttf"),
+    (lambda s: (s / "subs/fonts/0.ttf").write_bytes(b""), "subs/fonts/0.ttf (empty)"),
+])
+def test_a_package_without_its_styled_original_or_its_font_is_refused(
+    item, change, named: str,
+) -> None:
+    # The manifest names them: a package without either is no whole package.
+    _root, stage = item
+    _styled(stage)
+    change(stage)
+    with pytest.raises(pk.PackageError, match="not swapped in") as e:
+        pk._verify_staged(stage)
+    assert named in str(e.value)

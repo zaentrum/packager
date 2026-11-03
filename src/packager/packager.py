@@ -2917,13 +2917,15 @@ class _Sidecar:
     in subs/, the manifest's `format` for it, ffmpeg's output options for
     it, and whether it is written in the one pass over the source with the
     others (_extract_subtitles); for a styled stream, the name in subs/ of
-    its styled original, written beside it (_STYLED_OPTIONS)."""
+    its styled original, written beside it, and ffmpeg's output options for
+    that (_STYLED_OPTIONS, _SSA_STYLED_OPTIONS)."""
     index: int             # among the source's subtitle streams
     name: str
     format: str
     options: tuple[str, ...]
     one_pass: bool
     styled: str | None = None
+    styled_options: tuple[str, ...] = ()
 
 
 # A styled subtitle stream's original: the ASS script the stream carries,
@@ -2934,7 +2936,24 @@ class _Sidecar:
 # Matroska SSA track is an ASS stream to ffmpeg (its header says SSA), so
 # it is copied alike.
 _STYLED_OPTIONS = ("-c:s", "copy", "-f", "ass")
+# A stream ffprobe calls SSA (codec ssa: a NUT file's, never a Matroska
+# track) is no ASS stream to ffmpeg's ASS muxer, which copies that alone:
+# its events are written by ffmpeg's ASS encoder, from what its decoder
+# reads of them. An ffmpeg that reads no such stream — 8.1 has no decoder
+# for it — writes neither its WebVTT copy nor this, and the track is not
+# packaged, which its record's essence says and the deletion gate names.
+_SSA_STYLED_OPTIONS = ("-c:s", "ass", "-f", "ass")
 STYLED_FORMAT = "ass"
+# How long a run of ffmpeg over the whole source for its subtitles may take,
+# a generous bound: _SUBS_TIMEOUT seconds and _SUBS_TIMEOUT_PER_SECOND for
+# every second of the source (a run reads it once), never more than
+# _SUBS_TIMEOUT_MAX — a probe may say a duration of months. One that runs
+# over is killed: a storage that stalls fails the title (the one pass) or
+# costs the track it was for (one run of its own), logged, never holds the
+# packager.
+_SUBS_TIMEOUT = 600.0
+_SUBS_TIMEOUT_PER_SECOND = 1.0
+_SUBS_TIMEOUT_MAX = 6 * 3600.0
 
 
 # Subtitle codecs that are bitmaps but not PGS: WebVTT can't be made of
@@ -2966,11 +2985,13 @@ def _sidecar(index: int, codec: str) -> _Sidecar:
         # DVB bitmap subs — rare outside broadcast recordings: a raw .dvb
         # file, for the same renderer-on-the-client story as PGS.
         return _Sidecar(index, f"{index}.dvb", "dvb", ("-c:s", "copy"), False)
-    if codec == "ass":
+    if codec in ("ass", "ssa"):
         # ASS/SSA — its WebVTT copy, which every client shows, and beside it
-        # the script as it is (N.ass), for a client that draws styles.
+        # the script (N.ass), for a client that draws styles: an ASS stream's
+        # as it is, an SSA stream's as ffmpeg's ASS encoder writes it.
         return _Sidecar(index, f"{index}.vtt", "webvtt", ("-c:s", "webvtt"), True,
-                        styled=f"{index}.ass")
+                        styled=f"{index}.ass",
+                        styled_options=_STYLED_OPTIONS if codec == "ass" else _SSA_STYLED_OPTIONS)
     return _Sidecar(index, f"{index}.vtt", "webvtt", ("-c:s", "webvtt"),
                     codec not in _SETUP_FAILS)
 
@@ -3059,19 +3080,22 @@ def _extract_subtitles(
     subs_dir.mkdir(parents=True, exist_ok=True)
     codecs = [s.get("codec_name", "") for s in probe.subtitles]
     sidecars = [_sidecar(i, codec) for i, codec in enumerate(codecs)]
+    timeout = min(_SUBS_TIMEOUT + _SUBS_TIMEOUT_PER_SECOND * max(probe.duration_ms, 0) / 1000,
+                  _SUBS_TIMEOUT_MAX)
     together = [c for c in sidecars if c.one_pass]
     outputs = sum(2 if c.styled else 1 for c in together)
-    written = _extract_together(src, subs_dir, together) if outputs > 1 else None
+    written = _extract_together(src, subs_dir, together, timeout) if outputs > 1 else None
     styled = {c.index for c in together if c.styled} if written is not None else set()
     if written is None:
-        written = {c.index for c in together if _extract_alone(src, subs_dir, c, codecs[c.index])}
+        written = {c.index for c in together
+                   if _extract_alone(src, subs_dir, c, codecs[c.index], timeout)}
         styled = {c.index for c in together if c.styled and c.index in written
-                  and _extract_styled(src, subs_dir, c)}
+                  and _extract_styled(src, subs_dir, c, timeout)}
     written |= _extract_vobsubs(src, subs_dir, [c for c in sidecars if c.format == "vobsub"],
                                 probe.subtitles)
     written |= {c.index for c in sidecars
                 if not c.one_pass and c.format != "vobsub"
-                and _extract_alone(src, subs_dir, c, codecs[c.index])}
+                and _extract_alone(src, subs_dir, c, codecs[c.index], timeout)}
     for c in [c for c in together if c.index in styled]:
         # ffmpeg's ASS muxer writes the script's header whatever events it
         # has: an empty file is a script it didn't write
@@ -3118,22 +3142,33 @@ def _extract_subtitles(
     return out
 
 
-def _extract_together(src: Path, subs_dir: Path, sidecars: list[_Sidecar]) -> set[int] | None:
+def _extract_together(src: Path, subs_dir: Path, sidecars: list[_Sidecar],
+                      timeout: float) -> set[int] | None:
     """Write every one of the sidecars in one ffmpeg run over the source,
     an output each, and the styled original of each that has one beside
     it. Returns the indices it wrote — all of them, styled originals and
-    all — or None when the run failed, with what it wrote removed."""
+    all — or None when the run failed, with what it wrote removed. A run
+    that takes longer than `timeout` seconds is killed, and the title
+    fails (PackageError): a storage that stalls would stall every run of
+    its own after it as well."""
     args = ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning", "-i", str(src)]
     names = []
     for c in sidecars:
         args += ["-map", f"0:s:{c.index}", *c.options, str(subs_dir / c.name)]
         names.append(c.name)
         if c.styled:
-            args += ["-map", f"0:s:{c.index}", *_STYLED_OPTIONS, str(subs_dir / c.styled)]
+            args += ["-map", f"0:s:{c.index}", *c.styled_options, str(subs_dir / c.styled)]
             names.append(c.styled)
     t0 = time.monotonic()
     try:
-        result = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        result = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        for name in names:
+            (subs_dir / name).unlink(missing_ok=True)
+        log.warning("packager.subs.one_pass_timeout", tracks=len(sidecars),
+                    timeout_s=round(timeout))
+        raise PackageError(f"the subtitles' extraction ran over {round(timeout)} s: killed") from e
     except OSError as e:
         result = subprocess.CompletedProcess(args, -1, "", str(e))
     stderr = (result.stderr or "").strip()
@@ -3221,33 +3256,46 @@ def _extract_vobsubs(src: Path, subs_dir: Path, cs: list[_Sidecar],
     return out
 
 
-def _extract_alone(src: Path, subs_dir: Path, c: _Sidecar, codec: str) -> bool:
+def _extract_alone(src: Path, subs_dir: Path, c: _Sidecar, codec: str, timeout: float) -> bool:
     """Write one sidecar in a run of its own, as every one was once.
-    False, logged, when ffmpeg fails."""
+    False, logged, when ffmpeg fails or takes longer than `timeout`
+    seconds (killed)."""
+    target = subs_dir / c.name
     try:
         subprocess.run(
             ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-             "-i", str(src), "-map", f"0:s:{c.index}", *c.options, str(subs_dir / c.name)],
-            check=True,
+             "-i", str(src), "-map", f"0:s:{c.index}", *c.options, str(target)],
+            check=True, stdin=subprocess.DEVNULL, timeout=timeout,
         )
     except subprocess.CalledProcessError as e:
         log.warning("packager.subs.failed", idx=c.index, codec=codec, error=str(e))
         return False
+    except subprocess.TimeoutExpired:
+        log.warning("packager.subs.failed", idx=c.index, codec=codec,
+                    error=f"ran over {round(timeout)} s: killed")
+        target.unlink(missing_ok=True)
+        return False
     return True
 
 
-def _extract_styled(src: Path, subs_dir: Path, c: _Sidecar) -> bool:
+def _extract_styled(src: Path, subs_dir: Path, c: _Sidecar, timeout: float) -> bool:
     """Write a sidecar's styled original in a run of its own. False,
-    logged, when ffmpeg fails: the track keeps its WebVTT copy alone."""
+    logged, when ffmpeg fails or takes longer than `timeout` seconds
+    (killed): the track keeps its WebVTT copy alone."""
     target = subs_dir / str(c.styled)
     try:
         subprocess.run(
             ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-             "-i", str(src), "-map", f"0:s:{c.index}", *_STYLED_OPTIONS, str(target)],
-            check=True,
+             "-i", str(src), "-map", f"0:s:{c.index}", *c.styled_options, str(target)],
+            check=True, stdin=subprocess.DEVNULL, timeout=timeout,
         )
     except subprocess.CalledProcessError as e:
         log.warning("packager.subs.styled_failed", idx=c.index, error=str(e))
+        target.unlink(missing_ok=True)
+        return False
+    except subprocess.TimeoutExpired:
+        log.warning("packager.subs.styled_failed", idx=c.index,
+                    error=f"ran over {round(timeout)} s: killed")
         target.unlink(missing_ok=True)
         return False
     return True
@@ -3443,6 +3491,13 @@ def _subtitle_text(raw: bytes, language: str = "und", *, keep_line_ends: bool = 
 # Where a package keeps the fonts its original carried: in subs/, beside
 # the subtitles that are drawn with them (fonts/<n>.<format> there).
 FONTS_DIR = "fonts"
+# How long the probe of the original's attachments and the run that takes
+# its fonts out may take, in seconds: each reads its header alone, which a
+# storage that stalls can hold up for good. One that runs over is killed,
+# and the package goes on without the fonts, logged: its record's essence
+# then says it lacks them (fonts), and the deletion gate names them.
+_FONT_PROBE_TIMEOUT = 120.0
+_FONT_DUMP_TIMEOUT = 300.0
 
 
 def _font_attachments(original: Path) -> list[dict[str, Any]]:
@@ -3453,21 +3508,32 @@ def _font_attachments(original: Path) -> list[dict[str, Any]]:
     is no picture, its first bytes, a font's signature, read as
     attachment_heads reads them for the record), in the order of its
     streams. [] for an original that holds none, or that ffprobe can't
-    read."""
+    read, or that ffprobe or ffmpeg can't read in time
+    (_FONT_PROBE_TIMEOUT, libv2_records.HEAD_TIMEOUT), logged: the
+    package then carries none of its fonts, which its record's essence
+    says."""
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams",
              "-select_streams", "t", str(original)],
             capture_output=True, check=True, text=True, encoding="utf-8", errors="replace",
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, timeout=_FONT_PROBE_TIMEOUT,
         )
         streams = json.loads(out.stdout).get("streams") or []
+    except subprocess.TimeoutExpired:
+        log.warning("packager.fonts.probe_failed", path=str(original),
+                    error=f"ffprobe ran over {round(_FONT_PROBE_TIMEOUT)} s: killed")
+        return []
     except (OSError, ValueError, subprocess.CalledProcessError) as e:
         log.warning("packager.fonts.probe_failed", path=str(original), error=str(e)[:200])
         return []
     attachments = [s for s in streams if s.get("codec_type") == "attachment"
                    and isinstance(s.get("index"), int)]
-    heads = rec.attachment_heads(str(original), {"streams": attachments}) if attachments else {}
+    try:
+        heads = rec.attachment_heads(str(original), {"streams": attachments}) if attachments else {}
+    except rec.AttachmentTimeout as e:
+        log.warning("packager.fonts.probe_failed", path=str(original), error=str(e))
+        return []
     return [s for s in attachments if rec.norm_stream(s, heads.get(s["index"]))["role"] == "font"]
 
 
@@ -3481,15 +3547,13 @@ def _extract_fonts(original: Path, subs_dir: Path, tmpdir: Path) -> list[dict[st
     original's stream it was taken from (sourceStreamIndex).
 
     A font told by its first bytes alone is taken as any other. One ffmpeg
-    run takes them all (-dump_attachment), opening the original
-    and reading its header alone: its output is nothing, the first font's
-    stream copied for no time to the null muxer. A font is taken only
-    when ffmpeg wrote all of it — as many bytes as ffprobe says the
-    attachment holds — and an attachment of no bytes not at all; either is
-    left out, logged, and the package then lacks a font its original
-    carried, which its record's essence says (fonts) and the deletion gate
-    names. The original is read, never changed: the fonts a transcoder's
-    encode of it (v0) left out are its own."""
+    run takes them all (_dump_attachments). A font is taken only when
+    ffmpeg wrote all of it — as many bytes as ffprobe says the attachment
+    holds — and an attachment of no bytes not at all; either is left out,
+    logged, and the package then lacks a font its original carried, which
+    its record's essence says (fonts) and the deletion gate names. The
+    original is read, never changed: the fonts a transcoder's encode of it
+    (v0) left out are its own."""
     attachments = _font_attachments(original)
     want = []
     for s in attachments:
@@ -3501,16 +3565,7 @@ def _extract_fonts(original: Path, subs_dir: Path, tmpdir: Path) -> list[dict[st
     if not want:
         return []
     dumps = {s["index"]: tmpdir / f"font-{s['index']}" for s in want}
-    args = ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error"]
-    for index, path in dumps.items():
-        args += [f"-dump_attachment:{index}", str(path)]
-    args += ["-i", str(original), "-map", f"0:{want[0]['index']}", "-c", "copy", "-t", "0",
-             "-f", "null", "-"]
-    try:
-        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                                errors="replace", stdin=subprocess.DEVNULL)
-    except OSError as e:
-        result = subprocess.CompletedProcess(args, -1, "", str(e))
+    result = _dump_attachments(str(original), dumps)
     if result.returncode != 0:
         log.warning("packager.fonts.dump_failed", code=result.returncode,
                     error=(result.stderr or "").strip()[-500:] or None)
@@ -3533,6 +3588,32 @@ def _extract_fonts(original: Path, subs_dir: Path, tmpdir: Path) -> list[dict[st
         out.append({"path": f"subs/{rel}", "format": fmt, "names": names,
                     "sourceStreamIndex": s["index"]})
     return out
+
+
+def _dump_attachments(source: str, dumps: dict[int, Path]) -> subprocess.CompletedProcess[str]:
+    """Write each attachment of the file at `source` (a path, or any input
+    ffmpeg opens) of the stream indices `dumps` names to its path there, in
+    one ffmpeg run that reads the file's header and little more: ffmpeg
+    writes the attachments as it opens the file (-dump_attachment), and its
+    output — the first video stream, else the first audio stream, copied
+    for no time to the null muxer — ends at that stream's first packet. An
+    attachment mapped instead gives no packet, and the run would read the
+    whole file for it. A run that takes longer than _FONT_DUMP_TIMEOUT
+    seconds is killed: what it wrote by then is what ffmpeg wrote."""
+    args = ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error"]
+    for index, path in dumps.items():
+        args += [f"-dump_attachment:{index}", str(path)]
+    args += ["-i", source, "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-t", "0",
+             "-f", "null", "-"]
+    try:
+        return subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", stdin=subprocess.DEVNULL,
+                              timeout=_FONT_DUMP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args, -1, "", f"ran over {round(_FONT_DUMP_TIMEOUT)} s: killed")
+    except OSError as e:
+        return subprocess.CompletedProcess(args, -1, "", str(e))
 
 
 def _generate_trickplay(src: Path, probe: _Probe, out_dir: Path) -> dict[str, Any] | None:
