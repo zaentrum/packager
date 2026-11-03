@@ -353,7 +353,15 @@ its WebVTT copy: `subs/N.ass`, written in the same run over the source by
 a stream copy into ffmpeg's ASS muxer (`-c:s copy -f ass`), never an
 encode — the script's header (its info and its styles) and every event's
 text, override tags and all, as the track holds them, each line ended
-with LF. A subtitle file beside the source that is a script (its text
+with LF. A stream ffprobe calls `ssa` (a NUT file's, never a Matroska
+track's) is styled too, as its source record counts it, its script written
+by ffmpeg's ASS encoder (`-c:s ass -f ass`), which the ASS muxer's copy
+takes none of; an ffmpeg that reads no such stream (8.1 has no decoder for
+it) makes neither file, and the track is not packaged, which the record's
+essence says. Every run over the source for its subtitles has its time,
+600 s and a second for every second of the source, never more than six
+hours: the one pass that runs over fails the title, a track's own run
+costs that track's file, each logged. A subtitle file beside the source that is a script (its text
 begins with `[Script Info]`, as ffmpeg tells one) keeps it too, as
 `subs/N.ass`: byte for byte when it is UTF-8, its byte order mark and line
 ends included, else its text in UTF-8, the same characters. A script
@@ -369,13 +377,21 @@ signature, which the record logic reads through a pipe from ffmpeg for
 the source record and for this alike (`attachment_heads`; the source's
 stream then says `signature`) — are taken
 out of the original (not the transcoder's encode, which carries none) in
-one more ffmpeg run that reads its header alone (`-dump_attachment`), each
-as its bytes are, into `subs/fonts/<n>.<format>`: `n` from 0 in the
+one more ffmpeg run (`-dump_attachment`) that reads the file's header and
+little more — its output, the first video stream (else audio) copied for no
+time, ends at that stream's first packet — each as its bytes are, into
+`subs/fonts/<n>.<format>`: `n` from 0 in the
 original's stream order, the format what the bytes are (`ttf`, `otf`,
 `ttc`, `woff`, `woff2`, else `bin`), never the name it was attached under.
 A font whose bytes ffmpeg didn't write whole (fewer than ffprobe says the
-attachment holds) is left out, logged. No other attachment is taken: a
-cover is a picture, an NFO is text.
+attachment holds) is left out, logged. The probe of the attachments and
+the run that takes the fonts out have their time (120 s, 300 s), and so
+has the record logic's read of an attachment's first bytes
+(`HEAD_TIMEOUT`, 120 s): a font probe or run that runs over leaves the
+package without the fonts, a read that runs over gives the original no
+record that time (the title fails, logged), as what the attachment is
+can't be told. No other attachment is taken: a cover is a picture, an NFO
+is text.
 
 What a client sees is what it saw: the subtitle entry stays the WebVTT
 one, and the script and the fonts are references beside it a client opts
