@@ -60,7 +60,7 @@ over extra.json and every package file. chain_problems() checks a folder written
 Piped into a pod behind a tool that uses it (cat libv2_records.py tool.py | python3 - …), this
 file runs as part of that tool, so it defines no main and runs nothing when it is read.
 """
-import copy, datetime, hashlib, json, os, re, shutil, subprocess, uuid
+import copy, datetime, hashlib, json, os, re, shutil, subprocess, threading, uuid
 
 # The version of what this module writes. A change to the shape of a record it builds is a new
 # value, and the copy a writer vendors names the one it was taken at. 2: no record names a file as
@@ -140,8 +140,16 @@ FONT_SIGNATURES = {b"\x00\x01\x00\x00": "ttf", b"true": "ttf", b"OTTO": "otf", b
 # application/font-sfnt, application/x-font-ttf — or a font's file name.
 FONT_MIME_RE = re.compile(r"font|opentype|truetype|sfnt", re.I)
 FONT_FILE_RE = re.compile(r"\.(ttf|otf|ttc|woff2?)$", re.I)
-# How many of an attachment's first bytes attachment_heads reads.
+# How many of an attachment's first bytes attachment_heads reads, and how long it waits for them, in seconds:
+# ffmpeg opens the file and reads its header for them, which a stalled storage can hold up for good.
 HEAD_BYTES = 16
+HEAD_TIMEOUT = 120
+
+
+class AttachmentTimeout(Exception):
+    """attachment_heads got no first bytes of an attachment within HEAD_TIMEOUT. What the attachment is
+    can't be told then — a font by its bytes alone is none to a record without them — so a writer records
+    no source of the file this time rather than one that may not count a font it holds."""
 
 
 # ---------------------------------------------------------------- small helpers
@@ -605,7 +613,9 @@ def attachment_heads(path, probe):
     """The first bytes (HEAD_BYTES) of each attachment of the file at path that its probe gives no role
     by itself — no font's MIME type or name, no picture's MIME type (attachment_role) —, by its stream
     index: what tells a font by its signature. ffmpeg hands each to a pipe, read no further than that and
-    closed; an attachment ffmpeg can't read, or a file without ffmpeg, gives none. Nothing is written."""
+    closed; an attachment ffmpeg can't read, or a file without ffmpeg, gives none. Nothing is written. An
+    ffmpeg that gives no bytes within HEAD_TIMEOUT seconds is killed, and AttachmentTimeout raised: what
+    the attachment is can't be told."""
     out = {}
     if not shutil.which("ffmpeg"):
         return out
@@ -615,18 +625,25 @@ def attachment_heads(path, probe):
         if s.get("codec_type") != "attachment" or not isinstance(index, int) or s.get("extradata_size") == 0 \
                 or attachment_role(tags.get("mimetype"), tags.get("filename")) != "other":
             continue
+        expired = threading.Event()
         try:
             p = subprocess.Popen(["ffmpeg", "-nostdin", "-v", "quiet", "-y", f"-dump_attachment:{index}", "pipe:1",
                                   "-i", path, "-map", f"0:{index}", "-c", "copy", "-t", "0", "-f", "null", "-"],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            timer = threading.Timer(HEAD_TIMEOUT, lambda p=p: (expired.set(), p.kill()))
+            timer.start()
             try:
                 head = p.stdout.read(HEAD_BYTES)
             finally:
+                timer.cancel()
                 p.stdout.close()
                 p.kill()
                 p.wait(timeout=60)
         except (OSError, subprocess.SubprocessError):
             continue
+        if expired.is_set() and len(head) < HEAD_BYTES:
+            raise AttachmentTimeout(f"ffmpeg gave no first bytes of attachment {index} of {path} within "
+                                    f"{HEAD_TIMEOUT} s")
         if head:
             out[index] = head
     return out
@@ -1371,7 +1388,8 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
     HDR10 static metadata (hdr10Metadata) says so, and the package's essence has it when the source's
     has and every rendition in PQ, the top one among them, says so (package_essence). A subtitle that
     keeps its styled original names it (styled_original), and the font files the manifest lists are the
-    record's fonts (font_file), listed only when there are any; the package's essence has styled
+    record's fonts (font_file), listed only when there are any — each only when it is one of the files
+    listed, the package's own, or it is left out with a note; the package's essence has styled
     subtitles and fonts when it carries them for every stream of the source that has them
     (package_essence). The playlist flags a reader could
     not follow are normalised, each with a note: a second default audio rendition is not one, a
@@ -1387,7 +1405,20 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
     for i, s in enumerate(manifest.get("subtitles") or []):
         sid = text(s.get("id")) or f"sub{i}"
         subs.append(subtitle_rendition(s, i, sidecars.get(sid)))
-    fonts = [x for x in (font_file(f) for f in manifest.get("fonts") or []) if x]
+    # a styled original and a font file are files of the package, ones its checksums list: a path the
+    # manifest names that is none of them is no file the package keeps, and no styling or font it carries
+    own = {rel for rel, *_ in listed}
+    for s in subs:
+        if s.get("styled") and s["styled"]["path"] not in own:
+            notes.append(f"subtitle {s['id']}'s styled original {s['styled']['path']} is no file of the package; "
+                         f"left out")
+            del s["styled"]
+    fonts = []
+    for x in (font_file(f) for f in manifest.get("fonts") or []):
+        if x and x["path"] not in own:
+            notes.append(f"font file {x['path']} is no file of the package; left out")
+        elif x:
+            fonts.append(x)
     defaults = [a for a in audio if a["default"]]
     for a in defaults[1:]:
         a["default"] = False
