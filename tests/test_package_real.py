@@ -64,6 +64,16 @@ def _start_time(path: Path) -> float:
     return float(out.strip() or 0)
 
 
+def _video_start(path: Path) -> float:
+    """The first video frame's presentation: where a clip starts, whatever
+    its audio's priming. ffprobe 7.1 shows a Matroska AAC track (and the file)
+    from its codec delay before 0; 9.0 from 0."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                          "stream=start_time", "-of", "csv=p=0", str(path)],
+                         capture_output=True, text=True).stdout
+    return float(out.strip() or 0)
+
+
 @pytest.fixture(scope="module")
 def handoff(tmp_path_factory) -> tuple[Path, Path]:
     d = tmp_path_factory.mktemp("handoff")
@@ -469,7 +479,7 @@ def test_webvtt_cues_line_up_with_the_media(tmp_path: Path, monkeypatch, start: 
         "-c:v", "libx264", "-preset", "ultrafast", "-bf", "0", "-g", "50",
         "-c:a", "aac", "-c:s", "srt", "-metadata:s:s:0", "language=eng",
         *(["-output_ts_offset", str(start)] if start else []), str(src))
-    assert _start_time(src) == pytest.approx(start, abs=0.001)
+    assert _video_start(src) == pytest.approx(start, abs=0.001)
     inbox = None
     if start:
         inbox = d / "_inbox" / ITEM

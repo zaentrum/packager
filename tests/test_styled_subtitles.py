@@ -139,8 +139,11 @@ def _shaka(_primary, videos, audio_meta, surround_meta, out_root: Path, **_kw):
         for name in ("init.mp4", "seg-00001.m4s", "seg-00002.m4s"):
             (d / name).write_bytes(f"{rid}/{name}".encode())
     (out_root / "hls" / "master.m3u8").write_text("\n".join(master) + "\n")
-    audio = [{**a, "id": f"a{i}", "dir": f"hls/a{i}", "codec": "mp4a.40.2",
-              "bitrateBps": 192_000, "segments": 2, "group": "audio", "name": "Japanese"}
+    # A lifted rendition's own MP4 (_input) is shaka's input, which it takes
+    # out of the entry as _run_shaka_packager does.
+    audio = [{**{k: v for k, v in a.items() if k != "_input"}, "id": f"a{i}", "dir": f"hls/a{i}",
+              "codec": "mp4a.40.2", "bitrateBps": 192_000, "segments": 2, "group": "audio",
+              "name": "Japanese"}
              for i, a in enumerate(audio_meta)]
     return video, audio, surround_meta
 
