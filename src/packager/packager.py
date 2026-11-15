@@ -481,6 +481,10 @@ class _Probe:
     video_index: int | None = None
     # The container's overall bit rate (bit/s), None when ffprobe has none.
     bit_rate: int | None = None
+    # The file's start (seconds), the earliest of its streams as ffprobe
+    # reads them: where ffmpeg's own normalisation puts a pass's 0 (_origin).
+    # None when ffprobe has none.
+    start_time: float | None = None
 
 
 def package_item(
@@ -776,9 +780,13 @@ def build_package(
             staged = _remux_video(rung, tmpdir, inputs.timestamp_offset, codecs)
             if staged is not None:
                 videos.append(staged)
+        # On the remux's origin (_origin): the first video frame at 0, or
+        # where the contract puts it.
         subtitle_meta = _extract_subtitles(
             src, probe, stage / "subs",
             visible_indices=sub_visible,
+            timeline=inputs.primary.timeline,
+            ts_offset=inputs.timestamp_offset,
         )
         converted = _convert_subtitle_files(
             sub_files, stage / "subs", tmpdir,
@@ -1194,6 +1202,7 @@ def _ffprobe(path: Path) -> _Probe:
         subtitles=subtitles,
         video_index=video.get("index") if video else None,
         bit_rate=bit_rate,
+        start_time=_start_time(fmt),
     )
 
 
@@ -1594,16 +1603,97 @@ def _pick_default_surround(
 
 
 
-def _timeline_input_args(timeline: str) -> list[str]:
-    """`keep` / `offset` inputs are on the contract's shared timeline (or
-    moved onto it): don't let ffmpeg renormalise them per file."""
-    return ["-copyts"] if timeline in ("keep", "offset") else []
+@dataclass(frozen=True)
+class _Origin:
+    """Where a package's 0 is on its input's timeline, the same for every
+    ffmpeg pass that writes a track or a script of the package: the
+    transmux (the video, the stereo renditions and their signals, the 5.1
+    companions), a rung's remux, a subtitle track's sidecar and the script
+    of a styled one. With `copyts`, the input's timestamps are kept
+    (-copyts); without, they are ffmpeg's own normalisation, counted from
+    the file's start. Either way every output moves them by `offset`
+    seconds (-output_ts_offset). `lead`: how long before the package's 0
+    the input's earliest stream starts, where it does (an audio track's
+    priming before the first video frame), else 0."""
+    copyts: bool = False
+    offset: float = 0.0
+    lead: float = 0.0
+
+    @property
+    def input_args(self) -> list[str]:
+        return ["-copyts"] if self.copyts else []
+
+    @property
+    def output_args(self) -> list[str]:
+        """An output's own: each output file of a run takes them."""
+        return _ts_offset(self.offset)
+
+    @property
+    def signal_args(self) -> list[str]:
+        """A stereo rendition's signal's (_stereo_signals): the MP4's
+        timeline, `lead` later, so that it starts at 0 or after it. NUT holds
+        no time before 0: its muxer moved such a signal by its first
+        timestamp, and its lift came out that much later than its rendition
+        (_lift_args moves it back)."""
+        return _ts_offset(self.offset + self.lead)
 
 
-def _timeline_output_args(timeline: str, ts_offset: float) -> list[str]:
-    if timeline == "offset" and ts_offset:
-        return ["-output_ts_offset", f"{ts_offset:.6f}"]
-    return []
+def _ts_offset(seconds: float) -> list[str]:
+    seconds = round(seconds, 6)
+    return ["-output_ts_offset", f"{seconds:.6f}"] if seconds else []
+
+
+# ffmpeg's normalisation puts a pass's 0 at the file's start, the earliest of
+# its streams, and that is not the same instant on every version: ffmpeg 7.1
+# reads a Matroska audio track with a codec delay (an AAC track ffmpeg muxed:
+# 1024 samples, 21 ms at 48 kHz; Opus: 6.5 ms) from that delay before 0, 9.0
+# from 0. The first video frame is at the same time on both: a package's 0 is
+# that frame (_origin). The normalisation itself stays: under -copyts, ffmpeg
+# leaves the timestamp jumps of an MPEG-TS source as they are (a recording
+# whose clock jumps by an hour came out an hour long), which it otherwise
+# makes continuous.
+
+
+def _origin(timeline: str, ts_offset: float, probe: _Probe) -> _Origin:
+    """The package's origin on an input of `timeline` (VideoInput.timeline),
+    `probe` its probe: `keep`, the contract's shared timeline as it is
+    (-copyts); `offset`, the original moved onto it by the contract's
+    timestampOffset (`ts_offset`, -copyts); `normalize`, ffmpeg's
+    normalisation, moved by the file's start's distance to the first video
+    frame (the video stream's start_time), which lands that frame at 0 —
+    nothing where the file starts with it, as before. A track that starts
+    before that frame (an audio track's priming, a lead) starts before 0,
+    and the MP4's edit list trims what is before 0, as ever (the origin's
+    `lead`). A `normalize` input whose video has no start is ffmpeg's
+    normalisation alone, as before."""
+    if timeline in ("keep", "offset"):
+        offset = ts_offset if timeline == "offset" else 0.0
+        # Kept, the earliest stream is at the file's start.
+        return _Origin(copyts=True, offset=offset,
+                       lead=_lead_of((probe.start_time or 0.0) + offset))
+    video = _start_time(probe.video)
+    if video is None:
+        return _Origin()
+    # Normalised, the earliest stream is at 0 (ffmpeg normalises by no start
+    # where the file has none).
+    offset = round((probe.start_time or 0.0) - video, 6)
+    return _Origin(offset=offset, lead=_lead_of(offset))
+
+
+def _lead_of(earliest: float) -> float:
+    """How long before the package's 0 a stream starting at `earliest`
+    there starts; 0 for one at 0 or after it."""
+    return round(max(0.0, -earliest), 6)
+
+
+def _start_time(entry: dict[str, Any]) -> float | None:
+    """A probed stream's or format's start_time in seconds; None where it
+    has none."""
+    try:
+        start = float(entry.get("start_time"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return start if math.isfinite(start) else None
 
 
 @dataclass(frozen=True)
@@ -1781,14 +1871,17 @@ def _lift_makeup(signal: Path, gain: float, level: float, retime: bool = False,
     return round(min(max(makeup, 0.0), 2 * high), 2)
 
 
-def _lift_args(signal: Path, filters: str, out: Path, language: str) -> list[str]:
+def _lift_args(signal: Path, filters: str, out: Path, language: str,
+               lead: float = 0.0) -> list[str]:
     """The ffmpeg run that makes a lifted stereo rendition of its signal,
     encoded as every stereo rendition is, its timestamps as they are: the
-    signal is on the transmux's timeline."""
+    signal is on the transmux's timeline, `lead` seconds later where the
+    transmux starts before 0 (_Origin.signal_args), which it is moved back
+    by."""
     return ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning", "-copyts",
             *_SIGNAL_INPUT, "-i", str(signal), "-map", "0:a:0", "-af", filters,
             "-c:a", STEREO_CODEC, "-b:a", STEREO_BITRATE, "-metadata:s:a:0", f"language={language}",
-            *NO_GLOBAL_METADATA, "-movflags", "+faststart", str(out)]
+            *NO_GLOBAL_METADATA, *_ts_offset(-lead), "-movflags", "+faststart", str(out)]
 
 
 def _same_timing(lifted: dict[str, Any] | None, rendition: dict[str, Any] | None) -> bool:
@@ -1856,19 +1949,21 @@ def _stereo_signals(probe: _Probe, tmpdir: Path, target: float | None,
 
 
 def _lift_stereo(probe: _Probe, signals: dict[int, Path], transmuxed: Path,
-                 target: float) -> dict[int, tuple[str, Path | None]]:
+                 target: float, *, lead: float = 0.0) -> dict[int, tuple[str, Path | None]]:
     """What became of the stereo rendition of every track whose signal was
     written beside the transmux, by track (_lift_one: LIFTED and its MP4,
     KEPT or SKIPPED), _LIFT_WORKERS at once, each run within its timeout
-    (_LIFT_TIMEOUT). A track whose lift fails, however it fails, keeps the
-    rendition it has (SKIPPED); each signal is removed once done, and an MP4
-    not kept."""
+    (_LIFT_TIMEOUT); the signals `lead` seconds later than the transmux
+    (_Origin.signal_args). A track whose lift fails, however it fails, keeps
+    the rendition it has (SKIPPED); each signal is removed once done, and an
+    MP4 not kept."""
     timeout = _LIFT_TIMEOUT + _LIFT_TIMEOUT_PER_SECOND * max(probe.duration_ms, 0) / 1000
 
     def lift(i: int, signal: Path) -> tuple[str, Path | None]:
         done: tuple[str, Path | None] = (SKIPPED, None)
         try:
-            done = _lift_one(i, probe.audio[i], signal, transmuxed, target, timeout=timeout)
+            done = _lift_one(i, probe.audio[i], signal, transmuxed, target, timeout=timeout,
+                             lead=lead)
         except Exception as e:  # a failed lift costs its track the lift, never the package
             log.warning("packager.stereo.lift_failed", track=i,
                         error=f"{type(e).__name__}: {e}"[:300])
@@ -1884,10 +1979,12 @@ def _lift_stereo(probe: _Probe, signals: dict[int, Path], transmuxed: Path,
 
 
 def _lift_one(i: int, stream: dict[str, Any], signal: Path, transmuxed: Path,
-              target: float, *, timeout: float | None = None) -> tuple[str, Path | None]:
+              target: float, *, timeout: float | None = None,
+              lead: float = 0.0) -> tuple[str, Path | None]:
     """The signal's loudness, and where it is quiet (_stereo_lift), the
     rendition made of it lifted: its make-up measured (_lift_makeup), then
-    encoded, the AAC decoded and measured with its true peak.
+    encoded, the AAC decoded and measured with its true peak, on the
+    transmux's timeline (the signal `lead` seconds later: _lift_args).
     One whose true peak is not under _LIFT_TRUE_PEAK (it is measured to 0.1
     dB) or whose loudness is more than _LIFT_TOLERANCE off the lift's level
     is made again, once: the limiter that much (and 0.5 dB) lower, the
@@ -1920,7 +2017,7 @@ def _lift_one(i: int, stream: dict[str, Any], signal: Path, transmuxed: Path,
     for again in (False, True):
         _run_ffmpeg_capturing(f"stereo {i}", _lift_args(
             signal, _lift_filter(gain, level, makeup, ceiling, retime), out,
-            _track_language(stream)), timeout=timeout)
+            _track_language(stream), lead), timeout=timeout)
         made = _measure_loudness(out, true_peak=True, timeout=timeout)
         if made is None:
             return SKIPPED, None
@@ -1995,6 +2092,10 @@ def _prepare_source(
     HEVC — feeding it an MKV makes the WebM demuxer choke ("Unsupported
     video codec"). So we always remux (video copy, no re-encode).
 
+    Timing: every output on the package's origin (_origin, by `timeline`
+    and `ts_offset`): the first video frame at 0, or where the contract
+    puts it, as the subtitles' sidecars are (_extract_subtitles).
+
     Stereo: every source track is re-encoded to AAC-LC 48 kHz stereo
     192 kbps — even tracks that are already AAC — for a correctness
     guarantee: every stereo rendition has identical channel count,
@@ -2024,6 +2125,7 @@ def _prepare_source(
     title, channels, default, visible}, in source order (audio_meta[N]
     is the Nth audio stream of the MP4 after the video)."""
     surround = surround or []
+    origin = _origin(timeline, ts_offset, probe)
     log.info(
         "packager.prepare",
         strategy="remux_to_mp4",
@@ -2032,12 +2134,13 @@ def _prepare_source(
         non_aac=[s.get("codec_name") for s in probe.audio if s.get("codec_name") != "aac"],
         surround=[f"{s.source_index}:{s.mode}" for s in surround] or None,
         timeline=timeline,
+        origin_offset=origin.offset,
     )
     transmuxed = tmpdir / "transmux.mp4"
     vmap = f"0:{probe.video_index}" if probe.video_index is not None else "0:v:0"
     args = [
         "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-        *_timeline_input_args(timeline),
+        *origin.input_args,
         "-i", str(src),
         "-map", vmap,
         "-c:v", "copy",
@@ -2089,12 +2192,12 @@ def _prepare_source(
     # No subtitle / data streams in the intermediate — subtitles are
     # extracted separately to sidecar files — and none of the original's
     # global metadata (NO_GLOBAL_METADATA).
-    args += ["-sn", "-dn", *NO_GLOBAL_METADATA, *_timeline_output_args(timeline, ts_offset),
+    args += ["-sn", "-dn", *NO_GLOBAL_METADATA, *origin.output_args,
              "-movflags", "+faststart", str(transmuxed)]
-    # The stereo renditions' signals (_SIGNAL_CODEC), on the MP4's timeline.
+    # The stereo renditions' signals (_SIGNAL_CODEC), on the MP4's timeline
+    # (where it starts before 0, that much later: _Origin.signal_args).
     for i, path in signals.items():
-        args += ["-map", f"[l{i}]", *_SIGNAL_CODEC,
-                 *_timeline_output_args(timeline, ts_offset), "-f", "nut", str(path)]
+        args += ["-map", f"[l{i}]", *_SIGNAL_CODEC, *origin.signal_args, "-f", "nut", str(path)]
     _run_ffmpeg_capturing("transmux", args)
     # What became of each shown track's stereo rendition; one without a
     # signal is one the temp space left out.
@@ -2102,7 +2205,8 @@ def _prepare_source(
         {i: (SKIPPED, None) for i in _shown(probe, audio_visible_indices, default_index)}
         if stereo_loudness is not None else {})
     if signals:
-        lifts.update(_lift_stereo(probe, signals, transmuxed, stereo_loudness))
+        lifts.update(_lift_stereo(probe, signals, transmuxed, stereo_loudness,
+                                  lead=origin.lead))
 
     # Visibility is attached per-meta-entry, not by dropping tracks —
     # every audio stream is packaged into the HLS tree; the client
@@ -2154,7 +2258,8 @@ def _remux_video(
     rung: VideoInput, tmpdir: Path, ts_offset: float, codecs: tuple[str, ...] = VIDEO_CODECS,
 ) -> _StagedVideo | None:
     """Stream-copy a lower rung's video into an MP4 for shaka, on the
-    shared timeline. A rung that can't be packaged (or whose codec isn't
+    shared timeline (_origin of its own timeline: a contract's rung keeps
+    it, -copyts). A rung that can't be packaged (or whose codec isn't
     one of `codecs`) is skipped (logged): the item still gets its top
     rendition."""
     try:
@@ -2168,15 +2273,15 @@ def _remux_video(
         return None
     target = tmpdir / f"{rung.id}.mp4"
     vmap = f"0:{probe.video_index}" if probe.video_index is not None else "0:v:0"
+    origin = _origin(rung.timeline, ts_offset, probe)
     args = [
         "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-        *_timeline_input_args(rung.timeline),
+        *origin.input_args,
         "-i", str(rung.path),
         "-map", vmap, "-c:v", "copy",
         *([*_hevc_copy_args(rung.path, probe.video_index), "-tag:v", "hvc1"]
           if codec == "hevc" else []),
-        "-an", "-sn", "-dn", *NO_GLOBAL_METADATA,
-        *_timeline_output_args(rung.timeline, ts_offset),
+        "-an", "-sn", "-dn", *NO_GLOBAL_METADATA, *origin.output_args,
         "-movflags", "+faststart", str(target),
     ]
     try:
@@ -3032,6 +3137,8 @@ def _extract_subtitles(
     src: Path, probe: _Probe, subs_dir: Path,
     *,
     visible_indices: set[int] | None = None,
+    timeline: str = "normalize",
+    ts_offset: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Extract every embedded subtitle stream as a sidecar file in
     `subs_dir/`. Text codecs (subrip, ass, mov_text, etc) get
@@ -3045,6 +3152,10 @@ def _extract_subtitles(
     them frame-accurate; clients without one can ignore the
     `format` hint and fall back to the WebVTT tracks for the same
     language. HLS can't carry the image formats; they stay sidecar-only.
+
+    Every ffmpeg run writes its sidecars and scripts on the package's
+    origin (_origin, by `timeline` and `ts_offset`), as the transmux writes
+    the video and the audio: a cue at its frame's time.
 
     The PGS and text tracks are written in one ffmpeg run, one output
     each and one more for each styled original: the source is read once,
@@ -3082,20 +3193,22 @@ def _extract_subtitles(
     sidecars = [_sidecar(i, codec) for i, codec in enumerate(codecs)]
     timeout = min(_SUBS_TIMEOUT + _SUBS_TIMEOUT_PER_SECOND * max(probe.duration_ms, 0) / 1000,
                   _SUBS_TIMEOUT_MAX)
+    origin = _origin(timeline, ts_offset, probe)
     together = [c for c in sidecars if c.one_pass]
     outputs = sum(2 if c.styled else 1 for c in together)
-    written = _extract_together(src, subs_dir, together, timeout) if outputs > 1 else None
+    written = (_extract_together(src, subs_dir, together, timeout, origin) if outputs > 1
+               else None)
     styled = {c.index for c in together if c.styled} if written is not None else set()
     if written is None:
         written = {c.index for c in together
-                   if _extract_alone(src, subs_dir, c, codecs[c.index], timeout)}
+                   if _extract_alone(src, subs_dir, c, codecs[c.index], timeout, origin)}
         styled = {c.index for c in together if c.styled and c.index in written
-                  and _extract_styled(src, subs_dir, c, timeout)}
+                  and _extract_styled(src, subs_dir, c, timeout, origin)}
     written |= _extract_vobsubs(src, subs_dir, [c for c in sidecars if c.format == "vobsub"],
                                 probe.subtitles)
     written |= {c.index for c in sidecars
                 if not c.one_pass and c.format != "vobsub"
-                and _extract_alone(src, subs_dir, c, codecs[c.index], timeout)}
+                and _extract_alone(src, subs_dir, c, codecs[c.index], timeout, origin)}
     for c in [c for c in together if c.index in styled]:
         # ffmpeg's ASS muxer writes the script's header whatever events it
         # has: an empty file is a script it didn't write
@@ -3143,21 +3256,24 @@ def _extract_subtitles(
 
 
 def _extract_together(src: Path, subs_dir: Path, sidecars: list[_Sidecar],
-                      timeout: float) -> set[int] | None:
+                      timeout: float, origin: _Origin) -> set[int] | None:
     """Write every one of the sidecars in one ffmpeg run over the source,
     an output each, and the styled original of each that has one beside
-    it. Returns the indices it wrote — all of them, styled originals and
-    all — or None when the run failed, with what it wrote removed. A run
-    that takes longer than `timeout` seconds is killed, and the title
-    fails (PackageError): a storage that stalls would stall every run of
-    its own after it as well."""
-    args = ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning", "-i", str(src)]
+    it, every one on the package's `origin`. Returns the indices it wrote
+    — all of them, styled originals and all — or None when the run failed,
+    with what it wrote removed. A run that takes longer than `timeout`
+    seconds is killed, and the title fails (PackageError): a storage that
+    stalls would stall every run of its own after it as well."""
+    args = ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
+            *origin.input_args, "-i", str(src)]
     names = []
     for c in sidecars:
-        args += ["-map", f"0:s:{c.index}", *c.options, str(subs_dir / c.name)]
+        args += ["-map", f"0:s:{c.index}", *c.options, *origin.output_args,
+                 str(subs_dir / c.name)]
         names.append(c.name)
         if c.styled:
-            args += ["-map", f"0:s:{c.index}", *c.styled_options, str(subs_dir / c.styled)]
+            args += ["-map", f"0:s:{c.index}", *c.styled_options, *origin.output_args,
+                     str(subs_dir / c.styled)]
             names.append(c.styled)
     t0 = time.monotonic()
     try:
@@ -3256,15 +3372,17 @@ def _extract_vobsubs(src: Path, subs_dir: Path, cs: list[_Sidecar],
     return out
 
 
-def _extract_alone(src: Path, subs_dir: Path, c: _Sidecar, codec: str, timeout: float) -> bool:
-    """Write one sidecar in a run of its own, as every one was once.
-    False, logged, when ffmpeg fails or takes longer than `timeout`
-    seconds (killed)."""
+def _extract_alone(src: Path, subs_dir: Path, c: _Sidecar, codec: str, timeout: float,
+                   origin: _Origin) -> bool:
+    """Write one sidecar in a run of its own, as every one was once, on
+    the package's `origin`. False, logged, when ffmpeg fails or takes
+    longer than `timeout` seconds (killed)."""
     target = subs_dir / c.name
     try:
         subprocess.run(
             ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-             "-i", str(src), "-map", f"0:s:{c.index}", *c.options, str(target)],
+             *origin.input_args, "-i", str(src), "-map", f"0:s:{c.index}", *c.options,
+             *origin.output_args, str(target)],
             check=True, stdin=subprocess.DEVNULL, timeout=timeout,
         )
     except subprocess.CalledProcessError as e:
@@ -3278,15 +3396,18 @@ def _extract_alone(src: Path, subs_dir: Path, c: _Sidecar, codec: str, timeout: 
     return True
 
 
-def _extract_styled(src: Path, subs_dir: Path, c: _Sidecar, timeout: float) -> bool:
-    """Write a sidecar's styled original in a run of its own. False,
-    logged, when ffmpeg fails or takes longer than `timeout` seconds
-    (killed): the track keeps its WebVTT copy alone."""
+def _extract_styled(src: Path, subs_dir: Path, c: _Sidecar, timeout: float,
+                    origin: _Origin) -> bool:
+    """Write a sidecar's styled original in a run of its own, on the
+    package's `origin`. False, logged, when ffmpeg fails or takes longer
+    than `timeout` seconds (killed): the track keeps its WebVTT copy
+    alone."""
     target = subs_dir / str(c.styled)
     try:
         subprocess.run(
             ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-             "-i", str(src), "-map", f"0:s:{c.index}", *c.styled_options, str(target)],
+             *origin.input_args, "-i", str(src), "-map", f"0:s:{c.index}", *c.styled_options,
+             *origin.output_args, str(target)],
             check=True, stdin=subprocess.DEVNULL, timeout=timeout,
         )
     except subprocess.CalledProcessError as e:

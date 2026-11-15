@@ -54,12 +54,21 @@ the transcoder README, "Rendition contract"):
   `segmentSeconds` from the file, the interval the rungs' keyframes were
   forced at. The inbox files share one timeline; they are remuxed with
   `-copyts` and the original is shifted onto it by `timestampOffset`, so
-  every rung and the audio carry identical timestamps for identical
-  frames.
+  every rung, the audio and the subtitles carry identical timestamps for
+  identical frames.
 - only `prepared.mkv` (an older transcoder) — one rung, as before.
 - nothing — the original source, one rung, as before.
 
 The handoff is deleted after a successful package.
+
+Without a contract, a package's 0 is the first video frame of v0: every
+ffmpeg pass that writes a track or a script (the remux, the subtitle
+sidecars, the styled scripts) is moved by the distance from the file's
+start to that frame. ffmpeg 7.1 reads a Matroska audio track with a codec
+delay (an AAC track ffmpeg muxed: 21 ms) as starting that long before the
+first frame, 9.0 from it, so the package is the same on both. A track that
+starts before the first frame (its priming) is before 0 and the MP4's
+edit list trims it.
 
 Each video rendition in the manifest (and in a library v2 `package.json`)
 records what made its stream as `encoder`: `"copy"` for the original's

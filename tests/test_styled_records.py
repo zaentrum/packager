@@ -66,7 +66,8 @@ def _subtitles(monkeypatch: pytest.MonkeyPatch, subs: Path, scripts: set[int]) -
     """The manifest's subtitle entries as _extract_subtitles makes them, the
     one pass writing each track's WebVTT copy, and the script of the tracks
     `scripts` names — the other's empty, a script ffmpeg didn't write."""
-    def together(_src: Path, folder: Path, sidecars: list, _timeout: float) -> set[int]:
+    def together(_src: Path, folder: Path, sidecars: list, _timeout: float,
+                 _origin=None) -> set[int]:
         for c in sidecars:
             (folder / c.name).write_text("WEBVTT\n\n00:01.000 --> 00:02.000\nA line.\n")
             if c.styled:

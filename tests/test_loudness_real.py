@@ -233,14 +233,14 @@ def test_the_signals_are_flac_of_24_bits_on_the_mp4s_timeline(film: Path, tmp_pa
     seen = {}
     lift = pk._lift_stereo
 
-    def probe_then_lift(probe, signals, mp4, target):
+    def probe_then_lift(probe, signals, mp4, target, **kw):
         for i, signal in signals.items():
             out = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
                                   "stream=codec_name,sample_fmt,bits_per_raw_sample,channels,"
                                   "channel_layout,start_pts,time_base", "-of", "json", str(signal)],
                                  capture_output=True, text=True, check=True).stdout
             seen[i] = json.loads(out)["streams"][0]
-        return lift(probe, signals, mp4, target)
+        return lift(probe, signals, mp4, target, **kw)
 
     monkeypatch.setattr(pk, "_lift_stereo", probe_then_lift)
     mp4, _meta = _prepare(film, tmp_path, -20.0, "offset", 0.021)

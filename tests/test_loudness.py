@@ -148,7 +148,7 @@ def test_the_remux_writes_every_renditions_signal_beside_it(monkeypatch, tmp_pat
     calls: list[list[str]] = []
     monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: calls.append(args))
     lifts: list[dict] = []
-    monkeypatch.setattr(pk, "_lift_stereo", lambda probe, signals, mp4, target: (
+    monkeypatch.setattr(pk, "_lift_stereo", lambda probe, signals, mp4, target, **_kw: (
         lifts.append({"signals": signals, "mp4": mp4, "target": target}) or
         {0: (pk.KEPT, None), 1: (pk.LIFTED, tmp_path / "stereo1.mp4")}))
     audio = [_s(6, "5.1(side)", codec="dts"), _s(2, "stereo", "ger")]
@@ -190,7 +190,7 @@ def test_only_the_tracks_a_client_offers_get_a_signal(monkeypatch, tmp_path: Pat
     calls: list[list[str]] = []
     monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: calls.append(args))
     lifts: list[dict] = []
-    monkeypatch.setattr(pk, "_lift_stereo", lambda probe, signals, mp4, target: (
+    monkeypatch.setattr(pk, "_lift_stereo", lambda probe, signals, mp4, target, **_kw: (
         lifts.append(signals) or {i: (pk.KEPT, None) for i in signals}))
     audio = [_s(2, "stereo", "eng"), _s(2, "stereo", "ger"), _s(6, None, "fre", "dts"),
              _s(2, "stereo", "ita")]
@@ -212,7 +212,7 @@ def test_the_default_track_is_measured_though_no_client_offers_it(monkeypatch, t
     # one DEFAULT=YES all the same, and it plays: it is measured and lifted.
     monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: None)
     lifts: list[dict] = []
-    monkeypatch.setattr(pk, "_lift_stereo", lambda probe, signals, mp4, target: (
+    monkeypatch.setattr(pk, "_lift_stereo", lambda probe, signals, mp4, target, **_kw: (
         lifts.append(signals) or {i: (pk.LIFTED, tmp_path / f"stereo{i}.mp4") for i in signals}))
     audio = [_s(2, "stereo", "fre"), _s(2, "stereo", "ita")]
     shown = pk._visible_indices(audio, ["en", "de"], keep_original_if_single=True)
@@ -297,7 +297,7 @@ def test_without_the_temp_space_the_remux_is_as_before(monkeypatch, tmp_path: Pa
     space["free"] = 30.5 * GB
     calls: list[list[str]] = []
     monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: calls.append(args))
-    monkeypatch.setattr(pk, "_lift_stereo", lambda *a: pytest.fail("nothing to lift"))
+    monkeypatch.setattr(pk, "_lift_stereo", lambda *a, **kw: pytest.fail("nothing to lift"))
     _mp4, meta, _ = pk._prepare_source(Path("/m/src.mkv"), _probe([_s(2, "stereo")]), tmp_path,
                                        stereo_loudness=-20.0)
     [args] = calls
@@ -308,7 +308,7 @@ def test_without_the_temp_space_the_remux_is_as_before(monkeypatch, tmp_path: Pa
 def test_without_a_target_the_remux_is_as_before(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(pk, "_run_ffmpeg_capturing", lambda label, args: calls.append(args))
-    monkeypatch.setattr(pk, "_lift_stereo", lambda *a: pytest.fail("nothing to lift"))
+    monkeypatch.setattr(pk, "_lift_stereo", lambda *a, **kw: pytest.fail("nothing to lift"))
     _mp4, meta, _ = pk._prepare_source(Path("/m/src.mkv"), _probe([_s(2, "stereo")]), tmp_path)
     [args] = calls
     assert args[args.index("-filter_complex") + 1] == f"[0:a:0]{FORMAT}[s0]"
@@ -581,7 +581,7 @@ def test_every_signal_is_removed_and_a_failed_lift_keeps_its_rendition(
         path.write_bytes(b"x")
     timeouts: set[float] = set()
 
-    def lift_one(i, stream, signal, mp4, target, *, timeout):
+    def lift_one(i, stream, signal, mp4, target, *, timeout, **_kw):
         timeouts.add(timeout)
         if i == 1:
             raise pk.PackageError("ffmpeg stereo 1 exited 1")
