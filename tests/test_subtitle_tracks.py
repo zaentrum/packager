@@ -563,5 +563,6 @@ def test_mkvextract_writes_the_vobsub_pair(tmp_path: Path, tracks: Path) -> None
     assert idx.startswith("# VobSub index file") and "timestamp: " in idx
     # .sub is an MPEG program stream: a pack header first
     assert (tmp_path / "subs" / "3.sub").read_bytes()[:4] == b"\x00\x00\x01\xba"
+    # The ASS track's script beside its WebVTT copy, as in the test above.
     assert sorted(p.name for p in (tmp_path / "subs").iterdir()) == [
-        "0.vtt", "1.vtt", "2.sup", "3.idx", "3.sub", "5.vtt"]
+        "0.vtt", "1.ass", "1.vtt", "2.sup", "3.idx", "3.sub", "5.vtt"]

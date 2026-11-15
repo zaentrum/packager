@@ -32,9 +32,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # shaka-packager: Google's CMAF/HLS/DASH packager. Pinned to the same
 # version used historically by the analyzer pod so package layout
 # remains identical across the cutover.
+# The binary's sha256 is pinned with it (the release publishes none): a
+# version bump changes both.
 ARG SHAKA_PACKAGER_VERSION=v3.4.2
+ARG SHAKA_PACKAGER_SHA256=7bdefe5a25fe84535c6c1a425f4c3c6b65fa85c441c2aeba01254b3c0f4b1956
 RUN curl -fsSL -o /usr/local/bin/packager \
       "https://github.com/shaka-project/shaka-packager/releases/download/${SHAKA_PACKAGER_VERSION}/packager-linux-x64" \
+    && echo "${SHAKA_PACKAGER_SHA256}  /usr/local/bin/packager" | sha256sum -c - \
     && chmod +x /usr/local/bin/packager \
     && /usr/local/bin/packager --version
 

@@ -16,10 +16,12 @@ jobs:
       - name: the image's tools
         env:
           SHAKA_PACKAGER_VERSION: v3.4.2
+          SHAKA_PACKAGER_SHA256: 7bdefe5a25fe84535c6c1a425f4c3c6b65fa85c441c2aeba01254b3c0f4b1956
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ffmpeg mkvtoolnix ca-certificates curl git
           curl -fsSL -o /usr/local/bin/packager "https://github.com/shaka-project/shaka-packager/releases/download/${SHAKA_PACKAGER_VERSION}/packager-linux-x64"
+          echo "${SHAKA_PACKAGER_SHA256}  /usr/local/bin/packager" | sha256sum -c -
           chmod +x /usr/local/bin/packager
           packager --version && mkvextract --version && ffmpeg -version | head -1
       - uses: actions/checkout@v4
