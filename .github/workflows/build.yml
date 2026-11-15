@@ -8,11 +8,21 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # In the image's own base, with the tools the image installs (Dockerfile):
+    # its ffmpeg and mkvtoolnix, and the same shaka-packager release. The tests
+    # that package end to end use them, and skip without them.
+    container: python:3.11-slim
     steps:
+      - name: the image's tools
+        env:
+          SHAKA_PACKAGER_VERSION: v3.4.2
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ffmpeg mkvtoolnix ca-certificates curl git
+          curl -fsSL -o /usr/local/bin/packager "https://github.com/shaka-project/shaka-packager/releases/download/${SHAKA_PACKAGER_VERSION}/packager-linux-x64"
+          chmod +x /usr/local/bin/packager
+          packager --version && mkvextract --version && ffmpeg -version | head -1
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
       - run: pip install -e '.[dev]'
       - run: python -m compileall src
       - run: ruff check src
