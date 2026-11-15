@@ -58,7 +58,8 @@ class Ffmpeg:
 
 
 def _out(subs: Path, i: int, *options: str, name: str) -> list[str]:
-    return ["-map", f"0:s:{i}", *options, str(subs / name)]
+    # Every output keeps its times as they are (_SUBTITLE_TIMES).
+    return ["-map", f"0:s:{i}", *options, "-avoid_negative_ts", "disabled", str(subs / name)]
 
 
 def test_every_text_and_pgs_track_is_one_run_over_the_source(

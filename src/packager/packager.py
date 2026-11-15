@@ -63,6 +63,7 @@ import posixpath
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import tempfile
 import threading
@@ -1652,20 +1653,33 @@ def _ts_offset(seconds: float) -> list[str]:
 # leaves the timestamp jumps of an MPEG-TS source as they are (a recording
 # whose clock jumps by an hour came out an hour long), which it otherwise
 # makes continuous.
+#
+# A run over a container whose timestamps may jump (its demuxer's
+# AVFMT_TS_DISCONT: MPEG-TS, MPEG-PS, FLV, Ogg and these) is normalised by the
+# earliest start of the streams the run reads, not by the file's start
+# (ffmpeg's "Correcting start time" of its input): the transmux by its video
+# and audio, a subtitle run by its subtitles. Each run's origin is moved from
+# its own normalisation, so the first video frame is at 0 in every one.
+_TS_DISCONT = frozenset({"mpegts", "mpegtsraw", "mpeg", "flv", "live_flv", "kux", "ogg", "hls",
+                         "m4v", "dhav", "dvdvideo", "ty", "rcwt"})
 
 
-def _origin(timeline: str, ts_offset: float, probe: _Probe) -> _Origin:
+def _origin(timeline: str, ts_offset: float, probe: _Probe,
+            streams: list[dict[str, Any]] | None = None) -> _Origin:
     """The package's origin on an input of `timeline` (VideoInput.timeline),
-    `probe` its probe: `keep`, the contract's shared timeline as it is
-    (-copyts); `offset`, the original moved onto it by the contract's
-    timestampOffset (`ts_offset`, -copyts); `normalize`, ffmpeg's
-    normalisation, moved by the file's start's distance to the first video
-    frame (the video stream's start_time), which lands that frame at 0 —
-    nothing where the file starts with it, as before. A track that starts
-    before that frame (an audio track's priming, a lead) starts before 0,
-    and the MP4's edit list trims what is before 0, as ever (the origin's
-    `lead`). A `normalize` input whose video has no start is ffmpeg's
-    normalisation alone, as before."""
+    `probe` its probe, for a run that reads `streams` of it (None: the
+    video and every audio stream, as the transmux): `keep`, the contract's
+    shared timeline as it is (-copyts); `offset`, the original moved onto
+    it by the contract's timestampOffset (`ts_offset`, -copyts);
+    `normalize`, ffmpeg's normalisation of that run (_normalised_by), moved
+    by its distance to the first video frame (the video stream's
+    start_time), which lands that frame at 0 — nothing where the run's
+    normalisation starts with it, as before. A track that starts before
+    that frame (an audio track's priming, a lead) starts before 0, and the
+    MP4's edit list trims what is before 0, as ever (the origin's `lead`);
+    a subtitle event, its sidecar keeps from 0 (_clip_before_zero). A
+    `normalize` input whose video has no start is ffmpeg's normalisation
+    alone, as before."""
     if timeline in ("keep", "offset"):
         offset = ts_offset if timeline == "offset" else 0.0
         # Kept, the earliest stream is at the file's start.
@@ -1676,8 +1690,20 @@ def _origin(timeline: str, ts_offset: float, probe: _Probe) -> _Origin:
         return _Origin()
     # Normalised, the earliest stream is at 0 (ffmpeg normalises by no start
     # where the file has none).
-    offset = round((probe.start_time or 0.0) - video, 6)
+    offset = round((_normalised_by(probe, streams) or 0.0) - video, 6)
     return _Origin(offset=offset, lead=_lead_of(offset))
+
+
+def _normalised_by(probe: _Probe, streams: list[dict[str, Any]] | None) -> float | None:
+    """The time ffmpeg's normalisation of a run puts at 0: the file's start,
+    or, in a container whose timestamps may jump (_TS_DISCONT), the earliest
+    start of the streams the run reads (`streams`; None: the video and every
+    audio stream)."""
+    if not set(probe.container.split(",")) & _TS_DISCONT:
+        return probe.start_time
+    read = [probe.video, *probe.audio] if streams is None else streams
+    starts = [s for s in map(_start_time, read) if s is not None]
+    return min(starts) if starts else probe.start_time
 
 
 def _lead_of(earliest: float) -> float:
@@ -2273,7 +2299,7 @@ def _remux_video(
         return None
     target = tmpdir / f"{rung.id}.mp4"
     vmap = f"0:{probe.video_index}" if probe.video_index is not None else "0:v:0"
-    origin = _origin(rung.timeline, ts_offset, probe)
+    origin = _origin(rung.timeline, ts_offset, probe, [probe.video])
     args = [
         "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
         *origin.input_args,
@@ -3049,6 +3075,12 @@ _STYLED_OPTIONS = ("-c:s", "copy", "-f", "ass")
 # packaged, which its record's essence says and the deletion gate names.
 _SSA_STYLED_OPTIONS = ("-c:s", "ass", "-f", "ass")
 STYLED_FORMAT = "ass"
+# Every subtitle output's: its times as they are, also one before 0 (an
+# event before the first video frame). By default ffmpeg's WebVTT and PGS
+# writers moved such a track by its first event's time, every event as late;
+# its ASS writer writes such a time as it is (0:00:00.-42). Those events are
+# taken out or kept from 0 once written (_clip_before_zero).
+_SUBTITLE_TIMES = ("-avoid_negative_ts", "disabled")
 # How long a run of ffmpeg over the whole source for its subtitles may take,
 # a generous bound: _SUBS_TIMEOUT seconds and _SUBS_TIMEOUT_PER_SECOND for
 # every second of the source (a run reads it once), never more than
@@ -3193,22 +3225,25 @@ def _extract_subtitles(
     sidecars = [_sidecar(i, codec) for i, codec in enumerate(codecs)]
     timeout = min(_SUBS_TIMEOUT + _SUBS_TIMEOUT_PER_SECOND * max(probe.duration_ms, 0) / 1000,
                   _SUBS_TIMEOUT_MAX)
-    origin = _origin(timeline, ts_offset, probe)
+    def origin(*cs: _Sidecar) -> _Origin:
+        # A run's origin, by the streams it reads.
+        return _origin(timeline, ts_offset, probe, [probe.subtitles[c.index] for c in cs])
+
     together = [c for c in sidecars if c.one_pass]
     outputs = sum(2 if c.styled else 1 for c in together)
-    written = (_extract_together(src, subs_dir, together, timeout, origin) if outputs > 1
-               else None)
+    written = (_extract_together(src, subs_dir, together, timeout, origin(*together))
+               if outputs > 1 else None)
     styled = {c.index for c in together if c.styled} if written is not None else set()
     if written is None:
         written = {c.index for c in together
-                   if _extract_alone(src, subs_dir, c, codecs[c.index], timeout, origin)}
+                   if _extract_alone(src, subs_dir, c, codecs[c.index], timeout, origin(c))}
         styled = {c.index for c in together if c.styled and c.index in written
-                  and _extract_styled(src, subs_dir, c, timeout, origin)}
+                  and _extract_styled(src, subs_dir, c, timeout, origin(c))}
     written |= _extract_vobsubs(src, subs_dir, [c for c in sidecars if c.format == "vobsub"],
                                 probe.subtitles)
     written |= {c.index for c in sidecars
                 if not c.one_pass and c.format != "vobsub"
-                and _extract_alone(src, subs_dir, c, codecs[c.index], timeout, origin)}
+                and _extract_alone(src, subs_dir, c, codecs[c.index], timeout, origin(c))}
     for c in [c for c in together if c.index in styled]:
         # ffmpeg's ASS muxer writes the script's header whatever events it
         # has: an empty file is a script it didn't write
@@ -3217,6 +3252,12 @@ def _extract_subtitles(
             log.warning("packager.subs.styled_failed", idx=c.index, error="no script written")
             path.unlink(missing_ok=True)
             styled.discard(c.index)
+    # No event before the package's 0 (_clip_before_zero).
+    for c in sidecars:
+        if c.index in written and c.format in ("webvtt", "pgs"):
+            _clip_before_zero(subs_dir / c.name, c.format, c.index)
+        if c.index in styled:
+            _clip_before_zero(subs_dir / str(c.styled), STYLED_FORMAT, c.index)
     out: list[dict[str, Any]] = []
     for c, s in zip(sidecars, probe.subtitles, strict=True):
         if c.index not in written:
@@ -3268,12 +3309,12 @@ def _extract_together(src: Path, subs_dir: Path, sidecars: list[_Sidecar],
             *origin.input_args, "-i", str(src)]
     names = []
     for c in sidecars:
-        args += ["-map", f"0:s:{c.index}", *c.options, *origin.output_args,
+        args += ["-map", f"0:s:{c.index}", *c.options, *origin.output_args, *_SUBTITLE_TIMES,
                  str(subs_dir / c.name)]
         names.append(c.name)
         if c.styled:
             args += ["-map", f"0:s:{c.index}", *c.styled_options, *origin.output_args,
-                     str(subs_dir / c.styled)]
+                     *_SUBTITLE_TIMES, str(subs_dir / c.styled)]
             names.append(c.styled)
     t0 = time.monotonic()
     try:
@@ -3382,7 +3423,7 @@ def _extract_alone(src: Path, subs_dir: Path, c: _Sidecar, codec: str, timeout: 
         subprocess.run(
             ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
              *origin.input_args, "-i", str(src), "-map", f"0:s:{c.index}", *c.options,
-             *origin.output_args, str(target)],
+             *origin.output_args, *_SUBTITLE_TIMES, str(target)],
             check=True, stdin=subprocess.DEVNULL, timeout=timeout,
         )
     except subprocess.CalledProcessError as e:
@@ -3407,7 +3448,7 @@ def _extract_styled(src: Path, subs_dir: Path, c: _Sidecar, timeout: float,
         subprocess.run(
             ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
              *origin.input_args, "-i", str(src), "-map", f"0:s:{c.index}", *c.styled_options,
-             *origin.output_args, str(target)],
+             *origin.output_args, *_SUBTITLE_TIMES, str(target)],
             check=True, stdin=subprocess.DEVNULL, timeout=timeout,
         )
     except subprocess.CalledProcessError as e:
@@ -3420,6 +3461,144 @@ def _extract_styled(src: Path, subs_dir: Path, c: _Sidecar, timeout: float,
         target.unlink(missing_ok=True)
         return False
     return True
+
+
+def _clip_before_zero(path: Path, fmt: str, idx: int) -> None:
+    """Keep a sidecar or a styled script ffmpeg wrote (`fmt`: webvtt, pgs,
+    ass) free of times before the package's 0, which an event before the
+    first video frame has (_SUBTITLE_TIMES): one that ends at 0 or before is
+    taken out, one that ends after it starts at 0 and keeps its end. A file
+    without such an event is left as ffmpeg wrote it; one that can't be
+    read as its format is left as it is, logged."""
+    clip = {"webvtt": _clip_webvtt, "pgs": _clip_pgs, STYLED_FORMAT: _clip_ass}[fmt]
+    try:
+        clipped = clip(path.read_bytes())
+    except (OSError, ValueError) as e:
+        log.warning("packager.subs.before_zero_failed", idx=idx, format=fmt, error=str(e)[:200])
+        return
+    if clipped is None:
+        return
+    data, dropped, from_zero = clipped
+    _write_atomic(path, data)
+    log.info("packager.subs.before_zero", idx=idx, format=fmt, dropped=dropped,
+             from_zero=from_zero)
+
+
+def _at_zero(time: bytes) -> bool:
+    """Whether a WebVTT or ASS time is 0 (00:00.000, 0:00:00.00)."""
+    return not time.strip(b"0:.")
+
+
+def _clip_webvtt(data: bytes) -> tuple[bytes, int, int] | None:
+    """A WebVTT file's cues before 0 taken out or kept from 0 (_clip_before_
+    zero), and how many of each; None where none is. ffmpeg's writer writes
+    a time before 0 with a minus in it (00:00.-420), a cue as a block of its
+    own (its identifier, its timing and settings, its text); the settings may
+    have a minus of their own (line:-1)."""
+    body = data[:-1] if data.endswith(b"\n") else data
+    blocks, dropped, from_zero = [], 0, 0
+    for block in body.split(b"\n\n"):
+        lines = block.split(b"\n")
+        k = next((n for n, line in enumerate(lines) if b" --> " in line), None)
+        start, _, rest = lines[k].partition(b" --> ") if k is not None else (b"", b"", b"")
+        if k is None or b"-" not in start:
+            blocks.append(block)
+            continue
+        end = rest.split(b" ", 1)[0]
+        if b"-" in end or _at_zero(end):
+            dropped += 1
+            continue
+        lines[k] = b"00:00.000 --> " + rest
+        from_zero += 1
+        blocks.append(b"\n".join(lines))
+    if not (dropped or from_zero):
+        return None
+    return b"\n\n".join(blocks) + data[len(body):], dropped, from_zero
+
+
+def _clip_ass(data: bytes) -> tuple[bytes, int, int] | None:
+    """An ASS script's events before 0 taken out or kept from 0, as
+    _clip_webvtt; None where none is. ffmpeg's ASS writer writes a time
+    before 0 with a minus in it (0:00:00.-42): an event's line is
+    `Dialogue: layer,start,end,…`."""
+    lines, dropped, from_zero = [], 0, 0
+    for line in data.splitlines(keepends=True):
+        fields = line.split(b",", 3) if line.startswith(b"Dialogue:") else []
+        if len(fields) < 4 or b"-" not in fields[1]:
+            lines.append(line)
+            continue
+        if b"-" in fields[2] or _at_zero(fields[2].strip()):
+            dropped += 1
+            continue
+        lines.append(b",".join([fields[0], b"0:00:00.00", *fields[2:]]))
+        from_zero += 1
+    if not (dropped or from_zero):
+        return None
+    return b"".join(lines), dropped, from_zero
+
+
+# A PGS display set: its segments (PTS, DTS in 90 kHz ticks, as signed 32-bit
+# times: ffmpeg's writer writes one before 0 as it wraps; type; payload), from
+# its presentation composition (PCS, 0x16) to its end (0x80).
+_PGS_PCS, _PGS_END = 0x16, 0x80
+# A composition state a decoder can start at: an epoch start, an acquisition
+# point (the PCS's eighth byte). A normal one may use objects defined before.
+_PGS_STARTS = frozenset({0x80, 0x40})
+
+
+def _clip_pgs(data: bytes) -> tuple[bytes, int, int] | None:
+    """A PGS stream's (.sup) display sets before 0, as _clip_webvtt: each
+    shows from its time until the next one's. Where the last before 0 shows
+    nothing and the next can be decoded from (_PGS_STARTS), all of them are
+    taken out; else those before the last one a decoder can start at, and
+    that one and the rest before 0 are at 0, in their order, so that what
+    shows at 0 is what showed there. The counts are display sets'; None
+    where none is before 0, the stream read no further than its first."""
+    sets: list[list[tuple[int, int, int, bytes]]] = []
+    current: list[tuple[int, int, int, bytes]] = []
+    i = 0
+    while i < len(data):
+        if data[i:i + 2] != b"PG" or i + 13 > len(data):
+            raise ValueError(f"no PGS segment at byte {i}")
+        pts, dts, kind, size = struct.unpack_from(">IIBH", data, i + 2)
+        if (kind == _PGS_PCS or not current) and _signed(pts) >= 0:
+            break  # the first display set at 0 or after it: the rest as it is
+        if i + 13 + size > len(data):
+            raise ValueError(f"a PGS segment past the end at byte {i}")
+        if kind == _PGS_PCS and current:  # a display set without its end
+            sets.append(current)
+            current = []
+        current.append((_signed(pts), _signed(dts), kind, data[i + 13:i + 13 + size]))
+        i += 13 + size
+        if kind == _PGS_END:
+            sets.append(current)
+            current = []
+    if current:
+        sets.append(current)
+    if not sets:
+        return None
+
+    def state(s: list[tuple[int, int, int, bytes]]) -> int | None:
+        return s[0][3][7] if s[0][2] == _PGS_PCS and len(s[0][3]) > 10 else None
+
+    last = sets[-1]
+    shows_nothing = last[0][2] == _PGS_PCS and len(last[0][3]) > 10 and last[0][3][10] == 0
+    # The next display set's state: its PCS's eighth byte, after the 13 of its
+    # segment's header.
+    after = data[i + 20] if i + 21 <= len(data) and data[i + 10] == _PGS_PCS else None
+    if shows_nothing and (i >= len(data) or after in _PGS_STARTS):
+        keep = len(sets)
+    else:
+        keep = max((k for k, s in enumerate(sets) if state(s) in _PGS_STARTS), default=0)
+    kept = b"".join(b"PG" + struct.pack(">IIBH", max(pts, 0), max(min(dts, pts), 0), kind,
+                                        len(payload)) + payload
+                    for s in sets[keep:] for pts, dts, kind, payload in s)
+    return kept + data[i:], keep, len(sets) - keep
+
+
+def _signed(ticks: int) -> int:
+    """A PGS segment's 32-bit time read as signed."""
+    return ticks - (1 << 32) if ticks >= 1 << 31 else ticks
 
 
 # The subtitle files next to a source the packager takes, by extension;

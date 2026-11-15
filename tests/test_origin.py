@@ -12,6 +12,7 @@ its first frame, or whose frame has no time, is made as before."""
 
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,8 @@ from packager import packager as pk
 from packager.renditions import VideoInput
 
 SRC = Path("/m/src.mkv")
+# Every subtitle output keeps its times as they are, also one before 0.
+TIMES = ["-avoid_negative_ts", "disabled"]
 
 
 def _probe(start: float | None, video_start: float | None, *, audio: list[dict] | None = None,
@@ -145,9 +148,9 @@ def test_every_subtitle_output_is_on_the_transmuxs_origin(
     assert runs.runs == [[
         "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning", *head,
         "-i", str(SRC),
-        "-map", "0:s:0", "-c:s", "webvtt", *each, str(subs / "0.vtt"),
-        "-map", "0:s:0", "-c:s", "copy", "-f", "ass", *each, str(subs / "0.ass"),
-        "-map", "0:s:1", "-c:s", "copy", "-f", "sup", *each, str(subs / "1.sup"),
+        "-map", "0:s:0", "-c:s", "webvtt", *each, *TIMES, str(subs / "0.vtt"),
+        "-map", "0:s:0", "-c:s", "copy", "-f", "ass", *each, *TIMES, str(subs / "0.ass"),
+        "-map", "0:s:1", "-c:s", "copy", "-f", "sup", *each, *TIMES, str(subs / "1.sup"),
     ]]
 
 
@@ -162,10 +165,10 @@ def test_a_track_alone_and_its_script_alone_are_on_it_too(
     assert runs.runs == [
         ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning", "-copyts",
          "-i", str(SRC), "-map", "0:s:0", "-c:s", "webvtt", "-output_ts_offset", "-0.500000",
-         str(tmp_path / "0.vtt")],
+         *TIMES, str(tmp_path / "0.vtt")],
         ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning", "-copyts",
          "-i", str(SRC), "-map", "0:s:0", "-c:s", "copy", "-f", "ass",
-         "-output_ts_offset", "-0.500000", str(tmp_path / "0.ass")],
+         "-output_ts_offset", "-0.500000", *TIMES, str(tmp_path / "0.ass")],
     ]
 
 
@@ -179,3 +182,92 @@ def test_a_rung_keeps_the_contracts_timeline(monkeypatch: pytest.MonkeyPatch,
                            tmp_path, 0.021) is not None
     [args] = calls
     assert "-copyts" in args and "-output_ts_offset" not in args
+
+
+def test_a_run_over_a_transport_stream_is_moved_from_its_own_normalisation() -> None:
+    # ffmpeg normalises a run over an MPEG-TS file by the earliest start of
+    # the streams it reads: the transmux by its video and audio (the file's
+    # start is the subtitles'), a subtitle run by its subtitles. Each lands
+    # the first frame at 0.
+    def probe(container: str) -> pk._Probe:
+        return pk._Probe(container=container, duration_ms=6_000,
+                         video={"codec_name": "h264", "index": 0, "start_time": "1.920000"},
+                         audio=[{"codec_name": "aac", "index": 1, "start_time": "1.878667"}],
+                         subtitles=[{"codec_name": "hdmv_pgs_subtitle", "index": 2,
+                                     "start_time": "1.400000"}], video_index=0, start_time=1.4)
+    ts = probe("mpegts")
+    assert pk._origin("normalize", 0.0, ts) == pk._Origin(offset=-0.041333, lead=0.041333)
+    assert pk._origin("normalize", 0.0, ts, ts.subtitles) == pk._Origin(offset=-0.52, lead=0.52)
+    assert pk._origin("normalize", 0.0, ts, [ts.video]) == pk._Origin()
+    # Any other container: by the file's start, every run alike.
+    mkv = probe("matroska,webm")
+    assert pk._origin("normalize", 0.0, mkv) == pk._origin("normalize", 0.0, mkv, mkv.subtitles)
+    assert pk._origin("normalize", 0.0, mkv) == pk._Origin(offset=-0.52, lead=0.52)
+
+
+def test_a_webvtt_cue_before_0_is_taken_out_or_kept_from_0() -> None:
+    vtt = (b"WEBVTT\n\n00:00.-420 --> 00:00.-220\nBefore\n\n"
+           b"00:00.-100 --> 00:00.000\nAt 0\n\n"
+           b"7\n00:00.-320 --> 00:00.480 line:-1\nAcross\nit\n\n"
+           b"00:01.480 --> 00:02.480 line:-1\nAfter\n")
+    assert pk._clip_webvtt(vtt) == (
+        b"WEBVTT\n\n7\n00:00.000 --> 00:00.480 line:-1\nAcross\nit\n\n"
+        b"00:01.480 --> 00:02.480 line:-1\nAfter\n", 2, 1)
+    # A cue's settings have a minus of their own: no time before 0.
+    assert pk._clip_webvtt(b"WEBVTT\n\n00:01.000 --> 00:02.000 line:-1\nA\n") is None
+    assert pk._clip_webvtt(b"WEBVTT\n\n00:00.-500 --> 00:00.-100\nGone\n") == (b"WEBVTT\n", 1, 0)
+
+
+def test_an_ass_event_before_0_is_taken_out_or_kept_from_0() -> None:
+    head = b"[Script Info]\nScriptType: v4.00+\n\n[Events]\nFormat: Layer, Start, End, Text\n"
+    script = (head + b"Dialogue: 0,0:00:00.-42,0:00:00.-22,Default,,0,0,0,,Before\n"
+              b"Dialogue: 0,0:00:-1.-60,0:00:00.00,Default,,0,0,0,,At 0\n"
+              b"Dialogue: 0,0:00:00.-32,0:00:00.48,Default,,0,0,0,,Across, a comma\n"
+              b"Dialogue: 0,0:00:01.48,0:00:02.48,Default,,0,0,0,,After -1\n")
+    assert pk._clip_ass(script) == (
+        head + b"Dialogue: 0,0:00:00.00,0:00:00.48,Default,,0,0,0,,Across, a comma\n"
+        b"Dialogue: 0,0:00:01.48,0:00:02.48,Default,,0,0,0,,After -1\n", 2, 1)
+    assert pk._clip_ass(head + b"Dialogue: 0,0:00:01.48,0:00:02.48,Default,,0,0,0,,A -1\n") is None
+
+
+def _segment(seconds: float, kind: int, payload: bytes) -> bytes:
+    t = round(seconds * 90_000) & 0xFFFFFFFF  # one before 0 as ffmpeg's writer wraps it
+    return b"PG" + struct.pack(">IIBH", t, t, kind, len(payload)) + payload
+
+
+def _display(seconds: float, objects: int, state: int) -> bytes:
+    pcs = struct.pack(">HHBHBBBB", 320, 240, 0x10, 1, state, 0, 0, objects)
+    pcs += struct.pack(">HBBHH", 0, 0, 0, 10, 10) * objects
+    return _segment(seconds, 0x16, pcs) + _segment(seconds, 0x80, b"")
+
+
+def _sets(data: bytes) -> list[tuple[float, int]]:
+    """Every display set's time and objects shown."""
+    out, i = [], 0
+    while i < len(data):
+        pts, _dts, kind, size = struct.unpack_from(">IIBH", data, i + 2)
+        if kind == 0x16:
+            out.append((round(pk._signed(pts) / 90_000, 3), data[i + 13 + 10]))
+        i += 13 + size
+    return out
+
+
+@pytest.mark.parametrize(("sets", "kept", "counts"), [
+    # One shown and cleared before 0, one shown across it: from it, at 0.
+    ([(-0.52, 1, 0x80), (-0.32, 0, 0x00), (-0.22, 1, 0x80), (0.58, 0, 0x00), (1.38, 1, 0x80)],
+     [(0.0, 1), (0.58, 0), (1.38, 1)], (2, 1)),
+    # All of it before 0, the next a decoder can start at: taken out.
+    ([(-0.5, 1, 0x80), (-0.1, 0, 0x00), (1.0, 1, 0x80), (2.0, 0, 0x00)],
+     [(1.0, 1), (2.0, 0)], (2, 0)),
+    # An update before 0 of what an epoch start before it defined: both at 0.
+    ([(-0.5, 1, 0x80), (-0.2, 1, 0x00), (1.0, 0, 0x00)], [(0.0, 1), (0.0, 1), (1.0, 0)], (0, 2)),
+])
+def test_a_pgs_display_set_before_0_is_taken_out_or_kept_from_0(
+    sets: list[tuple[float, int, int]], kept: list[tuple[float, int]], counts: tuple[int, int],
+) -> None:
+    clipped = pk._clip_pgs(b"".join(_display(*s) for s in sets))
+    assert clipped is not None
+    data, *got = clipped
+    assert (_sets(data), tuple(got)) == (kept, counts)
+    # Nothing before 0: read no further than its first display set.
+    assert pk._clip_pgs(_display(0.0, 1, 0x80) + b"not PGS") is None

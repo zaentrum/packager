@@ -63,12 +63,15 @@ The handoff is deleted after a successful package.
 
 Without a contract, a package's 0 is the first video frame of v0: every
 ffmpeg pass that writes a track or a script (the remux, the subtitle
-sidecars, the styled scripts) is moved by the distance from the file's
-start to that frame. ffmpeg 7.1 reads a Matroska audio track with a codec
-delay (an AAC track ffmpeg muxed: 21 ms) as starting that long before the
-first frame, 9.0 from it, so the package is the same on both. A track that
-starts before the first frame (its priming) is before 0 and the MP4's
-edit list trims it.
+sidecars, the styled scripts) is moved by the distance from where ffmpeg
+starts that pass — the file's start, or in an MPEG-TS, MPEG-PS, FLV or Ogg
+file the earliest of the streams the pass reads — to that frame. ffmpeg
+7.1 reads a Matroska audio track with a codec delay (an AAC track ffmpeg
+muxed: 21 ms) as starting that long before the first frame, 9.0 from it,
+so the package is the same on both. A track that starts before the first
+frame (its priming) is before 0 and the MP4's edit list trims it. A
+subtitle event before it is taken out of its sidecar and script where it
+is over by then, and starts at 0 where it is not.
 
 Each video rendition in the manifest (and in a library v2 `package.json`)
 records what made its stream as `encoder`: `"copy"` for the original's
