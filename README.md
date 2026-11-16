@@ -466,15 +466,20 @@ transcoder names `-a53cc 1` for every encode), and shaka-packager keeps
 the SEI in every segment. No container or init segment says so, and
 ffprobe's `closed_captions` is no help on its own (7.1 sets it only for a
 stream it decoded a frame of, 9.0 has no such field), so after
-shaka-packager the packager reads each rung through its media playlist,
-decodes the first 48 packets of its first segment and looks for the A53
-captions FFmpeg's decoder exports with a frame (`_closed_captions`). A rung
-whose frames carry them is `closedCaptions: true` in the manifest and in a
-v2 record's `package.json` (record logic 11), and the package's essence has
-closed captions when its top rung does, so the deletion gate no longer
-holds an original for captions its package carries. A rung without them,
-or one that can't be read in time (logged), says nothing, and the package
-has none.
+shaka-packager the packager reads each rung in five windows across it and
+looks for the A53 captions FFmpeg's decoder exports with a frame
+(`_closed_captions`). An encoder may write caption data only where there is
+text, so the first frames of a programme whose captions start late carry
+none: each window is the first 48 packets of the segment that holds 10, 30,
+50, 70 or 90 % of the rung's duration, from its start, a keyframe, read
+after the init segment (`concat:`, nothing copied); the windows are read one
+after the other until one shows captions. A rung whose frames carry them is
+`closedCaptions: true` in the manifest and in a v2 record's `package.json`
+(record logic 11), and the package's essence has closed captions when its
+top rung does, so the deletion gate no longer holds an original for
+captions its package carries. A rung none of whose windows shows them says
+nothing, and the package has none; a window that can't be read in time, or
+decodes no frame, says nothing either (logged), which keeps the original.
 
 **Compatibility.** Rendition dirs stay `vN` / `aN`, so the existing
 playback routes serve every rung and both audio groups. `renditions.video[0]`

@@ -14,7 +14,7 @@ Design rules:
   original's HDR10 static metadata, which shaka-packager leaves out
   (hdr10.py). A rendition whose own stream carries closed captions
   (CEA-608/708 in its SEI, which shaka-packager keeps) says so in the
-  manifest (`closedCaptions`), as its first frames show them.
+  manifest (`closedCaptions`), as a window across it shows them.
 * N video renditions -> one master with one variant per rendition and
   audio group, plus one I-frame playlist per rendition. The master is
   assembled by `packager.hls` from shaka's media playlists.
@@ -3814,41 +3814,93 @@ def _carries_hdr10(stream: dict[str, Any]) -> bool:
 # a stream's closed_captions only once it has decoded a frame of it, and 9.0
 # gives none, so the decoder's own reading is what tells — the side data it
 # exports with each frame whose SEI carries them. An fMP4 rendition's init
-# segment has no frame: the first segment's are read, through the media
-# playlist as a player reads them, so much and no more.
+# segment has no frame, and an encoder may write caption data only where
+# there is text, so a programme whose captions start late has none in its
+# first frames: the rendition is read in windows across it, at
+# CLOSED_CAPTION_WINDOWS of its duration, each the first
+# CLOSED_CAPTION_PACKETS packets of the segment that holds that moment, from
+# its start (a keyframe), with the init segment before it.
 _CLOSED_CAPTIONS = "ATSC A53 Part 4 Closed Captions"
-# The packets read, about two seconds of a film: a stream with captions
-# carries them as broadcast sends them, with every picture, padding where
-# nothing is said, so its first frames tell.
+CLOSED_CAPTION_WINDOWS = (0.1, 0.3, 0.5, 0.7, 0.9)
 CLOSED_CAPTION_PACKETS = 48
 CLOSED_CAPTION_TIMEOUT = 120
 
 
-def _closed_captions(playlist: Path) -> bool:
-    """Whether the video rendition of the media playlist at `playlist`
-    carries closed captions in its own stream: whether ffprobe, decoding
-    its first CLOSED_CAPTION_PACKETS packets, gives a frame the A53
+def _caption_windows(playlist: Path) -> tuple[Path, list[Path]] | None:
+    """The init segment of the media playlist at `playlist` and the segments
+    the caption windows start, each once, in order: the segment that holds
+    each moment of CLOSED_CAPTION_WINDOWS of the rendition's duration. None
+    for a playlist that can't be read or names no init segment or no
+    segment."""
+    try:
+        init, segments = hls.media_segments(playlist)
+    except OSError:
+        return None
+    if init is None or not segments:
+        return None
+    total = sum(d for d, _ in segments)
+    starts: list[str] = []
+    for fraction in CLOSED_CAPTION_WINDOWS:
+        at, start = fraction * total, 0.0
+        uri = segments[-1][1]
+        for duration, name in segments:
+            if at < start + duration:
+                uri = name
+                break
+            start += duration
+        starts.append(uri)
+    return playlist.parent / init, [playlist.parent / u for u in dict.fromkeys(starts)]
+
+
+def _window_captions(init: Path, segment: Path) -> bool | None:
+    """Whether a window carries closed captions: whether ffprobe, decoding
+    the first CLOSED_CAPTION_PACKETS packets of `segment` read after `init`
+    (ffmpeg's concat protocol, nothing copied), gives a frame the A53
     captions of its SEI (or the stream closed_captions, which 7.1 then
-    says). False when none of them carries any — and when the rendition
-    can't be read in CLOSED_CAPTION_TIMEOUT seconds, logged: a package that
-    says nothing of captions has none, and the original that had some is
-    kept for them."""
+    says). None, logged, for a window that can't be read in
+    CLOSED_CAPTION_TIMEOUT seconds or decodes no frame: it says nothing."""
+    if any("|" in str(p) for p in (init, segment)):
+        log.warning("packager.closed_captions.unread", segment=str(segment),
+                    error="a path with '|', which the concat protocol can't take")
+        return None
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-read_intervals", f"%+#{CLOSED_CAPTION_PACKETS}", "-show_frames",
              "-show_entries", "frame_side_data=side_data_type:stream=closed_captions",
-             "-of", "json", str(playlist)],
+             "-of", "json", f"concat:{init}|{segment}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             stdin=subprocess.DEVNULL, timeout=CLOSED_CAPTION_TIMEOUT, check=True,
         ).stdout
         raw = json.loads(out or "{}")
     except (OSError, ValueError, subprocess.SubprocessError) as e:
-        log.warning("packager.closed_captions.unread", playlist=str(playlist), error=str(e)[:300])
-        return False
+        log.warning("packager.closed_captions.unread", segment=str(segment), error=str(e)[:300])
+        return None
+    frames = raw.get("frames") or []
+    if not frames:
+        log.warning("packager.closed_captions.unread", segment=str(segment),
+                    error="no frame decoded")
+        return None
     return any(sd.get("side_data_type") == _CLOSED_CAPTIONS
-               for f in raw.get("frames") or [] for sd in f.get("side_data_list") or []) \
+               for f in frames for sd in f.get("side_data_list") or []) \
         or any(s.get("closed_captions") == 1 for s in raw.get("streams") or [])
+
+
+def _closed_captions(playlist: Path) -> bool:
+    """Whether the video rendition of the media playlist at `playlist`
+    carries closed captions in its own stream: whether a window of it
+    (_caption_windows) shows them (_window_captions), read one after the
+    other until one does. False when none does — and where none could be
+    read, a window that can't be read saying nothing, logged: a package that
+    says nothing of captions has none, and the original that had some is
+    kept for them."""
+    windows = _caption_windows(playlist)
+    if windows is None:
+        log.warning("packager.closed_captions.unread", playlist=str(playlist),
+                    error="no init segment or no segment")
+        return False
+    init, segments = windows
+    return any(_window_captions(init, segment) for segment in segments)
 
 
 def _hdr10_metadata(inputs: PackageInputs, probe: _Probe, original: Path,
@@ -3915,8 +3967,8 @@ def _run_shaka_packager(
     its mdcv and clli boxes, which shaka leaves out (hdr10.py), and its
     manifest entry says so (`hdr10Metadata`), all of them or the run fails
     (_write_hdr10); every other init segment is shaka's as it wrote it.
-    A rung whose own stream carries closed captions, as its first segment
-    shows them, says so (`closedCaptions`, _closed_captions).
+    A rung whose own stream carries closed captions, as a window across its
+    segments shows them, says so (`closedCaptions`, _closed_captions).
 
     shaka-packager selects streams by absolute MP4 stream index when
     given a number, or by type ("video"/"audio"/"text") to pick the first
@@ -4000,8 +4052,8 @@ def _run_shaka_packager(
             # Its init segment carries the original's HDR10 static
             # metadata (mdcv, clli), as nothing else says.
             **({"hdr10Metadata": True} if v.rung.id in with_hdr10 else {}),
-            # Its own stream carries closed captions, as its first frames
-            # show them (_closed_captions).
+            # Its own stream carries closed captions, as a window across it
+            # shows them (_closed_captions).
             **({"closedCaptions": True}
                if _closed_captions(hls_dir / v.rung.id / "playlist.m3u8") else {}),
             "frameRate": rate,

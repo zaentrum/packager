@@ -100,6 +100,28 @@ def playlist_stats(path: Path) -> PlaylistStats:
     )
 
 
+def media_segments(path: Path) -> tuple[str | None, list[tuple[float, str]]]:
+    """A media playlist's init section (its EXT-X-MAP URI, None without
+    one) and its segments in order, (EXTINF duration, URI) each. Raises
+    OSError when the playlist can't be read."""
+    init: str | None = None
+    segs: list[tuple[float, str]] = []
+    dur: float | None = None
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if line.startswith("#EXT-X-MAP:"):
+            init = next(iter(_URI_ATTR.findall(line)), None)
+        elif line.startswith("#EXTINF:"):
+            try:
+                dur = float(line.split(":", 1)[1].split(",", 1)[0])
+            except ValueError:
+                dur = None
+        elif line and not line.startswith("#") and dur is not None:
+            segs.append((dur, line))
+            dur = None
+    return init, segs
+
+
 def _size(path: Path) -> int:
     try:
         return os.path.getsize(path)

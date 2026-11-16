@@ -16,7 +16,9 @@ copy, libx264 with -a53cc 1 and with -a53cc 0): every rendition whose own
 frames carry them says so, read from the rendition itself, the package's
 essence has them when its top rendition has, and deleting an original
 recorded with them costs nothing more. A rendition without them, and a
-film without them, says none."""
+film without them, says none. A film whose captions start late — an
+encoder may write them only where there is text — has none in its first
+frames, so a rendition is read in windows across it."""
 
 from __future__ import annotations
 
@@ -72,16 +74,19 @@ def _captioned(path: Path) -> tuple[int, int]:
         for x in f.get("side_data_list") or []))
 
 
-def _with_captions(raw: Path, out: Path) -> None:
+def _with_captions(raw: Path, out: Path, first: int = 0) -> None:
     """An H.264 elementary stream at `raw` again at `out`, an A53 cc_data
-    SEI (payload type 4) before each picture's slice."""
+    SEI (payload type 4) before the slice of each picture from the
+    `first`-th on."""
     sei = b"\x00\x00\x00\x01" + bytes([0x06, 0x04, len(A53)]) + A53 + b"\x80"
-    data, made, pos = raw.read_bytes(), bytearray(), 0
+    data, made, pos, picture = raw.read_bytes(), bytearray(), 0, 0
     for m in re.finditer(rb"\x00\x00\x01(.)", data, re.DOTALL):
         start = m.start() - 1 if m.start() and data[m.start() - 1] == 0 else m.start()
         if m.group(1)[0] & 0x1F in (1, 5):  # a slice: one per picture
-            made += data[pos:start] + sei
-            pos = start
+            if picture >= first:
+                made += data[pos:start] + sei
+                pos = start
+            picture += 1
     out.write_bytes(bytes(made + data[pos:]))
 
 
@@ -90,7 +95,9 @@ def films(tmp_path_factory) -> dict[str, Path]:
     """4 s 24 fps films with an English stereo track, each in its arrival
     folder: H264 (H.264, captions in every frame's SEI), HEVC (encoded from
     it by libx265 with -a53cc 1, so in every frame too) and PLAIN (HEVC,
-    none). Skips where this ffmpeg makes them otherwise."""
+    none); and LATE, 12 s of H.264 at 25 frames, a keyframe every 100, its
+    captions from its 100th picture on. Skips where this ffmpeg makes them
+    otherwise."""
     d = tmp_path_factory.mktemp("captions")
     out: dict[str, Path] = {}
     picture = ["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24:duration=4"]
@@ -111,8 +118,16 @@ def films(tmp_path_factory) -> dict[str, Path]:
     _ff("-i", str(out["H264"]), "-map", "0", *X265, "-a53cc", "1", "-c:a", "copy",
         str(path("HEVC")))
     _ff(*picture, *tone, "-map", "0:v", "-map", "1:a", *X265, *audio, str(path("PLAIN")))
+    late = d / "late.h264"
+    _ff("-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=12", *X264[:4],
+        "-x264-params", "slices=1:keyint=100:min-keyint=100:scenecut=0", "-f", "h264", str(late))
+    _with_captions(late, d / "late-captioned.h264", first=100)
+    _ff("-framerate", "25", "-i", str(d / "late-captioned.h264"), "-f", "lavfi", "-i",
+        "sine=frequency=440:sample_rate=48000:duration=12", "-map", "0:v", "-map", "1:a",
+        "-c:v", "copy", *audio, str(path("LATE")))
     made = {name: _captioned(p) for name, p in out.items()}
-    want = {"H264": (FRAMES, FRAMES), "HEVC": (FRAMES, FRAMES), "PLAIN": (FRAMES, 0)}
+    want = {"H264": (FRAMES, FRAMES), "HEVC": (FRAMES, FRAMES), "PLAIN": (FRAMES, 0),
+            "LATE": (300, 200)}
     if made != want:
         pytest.skip(f"this ffmpeg makes other films than these tests need: {made}")
     return out
@@ -282,7 +297,31 @@ def test_h264_as_a_copy_and_an_encode_says_its_captions(
     assert _says(manifest["renditions"]) == [("v0", "copy", None)]
 
 
-def test_the_captions_are_read_from_the_first_segment_as_the_init_has_no_frame(
+def test_captions_that_start_late_are_found_in_a_window_past_the_first_frames(
+    tmp_path: Path, films: dict[str, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Copied, its two segments cut at its keyframes (0-8 s, 8-12 s): the
+    # windows at 10 to 50 % read the first, from frame 0, those at 70 and
+    # 90 % the second, from frame 200, captioned.
+    stage, manifest = _manifest(tmp_path / "copy", films["LATE"])
+    playlist = stage / "hls" / "v0" / "playlist.m3u8"
+    assert _says(manifest["renditions"]) == [("v0", "copy", True)]
+    assert _captioned(playlist) == (300, 200)
+    # Its first frames alone, as it was read, carry none.
+    monkeypatch.setattr(pk, "CLOSED_CAPTION_WINDOWS", (0.0,))
+    assert pk._closed_captions(playlist) is False
+    monkeypatch.undo()
+    # Encoded by libx265 with -a53cc 1, which writes them only for the
+    # frames that have them, on the library v2 path.
+    _lib, vdir, package, source = _v2(tmp_path / "encode", films["LATE"],
+                                      [("libx265", [*X265, "-a53cc", "1"])])
+    assert _says(package["renditions"]) == [("v0", "libx265", True)]
+    assert _captioned(vdir / "hls" / "v0" / "playlist.m3u8") == (300, 200)
+    assert package["essence"]["closedCaptions"] is True
+    assert rec.deletion_gate([_held(source)], package["essence"]) == []
+
+
+def test_the_captions_are_read_from_the_segments_as_the_init_has_no_frame(
     tmp_path: Path, films: dict[str, Path],
 ) -> None:
     stage, _manifest_ = _manifest(tmp_path, films["HEVC"])
