@@ -27,9 +27,11 @@ from packager import library, records
 from packager import libv2_records as rec
 from packager.katalog import ClaimedItem
 
-# zaentrum/schemas 392d01d3b93c7446952e36a7c71dc1987a4685aa, tools/libv2_records.py
-SHA256 = "a7ad958d94d0eb6182b7428cd848170099f6fc4b8d24ea806d67fc2ab7cb92f9"
-LIBV2_RECORDS = 10
+# zaentrum/schemas 392d01d3b93c7446952e36a7c71dc1987a4685aa, tools/libv2_records.py, with record
+# logic 11 (a video rendition's closedCaptions), which the schemas repository takes with it; pin its
+# commit here once it has
+SHA256 = "1026860efbb0780ba19612cb172300962665c429dc2365ccd9f81b8de2826abe"
+LIBV2_RECORDS = 11
 
 GOLDEN = Path(__file__).parent / "fixtures" / "libv2_records"
 ITEM = "f0f0f0f0-1111-4222-8333-444444444444"

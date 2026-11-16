@@ -12,7 +12,9 @@ Design rules:
   hevc/h264 (the transcoder produced or chose them); anything else fails
   the package job. The init segment of every HEVC rung in PQ gets the
   original's HDR10 static metadata, which shaka-packager leaves out
-  (hdr10.py).
+  (hdr10.py). A rendition whose own stream carries closed captions
+  (CEA-608/708 in its SEI, which shaka-packager keeps) says so in the
+  manifest (`closedCaptions`), as its first frames show them.
 * N video renditions -> one master with one variant per rendition and
   audio group, plus one I-frame playlist per rendition. The master is
   assembled by `packager.hls` from shaka's media playlists.
@@ -3805,6 +3807,50 @@ def _carries_hdr10(stream: dict[str, Any]) -> bool:
     return stream.get("codec_name") == "hevc" and _video_range(stream) == "PQ"
 
 
+# Closed captions (EIA/CEA-608/708) ride in a video stream itself: an A53
+# cc_data SEI (ITU-T T.35, "GA94") with each picture, which a copy of the
+# stream keeps and an encode carries when its encoder writes it (the
+# transcoder's -a53cc 1). Nothing in a container says so: ffprobe 7.1 gives
+# a stream's closed_captions only once it has decoded a frame of it, and 9.0
+# gives none, so the decoder's own reading is what tells — the side data it
+# exports with each frame whose SEI carries them. An fMP4 rendition's init
+# segment has no frame: the first segment's are read, through the media
+# playlist as a player reads them, so much and no more.
+_CLOSED_CAPTIONS = "ATSC A53 Part 4 Closed Captions"
+# The packets read, about two seconds of a film: a stream with captions
+# carries them as broadcast sends them, with every picture, padding where
+# nothing is said, so its first frames tell.
+CLOSED_CAPTION_PACKETS = 48
+CLOSED_CAPTION_TIMEOUT = 120
+
+
+def _closed_captions(playlist: Path) -> bool:
+    """Whether the video rendition of the media playlist at `playlist`
+    carries closed captions in its own stream: whether ffprobe, decoding
+    its first CLOSED_CAPTION_PACKETS packets, gives a frame the A53
+    captions of its SEI (or the stream closed_captions, which 7.1 then
+    says). False when none of them carries any — and when the rendition
+    can't be read in CLOSED_CAPTION_TIMEOUT seconds, logged: a package that
+    says nothing of captions has none, and the original that had some is
+    kept for them."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-read_intervals", f"%+#{CLOSED_CAPTION_PACKETS}", "-show_frames",
+             "-show_entries", "frame_side_data=side_data_type:stream=closed_captions",
+             "-of", "json", str(playlist)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            stdin=subprocess.DEVNULL, timeout=CLOSED_CAPTION_TIMEOUT, check=True,
+        ).stdout
+        raw = json.loads(out or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        log.warning("packager.closed_captions.unread", playlist=str(playlist), error=str(e)[:300])
+        return False
+    return any(sd.get("side_data_type") == _CLOSED_CAPTIONS
+               for f in raw.get("frames") or [] for sd in f.get("side_data_list") or []) \
+        or any(s.get("closed_captions") == 1 for s in raw.get("streams") or [])
+
+
 def _hdr10_metadata(inputs: PackageInputs, probe: _Probe, original: Path,
                     videos: list[_StagedVideo]) -> hdr10.StaticMetadata | None:
     """The HDR10 static metadata the PQ rungs' init segments get (hdr10.py):
@@ -3869,6 +3915,8 @@ def _run_shaka_packager(
     its mdcv and clli boxes, which shaka leaves out (hdr10.py), and its
     manifest entry says so (`hdr10Metadata`), all of them or the run fails
     (_write_hdr10); every other init segment is shaka's as it wrote it.
+    A rung whose own stream carries closed captions, as its first segment
+    shows them, says so (`closedCaptions`, _closed_captions).
 
     shaka-packager selects streams by absolute MP4 stream index when
     given a number, or by type ("video"/"audio"/"text") to pick the first
@@ -3952,6 +4000,10 @@ def _run_shaka_packager(
             # Its init segment carries the original's HDR10 static
             # metadata (mdcv, clli), as nothing else says.
             **({"hdr10Metadata": True} if v.rung.id in with_hdr10 else {}),
+            # Its own stream carries closed captions, as its first frames
+            # show them (_closed_captions).
+            **({"closedCaptions": True}
+               if _closed_captions(hls_dir / v.rung.id / "playlist.m3u8") else {}),
             "frameRate": rate,
             "segments": stats.segments,
             "targetDuration": stats.target_duration or segment_seconds,

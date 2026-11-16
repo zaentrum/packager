@@ -97,8 +97,12 @@ import copy, datetime, hashlib, json, os, re, shutil, subprocess, threading, uui
 # opentype, truetype, sfnt), by a font's file name (.ttf .otf .ttc .woff .woff2), or, where neither says
 # so and no picture's MIME type says otherwise, by its first bytes — a font's signature (attachment_role;
 # attachment_heads reads them, and the stream then says it: signature) — in a source and as a package
-# carries it alike, so no font goes uncounted with its original.
-LIBV2_RECORDS = 10
+# carries it alike, so no font goes uncounted with its original. 11: a video rendition whose manifest
+# entry says its own stream carries closed captions (closedCaptions: CEA-608/708 in its SEI, as the
+# packager read them from its first frames) says so in its record, and the package's essence has closed
+# captions when its top rendition says so (package_essence), where it had none whatever it carried. A
+# manifest that says nothing of them gives the record it gave.
+LIBV2_RECORDS = 11
 
 NS = uuid.uuid5(uuid.NAMESPACE_URL, "https://zaentrum.github.io/schemas/library")
 PACKAGE_DIRS = ("hls", "subs", "trickplay", "trailers")
@@ -770,6 +774,13 @@ def package_essence(man, source=None, streams=None):
     encoded or not. One in PQ that says nothing of it — one whose init segment could not take it — and
     anything else re-encoded is taken to have lost it.
 
+    A package has closed captions when its top video rendition says its own stream carries them
+    (closedCaptions): CEA-608/708 captions in the stream's SEI, as the packager read them from the
+    rendition's first frames — a copy of the original's stream keeps the original's, an encode those
+    its encoder wrote. The top rendition is the package's full picture, as a source's essence has the
+    captions of its first video stream: what a lower rung lacks, the top one still carries. A top
+    rendition that says nothing of them has none, and neither has the package.
+
     A package has styled subtitles when a subtitle keeps its styled original (styled), and fonts when
     it lists a font file (fonts). Where the source's streams are given — a source record's streams —
     it has them only when it carries them for every stream that has them: each styled subtitle stream
@@ -808,7 +819,7 @@ def package_essence(man, source=None, streams=None):
         "fonts": carried(fonts, lambda x: x.get("type") == "attachment" and x.get("role") == "font"),
         "chapters": False,
         "commentaryTracks": sum(1 for x in auds if x.get("purpose") == "commentary"),
-        **track_essence(auds, subs, False),
+        **track_essence(auds, subs, v0.get("closedCaptions") is True),
     }
 
 
@@ -1197,6 +1208,8 @@ def video_rendition(v):
             out[key] = text(v[key])
     if v.get("hdr10Metadata") is True:
         out["hdr10Metadata"] = True
+    if v.get("closedCaptions") is True:
+        out["closedCaptions"] = True
     return out
 
 
@@ -1386,7 +1399,9 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
     audio rendition likewise (audio_purpose): a commentary (commentary), for the visually impaired
     (visualImpaired), then its title. A video rendition whose init segment carries the original's
     HDR10 static metadata (hdr10Metadata) says so, and the package's essence has it when the source's
-    has and every rendition in PQ, the top one among them, says so (package_essence). A subtitle that
+    has and every rendition in PQ, the top one among them, says so (package_essence). A video rendition
+    whose own stream carries closed captions (closedCaptions) says so, and the package's essence has
+    them when its top rendition says so (package_essence). A subtitle that
     keeps its styled original names it (styled_original), and the font files the manifest lists are the
     record's fonts (font_file), listed only when there are any — each only when it is one of the files
     listed, the package's own, or it is left out with a note; the package's essence has styled

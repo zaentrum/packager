@@ -168,13 +168,16 @@ def _catalogs_part(item_dir: Path, item_type: str = "movie", title: str = "Clip"
         "titles": {"primary": title}, "images": []}))
 
 
-def _validator(extras: bool, hdr10: bool = False) -> list[str] | None:
+def _validator(extras: bool, hdr10: bool = False,
+               closed_captions: bool = False) -> list[str] | None:
     """The validator and the Python to run it with, when there is a schemas
     checkout whose package schema has the platform's additive fields (S1)
     — and, for a tree with an extra, whose extra schema has packagedFrom
     (S2); for one whose renditions say their init segments carry HDR10
-    static metadata, whose video rendition has hdr10Metadata (S3) — and a
-    Python with jsonschema and referencing."""
+    static metadata, whose video rendition has hdr10Metadata (S3); for one
+    whose renditions say their streams carry closed captions, whose video
+    rendition has closedCaptions (S4) — and a Python with jsonschema and
+    referencing."""
     root = Path(os.environ.get("ZAENTRUM_SCHEMAS")
                 or Path(__file__).resolve().parents[2] / "schemas")
     tool = root / "tools" / "validate-library-v2.py"
@@ -189,7 +192,8 @@ def _validator(extras: bool, hdr10: bool = False) -> list[str] | None:
     video = ((package.get("$defs") or {}).get("videoRendition") or {}).get("properties") or {}
     if "audioSurround" not in package["properties"]["renditions"]["properties"] \
             or (extras and "packagedFrom" not in extra["properties"]) \
-            or (hdr10 and "hdr10Metadata" not in video):
+            or (hdr10 and "hdr10Metadata" not in video) \
+            or (closed_captions and "closedCaptions" not in video):
         return None
     python = os.environ.get("LIBRARY_V2_PYTHON") or sys.executable
     ok = subprocess.run([python, "-c", "import jsonschema, referencing"], capture_output=True)
@@ -198,8 +202,9 @@ def _validator(extras: bool, hdr10: bool = False) -> list[str] | None:
     return [python, str(tool), "--schemas", str(schemas)]
 
 
-def _validate(lib: Path, *, extras: bool = False, hdr10: bool = False) -> None:
-    cmd = _validator(extras, hdr10)
+def _validate(lib: Path, *, extras: bool = False, hdr10: bool = False,
+              closed_captions: bool = False) -> None:
+    cmd = _validator(extras, hdr10, closed_captions)
     if cmd is None:
         pytest.skip("no schemas checkout with the platform's fields, or no Python with "
                     "jsonschema, to validate with")

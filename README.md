@@ -459,6 +459,23 @@ the metadata while one of them lacks it. The init segment of an SDR rung,
 an HLG one and every rung of an original without the metadata is
 shaka-packager's, byte for byte.
 
+**Closed captions.** Closed captions (EIA/CEA-608/708) are in the video
+stream itself: an A53 `cc_data` SEI with each picture. A copied rung keeps
+the original's, an encoded one carries those its encoder wrote (the
+transcoder names `-a53cc 1` for every encode), and shaka-packager keeps
+the SEI in every segment. No container or init segment says so, and
+ffprobe's `closed_captions` is no help on its own (7.1 sets it only for a
+stream it decoded a frame of, 9.0 has no such field), so after
+shaka-packager the packager reads each rung through its media playlist,
+decodes the first 48 packets of its first segment and looks for the A53
+captions FFmpeg's decoder exports with a frame (`_closed_captions`). A rung
+whose frames carry them is `closedCaptions: true` in the manifest and in a
+v2 record's `package.json` (record logic 11), and the package's essence has
+closed captions when its top rung does, so the deletion gate no longer
+holds an original for captions its package carries. A rung without them,
+or one that can't be read in time (logged), says nothing, and the package
+has none.
+
 **Compatibility.** Rendition dirs stay `vN` / `aN`, so the existing
 playback routes serve every rung and both audio groups. `renditions.video[0]`
 is still the top rung. Before a ladder is enabled, the playback service
