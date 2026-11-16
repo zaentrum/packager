@@ -252,8 +252,9 @@ SCAN = {"found": "fields", "judgedBy": "pictures", "fieldOrder": "tb",
                  "otherBlocks": 200, "blindBlocks": 0,
                  "windows": {"film": 0, "video": 5, "whole": 0, "unsure": 0, "detail": 0}},
         "verified": {"ok": True, "why": None, "sampleDone": "deinterlaced-field",
-                     "frames": 1500, "chunksInFields": 8, "otherOrder": 0, "offCadence": 300,
-                     "repeats": 0, "matchedUnsure": 8, "combedOut": 0, "combedOutRun": 0}}
+                     "sampleFound": "fields", "frames": 1500, "chunksInFields": 8,
+                     "otherOrder": 0, "offCadence": 300, "repeats": 0, "matchedUnsure": 8,
+                     "combedOut": 0, "combedOutRun": 0, "droppedDistinct": 0}}
 
 
 def test_the_contracts_record_of_fields_is_read_as_it_is(tmp_path: Path) -> None:
@@ -267,12 +268,21 @@ def test_the_contracts_record_of_fields_is_read_as_it_is(tmp_path: Path) -> None
 
 @pytest.mark.parametrize("done", ["inverse-telecine", "progressive", "deinterlaced-field",
                                   "deinterlaced-frame", "field-matched", "fields-kept",
-                                  "unexamined", "unverified", "none"])
+                                  "fields-left", "unexamined", "none"])
 def test_each_word_of_what_was_done_is_kept_as_it_is(done: str) -> None:
     found = {"inverse-telecine": "telecine", "progressive": "progressive",
-             "field-matched": "mixed", "unexamined": "unknown", "unverified": "progressive",
+             "field-matched": "mixed", "unexamined": "unknown", "fields-left": "mixed",
              "fields-kept": "field-pictures", "none": "progressive"}.get(done, "fields")
     scan = {**SCAN, "found": found, "done": done}
+    assert scan_of({"scan": scan}) == scan
+
+
+def test_a_word_the_read_through_did_not_bear_out_is_kept_beside_its_verdict() -> None:
+    # The title made again: what was done, what the sample said and that the
+    # whole title said otherwise, as the transcoder wrote them.
+    scan = {**SCAN, "found": "mixed", "done": "field-matched",
+            "verified": {**SCAN["verified"], "ok": False, "why": "fields in the title",
+                         "sampleDone": "progressive", "sampleFound": "progressive"}}
     assert scan_of({"scan": scan}) == scan
 
 
@@ -280,33 +290,44 @@ def test_each_word_of_what_was_done_is_kept_as_it_is(done: str) -> None:
     {},                                                    # an older transcoder
     {"scan": None},
     {"scan": "deinterlaced"},
-    {"scan": {**SCAN, "done": "woven"}},
-    {"scan": {**SCAN, "done": "deinterlaced"}},           # the rate is part of the word
-    {"scan": {**SCAN, "found": "maybe"}},
 ])
-def test_a_record_of_fields_it_cannot_read_is_none(contract: dict) -> None:
+def test_no_record_of_fields_is_none(contract: dict) -> None:
     assert scan_of(contract) is None
+
+
+@pytest.mark.parametrize("scan", [
+    {**SCAN, "done": "woven"},
+    {**SCAN, "done": "deinterlaced"},                      # an older word, without its rate
+    {**SCAN, "done": "unverified"},
+    {**SCAN, "found": "maybe"},
+])
+def test_a_record_of_fields_in_words_it_does_not_know_is_kept_and_logged(scan: dict) -> None:
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        assert scan_of({"scan": scan}) == scan
+    assert [e["event"] for e in logs] == ["packager.contract.scan_words_unknown"]
 
 
 def test_the_word_lists_are_the_transcoders() -> None:
     # The transcoder writes these words (its decision.SCAN_DONE,
     # decision.SCAN_RELEASES, and decision.FIELDS_FOUND as scan.found writes
     # them, "_" as "-"): a word added there is added here, or its packages'
-    # scans are refused.
+    # scans are logged as in words it does not know.
     from packager.renditions import SCAN_DONE, SCAN_FOUND, SCAN_RELEASES
 
     assert SCAN_DONE == ("inverse-telecine", "progressive", "deinterlaced-field",
-                         "deinterlaced-frame", "field-matched", "fields-kept", "unexamined",
-                         "unverified", "none")
+                         "deinterlaced-frame", "field-matched", "fields-kept", "fields-left",
+                         "unexamined", "none")
     assert SCAN_RELEASES == ("inverse-telecine", "progressive", "deinterlaced-field")
     assert SCAN_FOUND == ("fields", "film", "telecine", "mixed", "progressive", "unknown",
                           "field-pictures")
 
 
-def test_a_refused_record_of_fields_is_logged() -> None:
+def test_a_record_of_fields_that_is_no_object_is_refused_and_logged() -> None:
     from structlog.testing import capture_logs
 
     with capture_logs() as logs:
-        assert scan_of({"scan": {**SCAN, "done": "woven"}}) is None
+        assert scan_of({"scan": "deinterlaced"}) is None
         assert scan_of({}) is None
-    assert [(e["event"], e["done"]) for e in logs] == [("packager.contract.scan_refused", "woven")]
+    assert [(e["event"], e["kind"]) for e in logs] == [("packager.contract.scan_refused", "str")]

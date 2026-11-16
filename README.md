@@ -63,20 +63,21 @@ The handoff is deleted after a successful package.
 
 A contract's `scan` (the transcoder README, "Fields") says what the video
 is as far as fields go — video, film, a telecined film, film and video
-mixed, progressive, unknown or HEVC field pictures — and, in `done`, what was done: `inverse-telecine`,
-`progressive` (as found), `deinterlaced-field`, `deinterlaced-frame`,
-`field-matched`, `fields-kept`, `unexamined`, `unverified` or `none`, with
-the package's `frameRate`. The deletion gate
-reads `done`: an original in fields goes only where it says
-`inverse-telecine`, `progressive` or `deinterlaced-field`. The manifest
-takes the block as it is, at its top level (`scan`), when its `found` and
-`done` are words the transcoder writes; on the v2 layout that is the
-manifest the package's record is made from. A block it refuses is logged
-(`packager.contract.scan_refused`), and the package's record then carries no
-scan, which keeps an original in fields. The record logic (`libv2_records.py`, the
-schemas repository's, vendored byte for byte) does not keep it yet: until
-it does, a package's essence says `interlaced: false` whatever it was made
-from, and the deletion gate leaves interlacing out.
+mixed, progressive, unknown or HEVC field pictures — and, in `done`, what was
+done: `inverse-telecine`, `progressive` (as found), `deinterlaced-field`,
+`deinterlaced-frame`, `field-matched`, `fields-kept`, `fields-left`,
+`unexamined` or `none`, with the package's `frameRate` and, in `verified`,
+what the transcoder's read-through of the whole title said (its `ok` false
+beside a `done` it did not bear out, the title then made again). No word
+lets an original go (ADR-0015): the deletion gate keeps an original marked
+as fields or found to hold them. The manifest takes the block as it is, at
+its top level (`scan`), and never drops it: a `found` or `done` it does not
+know is logged (`packager.contract.scan_words_unknown`) and kept; on the v2
+layout that is the manifest the package's record is made from. A `scan`
+that is not an object is logged (`packager.contract.scan_refused`) and left
+out. The record logic (`libv2_records.py`, the schemas repository's, vendored
+byte for byte) does not keep it yet: until it does, a package's essence says
+`interlaced: false` whatever it was made from.
 
 Each video rendition in the manifest (and in a library v2 `package.json`)
 records what made its stream as `encoder`: `"copy"` for the original's

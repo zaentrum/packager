@@ -125,16 +125,18 @@ def _from_contract(path: Path, inbox: Path, original: Path) -> PackageInputs:
 
 
 # What the transcoder's record of fields says was done (its README,
-# "Fields"), the one field of it the deletion gate reads: a film at its own
-# frames, whole frames as found, video deinterlaced at the field rate (one
-# frame a field) or at the frame rate (every second moment dropped), film and
-# video field-matched at the source's rate, HEVC field pictures kept as they
-# are, an examination that told nothing, a title whose read-through did not
-# bear the sample's word out, or nothing to do. An original in fields
-# goes only where its package says one of SCAN_RELEASES. The values of
-# `scan.done` a manifest takes the block with.
+# "Fields"): a film at its own frames, whole frames as found, video
+# deinterlaced at the field rate (one frame a field) or at the frame rate
+# (every second moment dropped), film and video field-matched at the
+# source's rate, HEVC field pictures kept as they are, fields too few to make
+# a source over left as they are, an examination that told nothing, or
+# nothing to do. No word lets an original go (ADR-0015): the deletion gate
+# keeps an original marked as fields or found to hold them (`scan.found`
+# anything but "progressive"). SCAN_RELEASES are the words that say the
+# package lost nothing to its fields, each borne out by the transcoder's
+# read-through of the whole title (`scan.verified`).
 SCAN_DONE = ("inverse-telecine", "progressive", "deinterlaced-field", "deinterlaced-frame",
-             "field-matched", "fields-kept", "unexamined", "unverified", "none")
+             "field-matched", "fields-kept", "fields-left", "unexamined", "none")
 SCAN_RELEASES = ("inverse-telecine", "progressive", "deinterlaced-field")
 SCAN_FOUND = ("fields", "film", "telecine", "mixed", "progressive", "unknown", "field-pictures")
 
@@ -143,21 +145,22 @@ def scan_of(contract: dict[str, Any]) -> dict[str, Any] | None:
     """renditions.json's `scan`, as the transcoder wrote it, for the package's
     record: what the package's video is as far as fields go (`found`,
     SCAN_FOUND: video in fields, a film, a telecined film, film and video
-    mixed, whole frames, not told, HEVC field pictures) and what was done
-    (`done`, SCAN_DONE), with the package's frame rate. None when the
-    contract has none (an older transcoder), or one whose `found` or `done`
-    is not a word it writes: logged (packager.contract.scan_refused), and the
-    package's record then says nothing that lets an original in fields go."""
+    mixed, whole frames, not told, HEVC field pictures), what was done
+    (`done`, SCAN_DONE), the package's frame rate, and what the read-through
+    of the whole title said (`verified`: its `ok` beside a `done` it did not
+    bear out). Taken as it is, never dropped: a `found` or `done` that is not
+    a word the transcoder writes is logged (packager.contract.scan_words_unknown)
+    and kept. None when the contract has none (an older transcoder), or one
+    that is not an object (logged, packager.contract.scan_refused)."""
     scan = contract.get("scan")
     if scan is None:
         return None
-    if (not isinstance(scan, dict) or scan.get("done") not in SCAN_DONE
-            or scan.get("found") not in SCAN_FOUND):
-        log.warning("packager.contract.scan_refused",
-                    done=scan.get("done") if isinstance(scan, dict) else None,
-                    found=scan.get("found") if isinstance(scan, dict) else None,
-                    kind=type(scan).__name__)
+    if not isinstance(scan, dict):
+        log.warning("packager.contract.scan_refused", kind=type(scan).__name__)
         return None
+    if scan.get("done") not in SCAN_DONE or scan.get("found") not in SCAN_FOUND:
+        log.warning("packager.contract.scan_words_unknown", done=scan.get("done"),
+                    found=scan.get("found"))
     return dict(scan)
 
 
