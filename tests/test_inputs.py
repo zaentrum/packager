@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from packager import worker
-from packager.renditions import ContractError, resolve_inputs
+from packager.renditions import ContractError, resolve_inputs, scan_of
 
 
 def _contract(inbox: Path, video: list[dict], **extra: object) -> None:
@@ -240,3 +240,30 @@ def test_source_block_is_empty_when_nothing_is_known(
     probes = _probes(monkeypatch, PROBED)
     assert worker._source_block(resolve_inputs(tmp_path / "inbox", gone), gone) == {}
     assert probes == []
+
+
+SCAN = {"found": "fields", "judgedBy": "pictures", "fieldOrder": "tb", "done": "deinterlaced",
+        "rate": "field", "order": "tff", "orderBy": "mark", "frameRate": "50/1",
+        "filter": "bwdif=mode=send_field:parity=tff:deint=all",
+        "idet": {"frames": 1000, "tff": 990, "bff": 0, "progressive": 0, "undetermined": 10,
+                 "repeatedTop": 0, "repeatedBottom": 0, "cadence": 0.0, "coverage": 0.0}}
+
+
+def test_the_contracts_record_of_fields_is_read_as_it_is(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"x")
+    _contract(inbox, [{"id": "v0", "file": None, "mode": "copy"}], scan=SCAN)
+    inputs = resolve_inputs(inbox, str(original))
+    assert scan_of(inputs.contract) == SCAN
+
+
+@pytest.mark.parametrize("contract", [
+    {},                                                    # an older transcoder
+    {"scan": None},
+    {"scan": "deinterlaced"},
+    {"scan": {**SCAN, "done": "woven"}},
+    {"scan": {**SCAN, "found": "maybe"}},
+])
+def test_a_record_of_fields_it_cannot_read_is_none(contract: dict) -> None:
+    assert scan_of(contract) is None

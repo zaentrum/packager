@@ -80,7 +80,7 @@ import structlog
 from . import hdr10, hls, regions
 from . import libv2_records as rec
 from .fonts import font_format, font_names
-from .renditions import PackageInputs, VideoInput
+from .renditions import PackageInputs, VideoInput, scan_of
 
 log = structlog.get_logger("packager")
 
@@ -844,6 +844,11 @@ def build_package(
         # The fonts a styled subtitle is drawn with, where the original
         # carried any; a client that shows the WebVTT copies needs none.
         **({"fonts": font_meta} if font_meta else {}),
+        # What the video is as far as fields go, as the transcoder's
+        # contract says it (deinterlaced and at which rate, inverse
+        # telecine, progressive as found), where it says it: the package
+        # keeps the original's fields only as they were made progressive.
+        **({"scan": scan} if (scan := scan_of(inputs.contract)) else {}),
         "hls": {
             "master": "hls/master.m3u8",
             "segmentSeconds": segment_seconds,

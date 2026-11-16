@@ -124,6 +124,27 @@ def _from_contract(path: Path, inbox: Path, original: Path) -> PackageInputs:
     )
 
 
+# What the transcoder's record of fields says was done (its README,
+# "Fields"): the values of `scan.done` a manifest takes it with.
+SCAN_DONE = ("deinterlaced", "inverseTelecine", "progressiveAsFound", "none")
+
+
+def scan_of(contract: dict[str, Any]) -> dict[str, Any] | None:
+    """renditions.json's `scan`, as the transcoder wrote it: what the
+    package's video is as far as fields go (found in fields, a telecined
+    film, or progressive, by its pictures or its mark) and what was done
+    (deinterlaced and at which rate, inverse telecine, progressive as
+    found), for the package's record. None when the contract has none (an
+    older transcoder) or one whose `found` or `done` is not a word it
+    writes."""
+    scan = contract.get("scan")
+    if not isinstance(scan, dict) or scan.get("done") not in SCAN_DONE:
+        return None
+    if scan.get("found") not in ("fields", "telecine", "progressive"):
+        return None
+    return dict(scan)
+
+
 def _encoder_of(rung: dict[str, Any]) -> str | None:
     """What made a contract rung's stream: its `encoder` where the contract
     names one; else "copy" for a rung with `"file": null`, which is the

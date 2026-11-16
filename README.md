@@ -61,6 +61,17 @@ the transcoder README, "Rendition contract"):
 
 The handoff is deleted after a successful package.
 
+A contract's `scan` (the transcoder README, "Fields") says what the video
+is as far as fields go: found in fields, a telecined film or progressive,
+by its pictures or its mark, and what was done — deinterlaced and at which
+rate, brought back to the film's frames, or left as found. The manifest
+takes it as it is, at its top level (`scan`), when its `found` and `done`
+are words the transcoder writes; on the v2 layout that is the manifest the
+package's record is made from. The record logic (`libv2_records.py`, the
+schemas repository's, vendored byte for byte) does not keep it yet: until
+it does, a package's essence says `interlaced: false` whatever it was made
+from, and the deletion gate leaves interlacing out.
+
 Each video rendition in the manifest (and in a library v2 `package.json`)
 records what made its stream as `encoder`: `"copy"` for the original's
 own stream, played as it is (a rung with `"file": null`, or no handoff at
