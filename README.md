@@ -62,10 +62,11 @@ the transcoder README, "Rendition contract"):
 The handoff is deleted after a successful package.
 
 A contract's `scan` (the transcoder README, "Fields") says what the video
-is as far as fields go — found in fields, a telecined film, progressive or
-HEVC field pictures — and, in `done`, what was done: `inverse-telecine`,
+is as far as fields go — video, film, a telecined film, film and video
+mixed, progressive, unknown or HEVC field pictures — and, in `done`, what was done: `inverse-telecine`,
 `progressive` (as found), `deinterlaced-field`, `deinterlaced-frame`,
-`fields-kept` or `none`, with the package's `frameRate`. The deletion gate
+`field-matched`, `fields-kept`, `unexamined` or `none`, with the package's
+`frameRate`. The deletion gate
 reads `done`: an original in fields goes only where it says
 `inverse-telecine`, `progressive` or `deinterlaced-field`. The manifest
 takes the block as it is, at its top level (`scan`), when its `found` and

@@ -125,16 +125,17 @@ def _from_contract(path: Path, inbox: Path, original: Path) -> PackageInputs:
 
 
 # What the transcoder's record of fields says was done (its README,
-# "Fields"), the one field of it the deletion gate reads: a telecined film at
-# its own frames, whole frames as found, deinterlaced at the field rate (one
-# frame a field) or at the frame rate (every second moment dropped), HEVC
-# field pictures kept as they are, or nothing to do. An original in fields
+# "Fields"), the one field of it the deletion gate reads: a film at its own
+# frames, whole frames as found, video deinterlaced at the field rate (one
+# frame a field) or at the frame rate (every second moment dropped), film and
+# video field-matched at the source's rate, HEVC field pictures kept as they
+# are, an examination that told nothing, or nothing to do. An original in fields
 # goes only where its package says one of SCAN_RELEASES. The values of
 # `scan.done` a manifest takes the block with.
 SCAN_DONE = ("inverse-telecine", "progressive", "deinterlaced-field", "deinterlaced-frame",
-             "fields-kept", "none")
+             "field-matched", "fields-kept", "unexamined", "none")
 SCAN_RELEASES = ("inverse-telecine", "progressive", "deinterlaced-field")
-SCAN_FOUND = ("fields", "telecine", "progressive", "field-pictures")
+SCAN_FOUND = ("fields", "film", "telecine", "mixed", "progressive", "unknown", "field-pictures")
 
 
 def scan_of(contract: dict[str, Any]) -> dict[str, Any] | None:

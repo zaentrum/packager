@@ -259,9 +259,11 @@ def test_the_contracts_record_of_fields_is_read_as_it_is(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize("done", ["inverse-telecine", "progressive", "deinterlaced-field",
-                                  "deinterlaced-frame", "fields-kept", "none"])
+                                  "deinterlaced-frame", "field-matched", "fields-kept",
+                                  "unexamined", "none"])
 def test_each_word_of_what_was_done_is_kept_as_it_is(done: str) -> None:
     found = {"inverse-telecine": "telecine", "progressive": "progressive",
+             "field-matched": "mixed", "unexamined": "unknown",
              "fields-kept": "field-pictures", "none": "progressive"}.get(done, "fields")
     scan = {**SCAN, "found": found, "done": done}
     assert scan_of({"scan": scan}) == scan
