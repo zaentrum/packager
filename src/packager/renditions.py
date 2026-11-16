@@ -129,26 +129,34 @@ def _from_contract(path: Path, inbox: Path, original: Path) -> PackageInputs:
 # frames, whole frames as found, video deinterlaced at the field rate (one
 # frame a field) or at the frame rate (every second moment dropped), film and
 # video field-matched at the source's rate, HEVC field pictures kept as they
-# are, an examination that told nothing, or nothing to do. An original in fields
+# are, an examination that told nothing, a title whose read-through did not
+# bear the sample's word out, or nothing to do. An original in fields
 # goes only where its package says one of SCAN_RELEASES. The values of
 # `scan.done` a manifest takes the block with.
 SCAN_DONE = ("inverse-telecine", "progressive", "deinterlaced-field", "deinterlaced-frame",
-             "field-matched", "fields-kept", "unexamined", "none")
+             "field-matched", "fields-kept", "unexamined", "unverified", "none")
 SCAN_RELEASES = ("inverse-telecine", "progressive", "deinterlaced-field")
 SCAN_FOUND = ("fields", "film", "telecine", "mixed", "progressive", "unknown", "field-pictures")
 
 
 def scan_of(contract: dict[str, Any]) -> dict[str, Any] | None:
     """renditions.json's `scan`, as the transcoder wrote it, for the package's
-    record: what the package's video is as far as fields go (`found`: in
-    fields, a telecined film, progressive, HEVC field pictures) and what was
-    done (`done`, SCAN_DONE), with the package's frame rate. None when the
-    contract has none (an older transcoder) or one whose `found` or `done`
-    is not a word it writes."""
+    record: what the package's video is as far as fields go (`found`,
+    SCAN_FOUND: video in fields, a film, a telecined film, film and video
+    mixed, whole frames, not told, HEVC field pictures) and what was done
+    (`done`, SCAN_DONE), with the package's frame rate. None when the
+    contract has none (an older transcoder), or one whose `found` or `done`
+    is not a word it writes: logged (packager.contract.scan_refused), and the
+    package's record then says nothing that lets an original in fields go."""
     scan = contract.get("scan")
-    if not isinstance(scan, dict) or scan.get("done") not in SCAN_DONE:
+    if scan is None:
         return None
-    if scan.get("found") not in SCAN_FOUND:
+    if (not isinstance(scan, dict) or scan.get("done") not in SCAN_DONE
+            or scan.get("found") not in SCAN_FOUND):
+        log.warning("packager.contract.scan_refused",
+                    done=scan.get("done") if isinstance(scan, dict) else None,
+                    found=scan.get("found") if isinstance(scan, dict) else None,
+                    kind=type(scan).__name__)
         return None
     return dict(scan)
 

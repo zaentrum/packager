@@ -65,13 +65,15 @@ A contract's `scan` (the transcoder README, "Fields") says what the video
 is as far as fields go — video, film, a telecined film, film and video
 mixed, progressive, unknown or HEVC field pictures — and, in `done`, what was done: `inverse-telecine`,
 `progressive` (as found), `deinterlaced-field`, `deinterlaced-frame`,
-`field-matched`, `fields-kept`, `unexamined` or `none`, with the package's
-`frameRate`. The deletion gate
+`field-matched`, `fields-kept`, `unexamined`, `unverified` or `none`, with
+the package's `frameRate`. The deletion gate
 reads `done`: an original in fields goes only where it says
 `inverse-telecine`, `progressive` or `deinterlaced-field`. The manifest
 takes the block as it is, at its top level (`scan`), when its `found` and
 `done` are words the transcoder writes; on the v2 layout that is the
-manifest the package's record is made from. The record logic (`libv2_records.py`, the
+manifest the package's record is made from. A block it refuses is logged
+(`packager.contract.scan_refused`), and the package's record then carries no
+scan, which keeps an original in fields. The record logic (`libv2_records.py`, the
 schemas repository's, vendored byte for byte) does not keep it yet: until
 it does, a package's essence says `interlaced: false` whatever it was made
 from, and the deletion gate leaves interlacing out.
