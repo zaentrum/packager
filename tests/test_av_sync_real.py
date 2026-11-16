@@ -5,17 +5,20 @@ A clip shows a white frame and sounds a beep at the same instants, every
 2.002 s. In a Matroska file with B-frames (libx264 -bf 3) its video starts at
 the B-frames' delay (83 ms) after its first decode and its audio, which is at
 the file's start: Matroska keeps presentation times alone, to the
-millisecond. The packager's remux of it is an MP4 with an empty edit of that
-delay and an edit from media_time = that delay; shaka-packager, at its
-default, adds the two, takes the 0 for a missing edit list and moved the
-video that much earlier (the picture 83 ms before the sound). Packaged as is
-and on the transcoder's contract, from that Matroska file, from the MP4 it was
-copied from, and from a clip without B-frames, every flash is within one
-frame of its beep, as ffmpeg presents the package (its edit lists applied)."""
+millisecond. On the transcoder's contract the packager's remux of it is an MP4
+with an empty edit of that delay and an edit from media_time = that delay;
+shaka-packager, at its default, adds the two, takes the 0 for a missing edit
+list and moved the video that much earlier (the picture 83 ms before the
+sound). Packaged as is, the origin puts the first frame at 0 and the remux has
+no empty edit. Packaged both ways, from that Matroska file, from the MP4 it was
+copied from, and from a clip without B-frames, every flash is within
+TOLERANCE_MS of its beep, as ffmpeg presents the package (its edit lists
+applied)."""
 
 from __future__ import annotations
 
 import array
+import itertools
 import json
 import re
 import shutil
@@ -36,6 +39,9 @@ ITEM = "c0ffee00-0000-4000-8000-0000000000b1"
 RATE = 24000 / 1001
 FRAME = 1 / RATE
 FLASHES = 4  # one every 48 frames (2.002 s) from the 48th
+# Measured within 1 ms on ffmpeg 7.1 and 9.0; a one-frame regression (42 ms)
+# must fail.
+TOLERANCE_MS = 5
 
 
 def _ff(*args: str) -> None:
@@ -129,7 +135,9 @@ def _flashes(path: Path) -> list[float]:
 
 def _beeps(path: Path) -> list[float]:
     """When each beep starts: its first sample over a fifth of full scale after
-    half a second under it, counted from the first decoded sample's time."""
+    half a second under it, counted from the first decoded sample's time.
+    Counting on from there assumes the audio's timestamps have no gap, as the
+    packages' AAC renditions have none; the test checks that."""
     first = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "frame=pts_time",
          "-read_intervals", "%+#64", "-of", "csv=p=0", str(path)],
@@ -165,4 +173,25 @@ def test_every_flash_is_within_a_frame_of_its_beep(clips: dict[str, Path], tmp_p
     flashes, beeps = _flashes(_joined(hls / "v0")), _beeps(_joined(hls / "a0"))
     assert len(flashes) == len(beeps) == FLASHES, (flashes, beeps)
     apart = [round((f - b) * 1000, 1) for f, b in zip(flashes, beeps, strict=True)]
-    assert all(abs(ms) <= FRAME * 1000 for ms in apart), apart
+    assert all(abs(ms) <= TOLERANCE_MS for ms in apart), apart
+
+
+def _audio_gaps(path: Path) -> list[float]:
+    """Where an audio frame does not start where the one before it ended (s);
+    the clips' audio is 48 kHz."""
+    rows = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+         "frame=pts_time,nb_samples", "-of", "json", str(path)],
+        capture_output=True, text=True, check=True).stdout
+    frames = [(float(f["pts_time"]), int(f["nb_samples"]) / 48000)
+              for f in json.loads(rows)["frames"]]
+    assert len(frames) > 100, frames
+    return [round(pts - (p + d), 6) for (p, d), (pts, _) in itertools.pairwise(frames)
+            if abs(pts - (p + d)) > 0.0005]
+
+
+@pytest.mark.parametrize("contract", [False, True], ids=["as-is", "contract"])
+def test_the_audio_has_no_gap_the_beep_count_would_miss(clips: dict[str, Path], tmp_path: Path,
+                                                        monkeypatch, contract: bool) -> None:
+    hls = _package(clips["mkv-bf3"], tmp_path, monkeypatch, contract)
+    assert _audio_gaps(_joined(hls / "a0")) == []

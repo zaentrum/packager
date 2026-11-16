@@ -120,14 +120,22 @@ hls.old-<stamp>/ subs.old-<stamp>/ …    replaced, until its grace period ends
 ```
 
 **The video's start.** Every shaka-packager run has
-`--mp4_reset_initial_composition_offset_to_zero=false`. A video that starts
-later than it decodes — B-frames whose first frame is presented a few frames
-after the first decode, as a Matroska file has them — comes to shaka as an
-MP4 with an empty edit of that delay and an edit from that far into its
-media. At its default shaka took the two for a missing edit list and moved
-the video that much earlier: the picture 83 ms before the sound at 23.976
-fps with two B-frames. Off, it keeps the edit list's timing; its warning
-"An EditList is probably missing" is then harmless.
+`--mp4_reset_initial_composition_offset_to_zero=false`. On the transcoder's
+contract timeline a video can be presented later than its first decode, which
+lands at the remux's 0 — a reorder delay, a composition offset, an open-GOP
+cut at a CRA — and comes to shaka as an MP4 with an empty edit of that delay
+and an edit from that far into its media. Where the empty edit converts back
+exactly, in any container, shaka at its default took the two for a missing
+edit list and moved the video that much earlier: the picture 83 ms before the
+sound at 23.976 fps with a two-frame reorder delay, 80 ms at 25 fps, more for
+larger offsets. Off, it keeps the edit list's timing. Packaged as is, the first
+frame is at 0 and there is no empty edit, so the flag changes nothing there.
+
+With the flag off, shaka no longer "repairs" an MP4 that really lacks its edit
+list (a composition offset with no edit): the package plays as the file itself
+plays, on both paths. Its warning "An EditList is probably missing" is then
+about the file, not the package; a repair of such files would belong in the
+probe or origin step for both paths, not in this flag.
 
 **Master.** shaka writes the media and I-frame playlists; the master is
 written by `packager/hls.py`. It keeps shaka's CODECS (read from the

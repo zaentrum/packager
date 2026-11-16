@@ -4305,17 +4305,23 @@ _LANG_TAG = re.compile(r"^[a-z]{2,3}(-[a-z0-9]{2,8})*$")
 # times are the media's, as both come from the same input timeline.
 _TEXT_TIMING = ["--transport_stream_timestamp_offset_ms", "0"]
 
-# Keep this off. An MP4 whose video starts later than its decoding does (a
-# source with B-frames whose first frame is presented a few frames after its
-# first decode, as a Matroska file always has it: 83 ms at 23.976 fps with two
-# B-frames) carries an empty edit of that delay and an edit from media_time =
-# that delay: ffmpeg's remux writes exactly what the source has. shaka-packager
-# adds the two, finds 0, takes it for "an EditList is probably missing" (its
-# warning) and, with this flag at its default (true), moves the video that much
-# earlier: the picture played that much before the sound. Off, shaka keeps the
-# edit list's timing, and every rendition is where the remux put it. Its
-# warning about the missing edit list then is no fault: don't turn the flag on
-# to silence it. Every run takes it (the text runs read no MP4: no effect).
+# Keep this off. On the transcoder's contract timeline a video can be
+# presented later than its first decode, which lands at the remux's 0: a
+# reorder delay (83 ms at 23.976 fps for a two-frame delay), a composition
+# offset, an open-GOP cut at a CRA. ffmpeg's remux then writes an empty edit of
+# that delay and an edit from media_time = that delay. Where the empty edit
+# converts back exactly (whatever the container: Matroska, MP4 or a transport
+# stream), shaka-packager adds the two, finds 0, takes it for "an EditList is
+# probably missing" (its warning) and, with this flag at its default (true),
+# moves the video that much earlier: the picture played that much before the
+# sound. Off, shaka keeps the edit list's timing, and every rendition is where
+# the remux put it. Packaged as is, the origin puts the first frame at 0 and
+# the remux has no empty edit; the flag makes no difference there.
+# With the flag off shaka also no longer "repairs" an MP4 that really lacks
+# its edit list (a composition offset and no edit): its package then plays as
+# the file itself plays, on both paths. A repair of such files belongs in the
+# probe or origin step, for both paths, not in this flag: don't turn it on to
+# silence the warning. Every run takes it (the text runs read no MP4: no effect).
 _COMPOSITION_OFFSET = ["--mp4_reset_initial_composition_offset_to_zero=false"]
 
 
