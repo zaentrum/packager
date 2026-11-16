@@ -125,22 +125,29 @@ def _from_contract(path: Path, inbox: Path, original: Path) -> PackageInputs:
 
 
 # What the transcoder's record of fields says was done (its README,
-# "Fields"): the values of `scan.done` a manifest takes it with.
-SCAN_DONE = ("deinterlaced", "inverseTelecine", "progressiveAsFound", "none")
+# "Fields"), the one field of it the deletion gate reads: a telecined film at
+# its own frames, whole frames as found, deinterlaced at the field rate (one
+# frame a field) or at the frame rate (every second moment dropped), HEVC
+# field pictures kept as they are, or nothing to do. An original in fields
+# goes only where its package says one of SCAN_RELEASES. The values of
+# `scan.done` a manifest takes the block with.
+SCAN_DONE = ("inverse-telecine", "progressive", "deinterlaced-field", "deinterlaced-frame",
+             "fields-kept", "none")
+SCAN_RELEASES = ("inverse-telecine", "progressive", "deinterlaced-field")
+SCAN_FOUND = ("fields", "telecine", "progressive", "field-pictures")
 
 
 def scan_of(contract: dict[str, Any]) -> dict[str, Any] | None:
-    """renditions.json's `scan`, as the transcoder wrote it: what the
-    package's video is as far as fields go (found in fields, a telecined
-    film, or progressive, by its pictures or its mark) and what was done
-    (deinterlaced and at which rate, inverse telecine, progressive as
-    found), for the package's record. None when the contract has none (an
-    older transcoder) or one whose `found` or `done` is not a word it
-    writes."""
+    """renditions.json's `scan`, as the transcoder wrote it, for the package's
+    record: what the package's video is as far as fields go (`found`: in
+    fields, a telecined film, progressive, HEVC field pictures) and what was
+    done (`done`, SCAN_DONE), with the package's frame rate. None when the
+    contract has none (an older transcoder) or one whose `found` or `done`
+    is not a word it writes."""
     scan = contract.get("scan")
     if not isinstance(scan, dict) or scan.get("done") not in SCAN_DONE:
         return None
-    if scan.get("found") not in ("fields", "telecine", "progressive"):
+    if scan.get("found") not in SCAN_FOUND:
         return None
     return dict(scan)
 

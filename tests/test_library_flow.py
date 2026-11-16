@@ -463,7 +463,7 @@ def test_the_contracts_record_of_fields_reaches_the_manifest_the_record_is_made_
     # copied) is in the manifest the package's record is built from, as the
     # contract wrote it; one without it has none.
     scan = {"found": "progressive", "judgedBy": "pictures", "fieldOrder": "tb",
-            "done": "progressiveAsFound", "rate": None, "order": "tff", "orderBy": "mark",
+            "done": "progressive", "order": "tff", "orderBy": "mark",
             "frameRate": "25/1", "filter": None, "idet": None}
     given: list[dict] = []
     real = rec.package_record

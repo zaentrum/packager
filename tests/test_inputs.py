@@ -242,8 +242,8 @@ def test_source_block_is_empty_when_nothing_is_known(
     assert probes == []
 
 
-SCAN = {"found": "fields", "judgedBy": "pictures", "fieldOrder": "tb", "done": "deinterlaced",
-        "rate": "field", "order": "tff", "orderBy": "mark", "frameRate": "50/1",
+SCAN = {"found": "fields", "judgedBy": "pictures", "fieldOrder": "tb",
+        "done": "deinterlaced-field", "order": "tff", "orderBy": "mark", "frameRate": "50/1",
         "filter": "bwdif=mode=send_field:parity=tff:deint=all",
         "idet": {"frames": 1000, "tff": 990, "bff": 0, "progressive": 0, "undetermined": 10,
                  "repeatedTop": 0, "repeatedBottom": 0, "cadence": 0.0, "coverage": 0.0}}
@@ -258,11 +258,21 @@ def test_the_contracts_record_of_fields_is_read_as_it_is(tmp_path: Path) -> None
     assert scan_of(inputs.contract) == SCAN
 
 
+@pytest.mark.parametrize("done", ["inverse-telecine", "progressive", "deinterlaced-field",
+                                  "deinterlaced-frame", "fields-kept", "none"])
+def test_each_word_of_what_was_done_is_kept_as_it_is(done: str) -> None:
+    found = {"inverse-telecine": "telecine", "progressive": "progressive",
+             "fields-kept": "field-pictures", "none": "progressive"}.get(done, "fields")
+    scan = {**SCAN, "found": found, "done": done}
+    assert scan_of({"scan": scan}) == scan
+
+
 @pytest.mark.parametrize("contract", [
     {},                                                    # an older transcoder
     {"scan": None},
     {"scan": "deinterlaced"},
     {"scan": {**SCAN, "done": "woven"}},
+    {"scan": {**SCAN, "done": "deinterlaced"}},           # the rate is part of the word
     {"scan": {**SCAN, "found": "maybe"}},
 ])
 def test_a_record_of_fields_it_cannot_read_is_none(contract: dict) -> None:
