@@ -3826,18 +3826,24 @@ def _carries_hdr10(stream: dict[str, Any]) -> bool:
 # caption data only where there is text, so a programme whose captions start
 # late has none in its first frames: every rendition is read in windows, at
 # the times its original's were read in (its source record's caption
-# windows), or where it keeps none at CLOSED_CAPTION_WINDOWS of the title's
-# duration, each the segments that cover the window read after the init
+# windows), or where it keeps none at CLOSED_CAPTION_WINDOWS of the top
+# rendition's own presentation span, its first picture to the end of its
+# last segment, each the segments that cover the window read after the init
 # segment and filtered by their frames' presentation times
-# (_caption_windows_of). The gate compares them with the original's window
-# by window (libv2_records.captions_carried), less how far the package's
-# times run ahead of the original's (timestampOffset, _caption_offset).
+# (_caption_windows_of), each with how far the package's times run ahead of
+# the original's (timestampOffset, _caption_offset): what the package's video
+# shows, kept for a later day. The deletion gate does not use the package's
+# captions: an original with closed captions, or whose captions are not
+# known, is kept (ADR-0015).
 CLOSED_CAPTION_WINDOWS = rec.CAPTION_WINDOWS
 CLOSED_CAPTION_PACKETS = rec.CAPTION_PACKETS
 CLOSED_CAPTION_TIMEOUT = 120
 # How long a window is where nothing gives its end: CLOSED_CAPTION_PACKETS
 # frames at 24 a second.
 CLOSED_CAPTION_SPAN = 2.0
+# How far a frame's time may fall short of a window's edge and still be on
+# it: half the millisecond the times are kept to.
+_EDGE = 0.0005
 _FRAME_ENTRIES = ("frame=best_effort_timestamp_time,pts_time,duration_time:"
                   "frame_side_data=side_data_type")
 
@@ -3905,39 +3911,43 @@ def _rendition_start(playlist: Path) -> tuple[Path, list[tuple[float, float, Pat
     return playlist.parent / init, spans
 
 
-def _caption_offset(original: Path, playlist: Path) -> tuple[float | None, float | None]:
-    """(the time of the package's first picture, its timestampOffset): how
-    far the package's presentation times run ahead of the original's — its
-    first picture's time in the top rendition less its time in the
-    original, as ffprobe decodes both — rounded to the millisecond. None of
-    either that can't be read: an original that is gone, or one ffprobe
-    can't open."""
+def _caption_offset(original: Path, playlist: Path
+                    ) -> tuple[tuple[float, float] | None, float | None]:
+    """(the top rendition's presentation span, its first picture to the end
+    of its last segment; the package's timestampOffset): how far the
+    package's presentation times run ahead of the original's — its first
+    picture's time in the top rendition less its time in the original, as
+    ffprobe decodes both — rounded to the millisecond. None of either that
+    can't be read: an original that is gone, or one ffprobe can't open."""
     start = _rendition_start(playlist)
-    first = start[1][0][0] if start else None
+    span = (start[1][0][0], start[1][-1][1]) if start else None
+    first = span[0] if span else None
     try:
         picture = _ffprobe(original).video_index if original.exists() else None
     except (OSError, ValueError, subprocess.SubprocessError):
         picture = None
     there = (_first_time(str(original), "-select_streams", str(picture))
              if picture is not None else None)
-    return first, (round(first - there, 3) if there is not None and first is not None else None)
+    return span, (round(first - there, 3) if there is not None and first is not None else None)
 
 
 def _caption_targets(windows: list[dict[str, Any]] | None, offset: float | None,
-                     first: float | None, duration_s: float) -> list[tuple[float, float, float]]:
+                     span: tuple[float, float] | None,
+                     duration_s: float) -> list[tuple[float, float, float]]:
     """Where the renditions are read, (at, start, end) in seconds of the
     package's timeline: at the times of the original's windows (its source
     record's, `windows`), its timestampOffset ahead — one that could not be
     read CLOSED_CAPTION_SPAN from its point —; without them each of
-    CLOSED_CAPTION_WINDOWS of the title's duration from the package's first
-    picture, CLOSED_CAPTION_SPAN long."""
+    CLOSED_CAPTION_WINDOWS of the top rendition's own span (start + at x
+    (end - start); where it can't be read, of the title's duration from 0),
+    CLOSED_CAPTION_SPAN long."""
     ahead = offset or 0.0
     if windows:
         return [(w["at"], w["start"] + ahead,
                  max(w["end"], w["start"] + (0 if w["frames"] else CLOSED_CAPTION_SPAN)) + ahead)
                 for w in windows]
-    origin = first or 0.0
-    return [(at, origin + at * duration_s, origin + at * duration_s + CLOSED_CAPTION_SPAN)
+    origin, end = span if span else (0.0, duration_s)
+    return [(at, origin + at * (end - origin), origin + at * (end - origin) + CLOSED_CAPTION_SPAN)
             for at in CLOSED_CAPTION_WINDOWS]
 
 
@@ -3962,9 +3972,11 @@ def _caption_windows_of(playlist: Path,
             if target is not None:
                 frames = _frames_of(target, "-select_streams", "v:0", "-read_intervals",
                                     f"%+{max(end - covering[0][0], 0) + 0.5:.3f}")
+        # a frame that starts where the window ends, or ends where it starts,
+        # is none of it: times are kept to the millisecond
         inside = [f for f in frames or []
-                  if (t := _time_of(f)) is not None and t < end
-                  and t + (rec.seconds(f.get("duration_time")) or 0.0) > begin]
+                  if (t := _time_of(f)) is not None and t < end - _EDGE
+                  and t + (rec.seconds(f.get("duration_time")) or 0.0) > begin + _EDGE]
         if not inside:
             log.warning("packager.closed_captions.unread", playlist=str(playlist), at=at,
                         error="no frame decoded in the window")
@@ -3982,8 +3994,8 @@ def _read_captions(hls_dir: Path, video_meta: list[dict[str, Any]], original: Pa
     (_caption_targets)."""
     if not video_meta:
         return
-    first, offset = _caption_offset(original, hls_dir / video_meta[0]["id"] / "playlist.m3u8")
-    targets = _caption_targets(windows, offset, first, duration_s)
+    span, offset = _caption_offset(original, hls_dir / video_meta[0]["id"] / "playlist.m3u8")
+    targets = _caption_targets(windows, offset, span, duration_s)
     for entry in video_meta:
         found = _caption_windows_of(hls_dir / entry["id"] / "playlist.m3u8", targets)
         entry["captionWindows"] = found

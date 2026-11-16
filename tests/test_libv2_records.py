@@ -30,7 +30,7 @@ from packager.katalog import ClaimedItem
 # zaentrum/schemas, branch record-logic-11 on 392d01d3b93c7446952e36a7c71dc1987a4685aa,
 # tools/libv2_records.py (record logic 11: closed captions window by window, a package's scan); pin
 # its commit here once it is merged
-SHA256 = "1e84cdb238b97267b2d4a4146af08b5f4ac0e91312104baa612ca22e112286e2"
+SHA256 = "d3b4f8959ed0697d1644919853925497b5f9cc3656ccab01ebcf4a25b767153b"
 LIBV2_RECORDS = 11
 
 GOLDEN = Path(__file__).parent / "fixtures" / "libv2_records"

@@ -469,25 +469,29 @@ stream it decoded a frame of, 9.0 has no such field), so what tells is the
 A53 captions FFmpeg's decoder exports with a frame. An encoder may write
 caption data only where there is text, so the first frames of a programme
 whose captions start late carry none: the original and its package are read
-in windows, window by window. The original's record (record logic 11) keeps
-the windows its picture was read in when it is recorded
-(`libv2_records.caption_windows`: 48 packets from the keyframe at 10, 30,
-50, 70 and 90 % of its duration). After shaka-packager, every rung is read
-at the times of those windows (where the original's record keeps none, at
-the same fractions of the title's duration from its first picture): the
-segments that cover a window, read after the init segment (`concat:`,
-nothing copied) from the first one's start, a keyframe, its frames those
-whose presentation times fall in the window (`_caption_windows_of`). Each
-video rendition of the manifest and of a v2 record's `package.json` keeps
-its windows, `captionWindows: [{at, start, end, frames, captions}]` — a
-window that decoded no frame is `frames: 0, captions: false`, a failed read
-— says `closedCaptions: true` when one shows them, and how far the package's
-times run ahead of the original's (`timestampOffset`: its first picture's
-time less the original's, as ffprobe decodes both). The deletion gate lets
-an original's captions go only where every window of the original that
-shows them overlaps, less that offset, a window of the package's top
-rendition that decoded frames and shows them; a rendition's `closedCaptions`
-alone carries nothing, and a window that can't be read keeps the original.
+in windows. The original's record (record logic 11) keeps the windows its
+picture was read in when it is recorded (`libv2_records.caption_windows`:
+48 packets from the keyframe at 10, 30, 50, 70 and 90 % of its picture's own
+presentation span, its first picture to the end of its last packet — not of
+the file's duration, which Matroska counts from 0 even where the picture
+starts later); a window that decoded no frame is `frames: 0, captions:
+false`, and a picture with such a window and none that shows captions does
+not know its captions, so it is never read as having none. The deletion
+gate does not use the package's captions: an original with closed
+captions, or with captions not known, is kept (ADR-0015). What the
+package's video shows is kept for a later day: after shaka-packager, every
+rung is read at the times of the original's windows (where the original's
+record keeps none, at the same fractions of the top rendition's own span,
+its first picture to the end of its last segment) — the segments that cover
+a window, read after the init segment (`concat:`, nothing copied) from the
+first one's start, a keyframe, its frames those whose presentation times
+fall in the window, a frame that starts where it ends none of them
+(`_caption_windows_of`) —, and each video rendition of the manifest and of a
+v2 record's `package.json` keeps its windows (`captionWindows: [{at, start,
+end, frames, captions}]`), says `closedCaptions: true` when one shows them,
+and how far the package's times run ahead of the original's
+(`timestampOffset`: its first picture's time less the original's, as
+ffprobe decodes both).
 
 **Compatibility.** Rendition dirs stay `vN` / `aN`, so the existing
 playback routes serve every rung and both audio groups. `renditions.video[0]`

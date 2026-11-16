@@ -1,6 +1,8 @@
 """A package's record says it carries closed captions when its top video
 rendition's own stream does, as the packager read them from windows across
-the rendition — no longer never, whatever it carried. The
+the rendition — no longer never, whatever it carried —, what its video
+shows: the deletion gate does not use it, and keeps an original that has
+captions, or whose captions are not known, whatever its package carries. The
 manifest is made as the packager makes it, the record through
 records.package_record, as package.json is written; ffprobe's answers are
 made up, and nothing runs ffmpeg."""
@@ -82,7 +84,9 @@ def test_a_package_whose_top_rendition_carries_them_has_them() -> None:
     assert [v.get("closedCaptions") for v in package["renditions"]["video"]] == [True, True]
     assert source["essence"]["closedCaptions"] is package["essence"]["closedCaptions"] is True
     assert not _dropped(package)
-    assert rec.deletion_gate([source["essence"]], package["essence"]) == []
+    # the gate does not use the package's captions: an original that has
+    # them is kept, whatever its package carries
+    assert rec.deletion_gate([source["essence"]], package["essence"]) == ["closedCaptions"]
 
 
 def test_the_top_rendition_alone_is_enough() -> None:
@@ -90,7 +94,6 @@ def test_the_top_rendition_alone_is_enough() -> None:
     package, source = _record([_video("v0", 1080, closedCaptions=True), _video("v1", 720)])
     assert [v.get("closedCaptions") for v in package["renditions"]["video"]] == [True, None]
     assert package["essence"]["closedCaptions"] is True
-    assert rec.deletion_gate([source["essence"]], package["essence"]) == []
 
 
 def test_a_package_whose_top_rendition_says_none_has_none() -> None:
@@ -107,8 +110,8 @@ def test_a_package_whose_top_rendition_says_none_has_none() -> None:
 
 def test_a_package_of_an_original_without_them() -> None:
     # Its picture read in five windows, none of which shows any: it knows
-    # it has none. One read from its probe alone can't tell, and an encode
-    # of it keeps it, as a copy of it does not.
+    # it has none. One read from its probe alone can't tell, and its
+    # package keeps it, a copy as an encode.
     none = [{"at": at, "start": at * 60, "end": at * 60 + 2, "frames": 48, "captions": False}
             for at in rec.CAPTION_WINDOWS]
     package, source = _record([_video("v0", 1080, encoder="hevc_nvenc")], closed_captions=0,
@@ -121,8 +124,8 @@ def test_a_package_of_an_original_without_them() -> None:
     assert "closedCaptionsKnown" not in source["essence"]
     assert rec.deletion_gate([source["essence"]], package["essence"]) == ["closedCaptions"]
     package, source = _record([_video("v0", 1080)], closed_captions=0)
-    assert rec.deletion_gate([source["essence"]], package["essence"],
-                             copied=rec.top_copied(package)) == []
+    assert package["renditions"]["video"][0]["encoder"] == "copy"
+    assert rec.deletion_gate([source["essence"]], package["essence"]) == ["closedCaptions"]
 
 
 def test_the_record_keeps_a_renditions_captions_only_when_it_says_it_carries_them() -> None:
@@ -203,9 +206,16 @@ def test_a_rendition_is_read_at_the_titles_fractions_without_its_sources_windows
     playlist = _rendition(tmp_path / "hls" / "v0", TEN)
     ffprobe = _Ffprobe(captioned=(8,))
     monkeypatch.setattr(pk.subprocess, "run", ffprobe)
-    targets = pk._caption_targets(None, None, 0.0, 60.0)
+    targets = pk._caption_targets(None, None, (0.0, 60.0), 90.0)
     assert targets == [(0.1, 6.0, 8.0), (0.3, 18.0, 20.0), (0.5, 30.0, 32.0), (0.7, 42.0, 44.0),
                        (0.9, 54.0, 56.0)]
+    # across the rendition's own span, its first picture to its end: one
+    # that starts at 10 s and ends at 70 s is read at 16, 28, 40, 52, 64 s;
+    # one whose span can't be read at the title's duration from 0
+    assert [t[1] for t in pk._caption_targets(None, None, (10.0, 70.0), 90.0)] == [
+        16.0, 28.0, 40.0, 52.0, 64.0]
+    assert [t[1] for t in pk._caption_targets(None, None, None, 60.0)] == [
+        6.0, 18.0, 30.0, 42.0, 54.0]
     # each window the segments that cover its span, read after the init
     # segment, its frames those of the span: captions where they start late
     assert _windows(pk._caption_windows_of(playlist, targets)) == [
@@ -226,31 +236,23 @@ def test_a_rendition_is_read_at_the_times_of_its_sources_windows(
     # 6-8 s, ..., 24.5-26.5 s and 40-42 s; one spans two segments.
     playlist = _rendition(tmp_path / "hls" / "v0", TEN)
     monkeypatch.setattr(pk.subprocess, "run", _Ffprobe(captioned=(4, 5), original=10.0))
-    assert pk._caption_offset(tmp_path / "original.mkv", playlist) == (0.0, None)
+    assert pk._caption_offset(tmp_path / "original.mkv", playlist) == ((0.0, 60.0), None)
     (tmp_path / "original.mkv").write_bytes(b"")
-    assert pk._caption_offset(tmp_path / "original.mkv", playlist) == (0.0, -10.0)
+    assert pk._caption_offset(tmp_path / "original.mkv", playlist) == ((0.0, 60.0), -10.0)
     source = [{"at": 0.1, "start": 16.0, "end": 18.0, "frames": 48, "captions": False},
               {"at": 0.3, "start": 28.0, "end": 30.0, "frames": 48, "captions": True},
               {"at": 0.5, "start": 34.5, "end": 36.5, "frames": 48, "captions": True},
               {"at": 0.7, "start": 50.0, "end": 50.0, "frames": 0, "captions": None},
               {"at": 0.9, "start": 64.0, "end": 66.0, "frames": 48, "captions": True}]
-    targets = pk._caption_targets(source, -10.0, 0.0, 60.0)
+    targets = pk._caption_targets(source, -10.0, (0.0, 60.0), 60.0)
     assert targets == [(0.1, 6.0, 8.0), (0.3, 18.0, 20.0), (0.5, 24.5, 26.5), (0.7, 40.0, 42.0),
                        (0.9, 54.0, 56.0)]
     found = pk._caption_windows_of(playlist, targets)
     assert _windows(found) == [(0.1, 6.0, 8.0, 2, False), (0.3, 18.0, 20.0, 2, True),
                                (0.5, 24.0, 27.0, 3, True), (0.7, 40.0, 42.0, 2, False),
                                (0.9, 54.0, 56.0, 2, False)]
-    # the gate's reading of them, less the package's timestampOffset: the
-    # window at 90 % shows none where the original's shows captions
-    src = {"streams": [{"index": 0, "type": "video", "dispositions": {}, "captionWindows": source}]}
-    top = {"id": "v0", "captionWindows": found, "timestampOffset": -10.0}
-    pkg = {"renditions": {"video": [top]}}
-    assert rec.captions_carried([src], pkg) is False
-    found[4]["captions"] = True
-    assert rec.captions_carried([src], pkg) is True
-    pkg["renditions"]["video"][0]["timestampOffset"] = 0.0
-    assert rec.captions_carried([src], pkg) is False
+    # each at its source window's time, less the offset
+    assert [round(t[1] - (-10.0), 3) for t in targets] == [w["start"] for w in source]
 
 
 @pytest.mark.parametrize("answer", [
@@ -266,7 +268,7 @@ def test_a_window_that_cant_be_read_says_nothing(
     playlist = _rendition(tmp_path / "hls" / "v0", TEN)
     monkeypatch.setattr(pk.subprocess, "run", _Ffprobe(captioned=(8,), failing={4: answer}))
     with capture_logs() as logs:
-        found = pk._caption_windows_of(playlist, pk._caption_targets(None, None, 0.0, 60.0))
+        found = pk._caption_windows_of(playlist, pk._caption_targets(None, None, (0.0, 60.0), 60.0))
     # recorded as failed, no frames; the windows after it read
     assert [(w["at"], w["frames"], w["captions"]) for w in found] == [
         (0.1, 2, False), (0.3, 0, False), (0.5, 2, False), (0.7, 2, True), (0.9, 2, False)]
@@ -283,7 +285,7 @@ def test_a_rendition_without_its_playlist_init_or_segments_says_nothing(
     no_map = tmp_path / "b" / "playlist.m3u8"
     no_map.parent.mkdir()
     no_map.write_text(playlist.read_text().replace('#EXT-X-MAP:URI="init.mp4"\n', ""))
-    targets = pk._caption_targets(None, None, 0.0, 4.0)
+    targets = pk._caption_targets(None, None, (0.0, 4.0), 4.0)
     piped = _rendition(tmp_path / "c|d" / "v0", [4.0])  # a path the concat protocol can't take
     for gone in (tmp_path / "gone" / "playlist.m3u8", no_map, piped):
         assert [(w["frames"], w["captions"]) for w in pk._caption_windows_of(gone, targets)] \
