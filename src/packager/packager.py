@@ -792,6 +792,7 @@ def build_package(
         converted = _convert_subtitle_files(
             sub_files, stage / "subs", tmpdir,
             first=len(probe.subtitles), visible_indices=sub_visible,
+            shift=_file_shift(inputs.primary.timeline, inputs.timestamp_offset, probe),
         )
         # subN of a file is numbered on from the source's own tracks, in
         # the order of the files (a file that failed keeps its number).
@@ -1655,11 +1656,18 @@ def _ts_offset(seconds: float) -> list[str]:
 # makes continuous.
 #
 # A run over a container whose timestamps may jump (its demuxer's
-# AVFMT_TS_DISCONT: MPEG-TS, MPEG-PS, FLV, Ogg and these) is normalised by the
-# earliest start of the streams the run reads, not by the file's start
-# (ffmpeg's "Correcting start time" of its input): the transmux by its video
-# and audio, a subtitle run by its subtitles. Each run's origin is moved from
-# its own normalisation, so the first video frame is at 0 in every one.
+# AVFMT_TS_DISCONT: MPEG-TS, MPEG-PS, FLV, Ogg and these) is not normalised by
+# the file's start but by the start of the streams it reads (ffmpeg's
+# "Correcting start time" of its input), and not alike on every version: 9.0
+# by the later of the file's start and the earliest of those streams, 7.1 by
+# the earliest of them (in its correct_input_start_times the seek's start
+# binds as `(start + cond) ? seek : 0`). A run that reads the video and the
+# audio starts at the earliest of them on both (no file's start is later).
+# One that reads none of them, a subtitle run, differs where a subtitle starts
+# over 1 s before them (the file's start leaves it out, and 9.0 put the run's
+# events that much early). Such a run keeps its timestamps (-copyts), the
+# first frame moved to 0: ffmpeg makes the clock jumps of a run continuous
+# from its video and audio packets alone, so it loses nothing by it.
 _TS_DISCONT = frozenset({"mpegts", "mpegtsraw", "mpeg", "flv", "live_flv", "kux", "ogg", "hls",
                          "m4v", "dhav", "dvdvideo", "ty", "rcwt"})
 
@@ -1674,7 +1682,9 @@ def _origin(timeline: str, ts_offset: float, probe: _Probe,
     `normalize`, ffmpeg's normalisation of that run (_normalised_by), moved
     by its distance to the first video frame (the video stream's
     start_time), which lands that frame at 0 — nothing where the run's
-    normalisation starts with it, as before. A track that starts before
+    normalisation starts with it, as before; a run over a container whose
+    timestamps may jump that reads neither video nor audio, its timestamps
+    kept and that frame moved to 0 (_TS_DISCONT). A track that starts before
     that frame (an audio track's priming, a lead) starts before 0, and the
     MP4's edit list trims what is before 0, as ever (the origin's `lead`);
     a subtitle event, its sidecar keeps from 0 (_clip_before_zero). A
@@ -1688,22 +1698,59 @@ def _origin(timeline: str, ts_offset: float, probe: _Probe,
     video = _start_time(probe.video)
     if video is None:
         return _Origin()
+    if streams is not None and _jumps(probe) and not any(
+            s is probe.video or any(s is a for a in probe.audio) for s in streams):
+        return _Origin(copyts=True, offset=-video)
     # Normalised, the earliest stream is at 0 (ffmpeg normalises by no start
     # where the file has none).
     offset = round((_normalised_by(probe, streams) or 0.0) - video, 6)
     return _Origin(offset=offset, lead=_lead_of(offset))
 
 
+def _jumps(probe: _Probe) -> bool:
+    """Whether the input's container may jump in time (_TS_DISCONT)."""
+    return bool(set(probe.container.split(",")) & _TS_DISCONT)
+
+
 def _normalised_by(probe: _Probe, streams: list[dict[str, Any]] | None) -> float | None:
     """The time ffmpeg's normalisation of a run puts at 0: the file's start,
     or, in a container whose timestamps may jump (_TS_DISCONT), the earliest
     start of the streams the run reads (`streams`; None: the video and every
-    audio stream)."""
-    if not set(probe.container.split(",")) & _TS_DISCONT:
+    audio stream), which is no earlier than the file's start for a run that
+    reads them."""
+    if not _jumps(probe):
         return probe.start_time
     read = [probe.video, *probe.audio] if streams is None else streams
     starts = [s for s in map(_start_time, read) if s is not None]
     return min(starts) if starts else probe.start_time
+
+
+def _file_shift(timeline: str, ts_offset: float, probe: _Probe) -> float:
+    """How far the package's origin moves a subtitle file next to the
+    source: its times count from the media file's start, as a player counts
+    them — the start of the source's own clock (Matroska's, MP4's: 0), or a
+    container's whose clock runs from elsewhere, an MPEG-TS's (_TS_DISCONT),
+    its file's start — and go where the source's own times go (_raw_shift);
+    on a contract, the source moved onto its timeline (timestampOffset),
+    whatever file v0 is."""
+    start = (probe.start_time or 0.0) if _jumps(probe) else 0.0
+    if timeline == "keep":
+        return round(ts_offset, 6)
+    return round(_raw_shift(timeline, ts_offset, probe) + start, 6)
+
+
+def _raw_shift(timeline: str, ts_offset: float, probe: _Probe) -> float:
+    """How far the package's origin moves a time on the input's own clock
+    (its timestamps as they are, -copyts): a file that keeps that clock —
+    mkvextract's VobSub pair — is moved by as much to be on it. As is, the
+    first video frame to 0 (no video start: the file's start, ffmpeg's
+    normalisation); on a contract's input, its offset."""
+    if timeline == "keep":
+        return 0.0
+    if timeline == "offset":
+        return ts_offset
+    video = _start_time(probe.video)
+    return round(-(video if video is not None else (probe.start_time or 0.0)), 6)
 
 
 def _lead_of(earliest: float) -> float:
@@ -3252,10 +3299,13 @@ def _extract_subtitles(
             log.warning("packager.subs.styled_failed", idx=c.index, error="no script written")
             path.unlink(missing_ok=True)
             styled.discard(c.index)
-    # No event before the package's 0 (_clip_before_zero).
+    # No event before the package's 0 (_clip_before_zero); the VobSub pair,
+    # on the source's own clock, moved onto it (_shift_vobsub).
     for c in sidecars:
         if c.index in written and c.format in ("webvtt", "pgs"):
             _clip_before_zero(subs_dir / c.name, c.format, c.index)
+        if c.index in written and c.format == "vobsub":
+            _shift_vobsub(subs_dir / c.name, _raw_shift(timeline, ts_offset, probe), c.index)
         if c.index in styled:
             _clip_before_zero(subs_dir / str(c.styled), STYLED_FORMAT, c.index)
     out: list[dict[str, Any]] = []
@@ -3575,8 +3625,9 @@ def _clip_pgs(data: bytes) -> tuple[bytes, int, int] | None:
             current = []
     if current:
         sets.append(current)
+    rest, dts_moved = _pgs_dts_from_zero(data, i)
     if not sets:
-        return None
+        return (data[:i] + rest, 0, 0) if dts_moved else None
 
     def state(s: list[tuple[int, int, int, bytes]]) -> int | None:
         return s[0][3][7] if s[0][2] == _PGS_PCS and len(s[0][3]) > 10 else None
@@ -3593,12 +3644,146 @@ def _clip_pgs(data: bytes) -> tuple[bytes, int, int] | None:
     kept = b"".join(b"PG" + struct.pack(">IIBH", max(pts, 0), max(min(dts, pts), 0), kind,
                                         len(payload)) + payload
                     for s in sets[keep:] for pts, dts, kind, payload in s)
-    return kept + data[i:], keep, len(sets) - keep
+    return kept + rest, keep, len(sets) - keep
+
+
+def _pgs_dts_from_zero(data: bytes, i: int) -> tuple[bytes, bool]:
+    """The PGS stream from byte `i` on, a display set at 0 or after it, its
+    segments' decode times (DTS) before 0 at 0 (at most their PTS): one
+    shortly after 0 may decode before it, which ffmpeg's writer wraps; and
+    whether any was. Read no further than the first segment that decodes at
+    0 or after it."""
+    head, j = bytearray(), i
+    while j + 13 <= len(data) and data[j:j + 2] == b"PG":
+        pts, dts, kind, size = struct.unpack_from(">IIBH", data, j + 2)
+        if _signed(dts) >= 0:
+            break
+        # Its PTS is 0 or after it: its DTS at 0 is at most it.
+        head += b"PG" + struct.pack(">IIBH", pts, 0, kind, size) + data[j + 13:j + 13 + size]
+        j += 13 + size
+    return (bytes(head) + data[j:], True) if j > i else (data[i:], False)
 
 
 def _signed(ticks: int) -> int:
     """A PGS segment's 32-bit time read as signed."""
     return ticks - (1 << 32) if ticks >= 1 << 31 else ticks
+
+
+# A VobSub .idx entry: `timestamp: HH:MM:SS:mmm, filepos: <hex>` (the subpicture
+# at that byte of the .sub).
+_IDX_ENTRY = re.compile(rb"^timestamp: (\d+):(\d\d):(\d\d):(\d{3}), filepos: ([0-9A-Fa-f]+)")
+# A subpicture's display commands and the bytes of parameters each has: forced
+# start, start, stop, colours, contrast, area, its pixel data's offsets.
+_SPU_PARAMETERS = {0x00: 0, 0x01: 0, 0x02: 0, 0x03: 2, 0x04: 2, 0x05: 6, 0x06: 4}
+
+
+def _shift_vobsub(idx: Path, seconds: float, index: int) -> None:
+    """Move a VobSub pair onto the package's origin: every .idx entry's time
+    by `seconds` (mkvextract writes the source's own clock: _raw_shift), as
+    the other sidecars are; one that then is over at 0 or before (at its
+    subpicture's stop, or at the next entry) is taken out, one across 0
+    starts at 0 and keeps its end (its subpicture's control times, in the
+    .sub, that much earlier: _spu_dates). A pair nothing moves is left as
+    mkvextract wrote it; one whose subpicture can't be read loses that
+    entry, logged."""
+    shift = round(seconds * 1000)
+    try:
+        lines = idx.read_bytes().splitlines(keepends=True)
+        entries = [(n, m) for n, line in enumerate(lines) if (m := _IDX_ENTRY.match(line))]
+        times = [((int(m[1]) * 60 + int(m[2])) * 60 + int(m[3])) * 1000 + int(m[4]) + shift
+                 for _, m in entries]
+        if not shift and min(times, default=0) >= 0:
+            return
+        sub = bytearray(idx.with_suffix(".sub").read_bytes())
+    except OSError as e:
+        log.warning("packager.subs.vobsub_shift_failed", idx=index, error=str(e)[:200])
+        return
+    dropped = from_zero = 0
+    for k, ((n, m), ms) in enumerate(zip(entries, times, strict=True)):
+        line = lines[n]
+        if ms < 0:
+            dates = _spu_dates(sub, int(m[5], 16))
+            later = times[k + 1] if k + 1 < len(times) else None
+            stop = ms + dates[1] if dates is not None and dates[1] is not None else None
+            ends = min((t for t in (stop, later) if t is not None), default=None)
+            if dates is None or (ends is not None and ends <= 0):
+                if dates is None:
+                    log.warning("packager.subs.vobsub_entry_dropped", idx=index, ms=ms,
+                                error="its subpicture can't be read")
+                lines[n] = b""
+                dropped += 1
+                continue
+            ticks = round(-ms * 90 / 1024)  # its control times are 1024/90000 s
+            for at in dates[0]:
+                date = int.from_bytes(sub[at:at + 2], "big")
+                sub[at:at + 2] = max(0, date - ticks).to_bytes(2, "big")
+            ms, from_zero = 0, from_zero + 1
+        h, rest = divmod(ms, 3_600_000)
+        lines[n] = (f"timestamp: {h:02d}:{rest // 60_000:02d}:{rest // 1000 % 60:02d}:"
+                    f"{rest % 1000:03d}").encode() + line[m.end(4):]
+    _write_atomic(idx, b"".join(lines))
+    if from_zero:
+        _write_atomic(idx.with_suffix(".sub"), bytes(sub))
+    log.info("packager.subs.vobsub_moved", idx=index, ms=shift, dropped=dropped,
+             from_zero=from_zero)
+
+
+def _spu_dates(sub: bytearray, pos: int) -> tuple[list[int], int | None] | None:
+    """Where in the .sub the control times of the subpicture at byte `pos`
+    are (each control sequence's 2-byte date, in 1024/90000 s after its
+    entry's time), and its stop's date in milliseconds (None where it has
+    none); None where it can't be read: MPEG-2 packs (an MPEG-1 one, which
+    mkvextract doesn't write, is none), private stream 1 packets holding the
+    subpicture, its size first, its control sequences where it says."""
+    try:
+        chunks: list[tuple[int, int]] = []  # (byte in the .sub, length) of its data
+        size, got, i = None, 0, pos
+        while size is None or got < size:
+            if sub[i:i + 4] == b"\x00\x00\x01\xba":
+                if sub[i + 4] & 0xC0 != 0x40:
+                    return None
+                i += 14 + (sub[i + 13] & 7)
+                continue
+            if sub[i:i + 3] != b"\x00\x00\x01":
+                return None
+            body, end = i + 6, i + 6 + int.from_bytes(sub[i + 4:i + 6], "big")
+            if sub[i + 3] == 0xBD:
+                if sub[body] & 0xC0 != 0x80:
+                    return None
+                start = body + 3 + sub[body + 2] + 1  # past its header and substream id
+                if size is None:
+                    size = int.from_bytes(sub[start:start + 2], "big")
+                chunks.append((start, end - start))
+                got += end - start
+            i = end
+        where = [p for start, length in chunks for p in range(start, start + length)][:size]
+
+        def word(off: int) -> int:
+            return (sub[where[off]] << 8) | sub[where[off + 1]]
+
+        dates, stop, off, seen = [], None, word(2), set()
+        while off not in seen:
+            seen.add(off)
+            if where[off + 1] != where[off] + 1:
+                return None  # a date across two packets
+            dates.append(where[off])
+            following, k = word(off + 2), off + 4
+            while sub[where[k]] != 0xFF:
+                cmd = sub[where[k]]
+                if cmd == 0x02:
+                    stop = round(word(off) * 1024 / 90)
+                if cmd == 0x07:  # its parameters' size follows it
+                    k += 1 + word(k + 1)
+                elif cmd in _SPU_PARAMETERS:
+                    k += 1 + _SPU_PARAMETERS[cmd]
+                else:
+                    return None
+            if following == off:
+                break
+            off = following
+        return dates, stop
+    except IndexError:
+        return None
 
 
 # The subtitle files next to a source the packager takes, by extension;
@@ -3657,6 +3842,7 @@ def _convert_subtitle_files(
     *,
     first: int,
     visible_indices: set[int] | None = None,
+    shift: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Convert each subtitle file next to the source to WebVTT at
     subs_dir/N.vtt, N counting on from the source's own subtitle tracks
@@ -3666,7 +3852,11 @@ def _convert_subtitle_files(
     ones. A file that is an ASS or SSA script keeps it beside its WebVTT
     copy too, subs_dir/N.ass (_styled_file), and says so in `styled`, as
     a styled stream does. A file that can't be read or converted is left
-    out, logged; the package goes on without it."""
+    out, logged; the package goes on without it. Its times move by `shift`
+    seconds onto the package's origin (_file_shift), the WebVTT copy's and
+    the script's alike, and an event then over at 0 or before is taken
+    out, one across 0 starts at 0 (_clip_before_zero, _shift_ass); a file
+    nothing moves is converted, and its script kept, as it always was."""
     if files:
         subs_dir.mkdir(parents=True, exist_ok=True)
     out: list[dict[str, Any]] = []
@@ -3676,8 +3866,11 @@ def _convert_subtitle_files(
         styled = subs_dir / f"{n}.ass"
         try:
             raw = _convert_subtitle_file(f, target,
-                                         tmpdir / f"subtitle-file-{n}{f.path.suffix.lower()}")
-            kept = _styled_file(raw, f.language, styled)
+                                         tmpdir / f"subtitle-file-{n}{f.path.suffix.lower()}",
+                                         shift)
+            if _moves(shift):
+                _clip_before_zero(target, "webvtt", n)
+            kept = _styled_file(raw, f.language, styled, shift)
         except (OSError, PackageError) as e:
             log.warning("packager.subs.file_failed", idx=n, path=str(f.path), error=str(e)[:300])
             target.unlink(missing_ok=True)
@@ -3700,13 +3893,15 @@ def _convert_subtitle_files(
     return out
 
 
-def _convert_subtitle_file(f: _SubtitleFile, target: Path, utf8: Path) -> bytes:
+def _convert_subtitle_file(f: _SubtitleFile, target: Path, utf8: Path,
+                           shift: float = 0.0) -> bytes:
     """One subtitle file as WebVTT at target: its text decoded
     (_subtitle_text) and written to `utf8` as UTF-8, then through ffmpeg's
-    WebVTT encoder, as the source's own text tracks are. ffmpeg reads SRT,
-    ASS/SSA and WebVTT by their content, and fails on a file that is none
-    of them. Returns the file's bytes, as it read them. Raises OSError or
-    PackageError."""
+    WebVTT encoder, as the source's own text tracks are, every time moved
+    by `shift` seconds (a time then before 0 as it is: _SUBTITLE_TIMES).
+    ffmpeg reads SRT, ASS/SSA and WebVTT by their content, and fails on a
+    file that is none of them. Returns the file's bytes, as it read them.
+    Raises OSError or PackageError."""
     size = f.path.stat().st_size
     if size > _SUBTITLE_FILE_MAX_BYTES:
         raise PackageError(f"{size} bytes: no subtitle file is that large")
@@ -3714,29 +3909,84 @@ def _convert_subtitle_file(f: _SubtitleFile, target: Path, utf8: Path) -> bytes:
     utf8.write_text(_subtitle_text(raw, f.language), encoding="utf-8")
     _run_ffmpeg_capturing(f"subtitle file {f.path.name}", [
         "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-        "-i", str(utf8), "-map", "0:s:0", "-c:s", "webvtt", "-f", "webvtt", str(target),
+        "-i", str(utf8), "-map", "0:s:0", "-c:s", "webvtt", "-f", "webvtt",
+        *([*_ts_offset(shift), *_SUBTITLE_TIMES] if _moves(shift) else []), str(target),
     ])
     return raw
 
 
-def _styled_file(raw: bytes, language: str, target: Path) -> bool:
+def _styled_file(raw: bytes, language: str, target: Path, shift: float = 0.0) -> bool:
     """Keep a subtitle file that is an ASS or SSA script at target, as it
     is: one whose text, past the line breaks before it, begins with
     [Script Info], as ffmpeg's ASS reader tells one by its content (an SRT
     file under any name is none). A file in UTF-8, byte order mark and
     all, is kept byte for byte; one in another encoding (UTF-16, a legacy
     code page: _subtitle_text) as its text in UTF-8, which every player
-    reads, the same characters and line ends. False, and nothing written,
-    for a file that is no script. Raises OSError."""
+    reads, the same characters and line ends. One whose times `shift`
+    moves (_convert_subtitle_files) is kept as its text in UTF-8 with its
+    events' times moved (_shift_ass), its byte order mark as it was. False,
+    and nothing written, for a file that is no script. Raises OSError."""
     if not _subtitle_text(raw, language).lstrip("\n").startswith("[Script Info]"):
         return False
-    try:
-        raw.decode("utf-8")
-        data = raw
-    except UnicodeDecodeError:
-        data = _subtitle_text(raw, language, keep_line_ends=True).encode("utf-8")
+    if _moves(shift, 100):
+        text = _shift_ass(_subtitle_text(raw, language, keep_line_ends=True), shift)
+        data = (codecs.BOM_UTF8 if raw.startswith(codecs.BOM_UTF8) else b"") + text.encode("utf-8")
+    else:
+        try:
+            raw.decode("utf-8")
+            data = raw
+        except UnicodeDecodeError:
+            data = _subtitle_text(raw, language, keep_line_ends=True).encode("utf-8")
     target.write_bytes(data)
     return True
+
+
+def _moves(seconds: float, per_second: int = 1000) -> bool:
+    """Whether `seconds` moves a time at all, to its format's precision
+    (WebVTT's milliseconds; per_second=100: ASS's centiseconds)."""
+    return round(seconds * per_second) != 0
+
+
+# An ASS event's time, H:MM:SS.cc (some writers put a colon before the
+# hundredths, or three digits).
+_ASS_TIME = re.compile(r"^\s*(\d+):(\d{1,2}):(\d{1,2})[.:](\d{1,3})\s*$")
+# The fields of an event where its [Events] section names none (ASS's; SSA's
+# Marked stands where Layer does).
+_ASS_FIELDS = ("layer", "start", "end", "style", "name", "marginl", "marginr", "marginv",
+               "effect", "text")
+
+
+def _shift_ass(text: str, seconds: float) -> str:
+    """An ASS or SSA script's events (Dialogue, Comment) moved by `seconds`,
+    by the fields its [Events] Format line names: one then over at 0 or
+    before taken out, one across 0 starting at 0 (_clip_before_zero's rule);
+    every other line as it is. An event whose times can't be read is left as
+    it is."""
+    shift, out, fields, events = round(seconds * 100), [], list(_ASS_FIELDS), False
+    for line in text.splitlines(keepends=True):
+        head, colon, body = line.partition(":")
+        key = head.strip().lower()
+        if line.strip().startswith("["):
+            events = line.strip().lower() == "[events]"
+        elif events and colon and key == "format":
+            fields = [name.strip().lower() for name in body.split(",")]
+        elif (events and colon and key in ("dialogue", "comment")
+              and {"start", "end"} <= set(fields)):
+            # The text, the last field, keeps its commas and its line end.
+            parts = body.split(",", len(fields) - 1)
+            s, e = fields.index("start"), fields.index("end")
+            times = [_ASS_TIME.match(parts[i]) if i < len(parts) else None for i in (s, e)]
+            if all(times):
+                start, end = (((int(m[1]) * 60 + int(m[2])) * 60 + int(m[3])) * 100
+                              + int(m[4].ljust(2, "0")[:2]) + shift for m in times if m)
+                if end <= 0:
+                    continue
+                for i, cs in ((s, max(start, 0)), (e, end)):
+                    parts[i] = (f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}."
+                                f"{cs % 100:02d}")
+                line = head + colon + ",".join(parts)
+        out.append(line)
+    return "".join(out)
 
 
 # The legacy code page a subtitle file that isn't UTF-8 is most likely in,

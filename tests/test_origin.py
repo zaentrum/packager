@@ -13,6 +13,7 @@ its first frame, or whose frame has no time, is made as before."""
 from __future__ import annotations
 
 import struct
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -185,10 +186,11 @@ def test_a_rung_keeps_the_contracts_timeline(monkeypatch: pytest.MonkeyPatch,
 
 
 def test_a_run_over_a_transport_stream_is_moved_from_its_own_normalisation() -> None:
-    # ffmpeg normalises a run over an MPEG-TS file by the earliest start of
-    # the streams it reads: the transmux by its video and audio (the file's
-    # start is the subtitles'), a subtitle run by its subtitles. Each lands
-    # the first frame at 0.
+    # ffmpeg normalises a run over an MPEG-TS file by the start of the
+    # streams it reads: the transmux by its video and audio (the file's start
+    # is the subtitles'), alike on every version. A subtitle run, whose
+    # start differs between versions, keeps its timestamps: each lands the
+    # first frame at 0.
     def probe(container: str) -> pk._Probe:
         return pk._Probe(container=container, duration_ms=6_000,
                          video={"codec_name": "h264", "index": 0, "start_time": "1.920000"},
@@ -197,7 +199,7 @@ def test_a_run_over_a_transport_stream_is_moved_from_its_own_normalisation() -> 
                                      "start_time": "1.400000"}], video_index=0, start_time=1.4)
     ts = probe("mpegts")
     assert pk._origin("normalize", 0.0, ts) == pk._Origin(offset=-0.041333, lead=0.041333)
-    assert pk._origin("normalize", 0.0, ts, ts.subtitles) == pk._Origin(offset=-0.52, lead=0.52)
+    assert pk._origin("normalize", 0.0, ts, ts.subtitles) == pk._Origin(copyts=True, offset=-1.92)
     assert pk._origin("normalize", 0.0, ts, [ts.video]) == pk._Origin()
     # Any other container: by the file's start, every run alike.
     mkv = probe("matroska,webm")
@@ -271,3 +273,96 @@ def test_a_pgs_display_set_before_0_is_taken_out_or_kept_from_0(
     assert (_sets(data), tuple(got)) == (kept, counts)
     # Nothing before 0: read no further than its first display set.
     assert pk._clip_pgs(_display(0.0, 1, 0x80) + b"not PGS") is None
+
+
+def test_what_keeps_the_sources_clock_is_moved_onto_the_origin() -> None:
+    # The source's own clock (a VobSub pair) and a file beside it, which
+    # counts from the media file's start: a transport stream's file start,
+    # Matroska's 0.
+    mkv = _probe(0.0, 0.52)
+    ts = replace(mkv, container="mpegts", start_time=1.4,
+                 video={**mkv.video, "start_time": "1.920000"})
+    assert [pk._raw_shift(t, o, mkv) for t, o in (
+        ("normalize", 0.0), ("offset", -0.52), ("keep", 0.3))] == [-0.52, -0.52, 0.0]
+    assert pk._raw_shift("normalize", 0.0, replace(mkv, video={"index": 0}, start_time=0.2)) == -0.2
+    assert [pk._file_shift(t, o, mkv) for t, o in (
+        ("normalize", 0.0), ("offset", -0.52), ("keep", 0.3))] == [-0.52, -0.52, 0.3]
+    assert [pk._file_shift(t, o, ts) for t, o in (
+        ("normalize", 0.0), ("offset", -1.92))] == [-0.52, -0.52]
+    # A run over a transport stream that reads no video and no audio keeps
+    # its timestamps, the first frame at 0.
+    assert pk._origin("normalize", 0.0, ts, ts.subtitles or [{"codec_name": "x"}]) == (
+        pk._Origin(copyts=True, offset=-1.92))
+
+
+def test_an_ass_script_is_moved_by_its_own_fields() -> None:
+    # Its Format line names where Start and End are; the text keeps its
+    # commas, every other line is as it was.
+    script = ("[Script Info]\r\nTitle: x\r\n\r\n[Events]\r\n"
+              "Format: Layer, Style, Start, End, Text\r\n"
+              "Dialogue: 0,Default,0:00:00.10,0:00:00.30,Before\r\n"
+              "Comment: 0,Default,0:00:00.20,0:00:01.00,Across, it\r\n"
+              "Dialogue: 0,Default,0:00:02.00,0:00:03.00,After\r\n"
+              "Dialogue: 0,Default,not a time,0:00:03.00,Left\r\n")
+    assert pk._shift_ass(script, -0.52) == (
+        "[Script Info]\r\nTitle: x\r\n\r\n[Events]\r\nFormat: Layer, Style, Start, End, Text\r\n"
+        "Comment: 0,Default,0:00:00.00,0:00:00.48,Across, it\r\n"
+        "Dialogue: 0,Default,0:00:01.48,0:00:02.48,After\r\n"
+        "Dialogue: 0,Default,not a time,0:00:03.00,Left\r\n")
+    assert pk._moves(-0.004, 100) is False and pk._moves(-0.004) is True
+
+
+def _spu(stop_ticks: int) -> bytes:
+    """A subpicture: its size, where its first control sequence is (byte 5),
+    a pixel byte, a start at 0 and, the last sequence (byte 11, it points at
+    itself), a stop at `stop_ticks` (1024/90000 s)."""
+    body = (b"\x00" + struct.pack(">HHBB", 0, 11, 0x01, 0xFF)
+            + struct.pack(">HHBB", stop_ticks, 11, 0x02, 0xFF))
+    return struct.pack(">HH", 4 + len(body), 5) + body
+
+
+def _pack(spu: bytes) -> bytes:
+    pes = b"\x81\x80\x05" + b"\x21\x00\x01\x00\x01" + b"\x20" + spu
+    return (b"\x00\x00\x01\xba\x44\x00\x04\x00\x04\x01\x01\x89\xc3\xf8"
+            + b"\x00\x00\x01\xbd" + struct.pack(">H", len(pes)) + pes)
+
+
+def test_a_vobsub_pair_is_moved_and_what_is_over_before_0_taken_out(tmp_path: Path) -> None:
+    # Three subpictures: 0.1 s for 0.2 s, 0.4 s for 0.8 s, 2.0 s; moved by
+    # -0.52 s: the first is over before 0, the second starts at 0 and keeps
+    # its end (its stop that much earlier), the third is at 1.48 s.
+    stops = [round(0.2 * 90000 / 1024), round(0.8 * 90000 / 1024), round(1.0 * 90000 / 1024)]
+    packs = [_pack(_spu(s)) for s in stops]
+    positions = [sum(len(p) for p in packs[:k]) for k in range(3)]
+    (tmp_path / "0.sub").write_bytes(b"".join(packs))
+    head = b"# VobSub index file, v7\nsize: 720x480\n\nid: en, index: 0\n"
+    (tmp_path / "0.idx").write_bytes(head + b"".join(
+        f"timestamp: 00:00:{t}, filepos: {pos:09x}\n".encode()
+        for t, pos in zip(("00:100", "00:400", "02:000"), positions, strict=True)))
+    assert pk._spu_dates(bytearray((tmp_path / "0.sub").read_bytes()), positions[1])[1] == round(
+        stops[1] * 1024 / 90)
+    pk._shift_vobsub(tmp_path / "0.idx", -0.52, 0)
+    assert (tmp_path / "0.idx").read_bytes() == head + (
+        f"timestamp: 00:00:00:000, filepos: {positions[1]:09x}\n"
+        f"timestamp: 00:00:01:480, filepos: {positions[2]:09x}\n").encode()
+    sub = bytearray((tmp_path / "0.sub").read_bytes())
+    assert pk._spu_dates(sub, positions[1])[1] == round((stops[1] - round(120 * 90 / 1024))
+                                                        * 1024 / 90)
+    assert pk._spu_dates(sub, positions[2])[1] == round(stops[2] * 1024 / 90)
+    # Nothing to move: left as it is.
+    before = (tmp_path / "0.idx").read_bytes()
+    pk._shift_vobsub(tmp_path / "0.idx", 0.0, 0)
+    assert (tmp_path / "0.idx").read_bytes() == before
+
+
+def test_a_pgs_decode_time_before_0_is_at_0() -> None:
+    # A display set at 0.01 s decoded from before 0 (its DTS wrapped), and
+    # none before 0: the decode time at 0, the rest as it was.
+    pcs = struct.pack(">HHBHBBBB", 320, 240, 0x10, 1, 0x80, 0, 0, 0)
+    early = (b"PG" + struct.pack(">IIBH", 900, (-900) & 0xFFFFFFFF, 0x16, len(pcs)) + pcs
+             + b"PG" + struct.pack(">IIBH", 900, 900, 0x80, 0))
+    clipped = pk._clip_pgs(early)
+    assert clipped is not None
+    data, *counts = clipped
+    assert [struct.unpack_from(">II", data, 2), struct.unpack_from(">II", data, 13 + len(pcs) + 2)
+            ] == [(900, 0), (900, 900)] and counts == [0, 0]

@@ -357,9 +357,19 @@ def test_subtitle_files_next_to_the_source(tmp_path: Path, monkeypatch, handoff)
         ("sub5", "ger", True, False, False, False, None),
     ]
     assert subs[3]["title"] == "Français"
+    # A file's times count from the source's start: on the contract's
+    # timeline they are moved by its timestampOffset, as the source's own
+    # tracks are (0 where the source starts at 0; ffmpeg 7.1 reads this one's
+    # AAC track, and the file, from 21 ms before its first frame).
+    offset = json.loads((tmp_path / "inbox" / "renditions.json").read_text())["timestampOffset"]
+
+    def at(seconds: float, hours: str = "") -> str:
+        ms = round((seconds + offset) * 1000)
+        return f"{hours}00:{ms // 1000:02d}.{ms % 1000:03d}"
+
     vtt = (root / subs[3]["path"]).read_text(encoding="utf-8")
-    assert "00:01.000 --> 00:03.500\nÇa va, « Café » ?" in vtt
-    assert "00:05.000 --> 00:07.000\nHallo" in (root / subs[5]["path"]).read_text()
+    assert f"{at(1.0)} --> {at(3.5)}\nÇa va, « Café » ?" in vtt
+    assert f"{at(5.0)} --> {at(7.0)}\nHallo" in (root / subs[5]["path"]).read_text()
     media = [a for tag, a, _ in _master(root) if tag == "#EXT-X-MEDIA" and a["TYPE"] == "SUBTITLES"]
     assert [(a["URI"], a["LANGUAGE"], a["NAME"], a.get("FORCED")) for a in media] == [
         ("s0/playlist.m3u8", "en", "English", None),
@@ -370,7 +380,7 @@ def test_subtitle_files_next_to_the_source(tmp_path: Path, monkeypatch, handoff)
     # ... and the rendition's cue is at its time (shaka adds cue settings).
     assert [line.split()[:3] for line in
             (root / "hls" / "s3" / "seg-00001.vtt").read_text().splitlines() if "-->" in line] == [
-        ["00:00:01.000", "-->", "00:00:03.500"]]
+        [at(1.0, "00:"), "-->", at(3.5, "00:")]]
     assert (root / ".complete").exists()
 
 

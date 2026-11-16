@@ -320,3 +320,94 @@ def test_a_cue_kept_from_0_is_packaged_from_0(early: Path, tmp_path: Path, monke
     first = float(pk._ffprobe(early).video["start_time"])
     assert [(round(t, 3), text) for _n, t, text in _mapped_cues(root / "hls" / "s0")] == [
         (0.0, "Across"), (round(2.0 - first, 3), "After")]
+
+
+@pytest.mark.parametrize("lead", [1.08, 2.0])
+def test_a_transport_streams_subtitles_far_ahead_of_its_picture_are_on_it(
+    tmp_path: Path, lead: float,
+) -> None:
+    # A PGS track that starts `lead` s before the audio and video, more than
+    # the 1 s the file's start counts a subtitle by: ffmpeg 9.0 starts a run
+    # that reads it alone at the file's start, 7.1 at its first event. Its
+    # sets are at their times after the first frame on both; the one over
+    # before it is gone.
+    picture = 0.5 + lead
+    (tmp_path / "s.sup").write_bytes(_pgs_display(0.5, True) + _pgs_display(1.0, False)
+                                     + _pgs_display(picture + 1.0, True)
+                                     + _pgs_display(picture + 2.0, False))
+    src = tmp_path / "far.m2ts"
+    _ff("-itsoffset", str(picture), "-f", "lavfi", "-i",
+        "testsrc2=size=320x240:rate=25:duration=6", "-itsoffset", str(picture), "-f", "lavfi",
+        "-i", "sine=frequency=440:sample_rate=48000:duration=6", "-i", str(tmp_path / "s.sup"),
+        "-map", "0:v", "-map", "1:a", "-map", "2", "-c:v", "libx264", "-preset", "ultrafast",
+        "-bf", "0", "-g", "25", "-c:a", "aac", "-c:s", "copy", "-f", "mpegts",
+        "-mpegts_m2ts_mode", "1", str(src))
+    probe = pk._ffprobe(src)
+    first = float(probe.video["start_time"])
+    raw = tmp_path / "raw.sup"
+    _ff("-copyts", "-i", str(src), "-map", "0:s:0", "-c:s", "copy", "-f", "sup", str(raw))
+    in_source = _pgs_sets(raw)
+    assert first - in_source[0][0] > 1.0 and [t < first for t, _ in in_source] == [
+        True, True, False, False]
+    [entry] = pk._extract_subtitles(src, probe, tmp_path / "subs")
+    assert _pgs_sets(tmp_path / entry["path"]) == [
+        (round(t - first, 3), shown) for t, shown in in_source if t > first]
+
+
+needs_vobsub = pytest.mark.skipif(
+    any(shutil.which(b) is None for b in ("mkvmerge", "mkvextract")),
+    reason="needs mkvmerge and mkvextract on PATH (VobSub is mkvextract's)")
+
+
+@needs_vobsub
+def test_a_vobsub_pair_is_on_the_first_frame_as_the_other_sidecars(tmp_path: Path) -> None:
+    # The early clip's PGS track as a VobSub one too: mkvextract writes the
+    # source's clock; the pair is moved onto the first frame, the subpicture
+    # over before it gone, the one across it from 0 — the PGS sidecar's times.
+    (tmp_path / "early.sup").write_bytes(b"".join(
+        _pgs_display(a, True) + _pgs_display(b, False) for a, b in EARLY_PGS))
+    src = tmp_path / "vobsub.mkv"
+    _ff("-itsoffset", "0.5", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=6",
+        "-i", str(tmp_path / "early.sup"), "-i", str(tmp_path / "early.sup"),
+        "-map", "0:v", "-map", "1", "-map", "2", "-c:v", "libx264", "-preset", "ultrafast",
+        "-bf", "0", "-g", "25", "-c:s:0", "copy", "-c:s:1", "dvdsub", str(src))
+    probe = pk._ffprobe(src)
+    first = float(probe.video["start_time"])
+    assert first > 0.5
+    entries = pk._extract_subtitles(src, probe, tmp_path / "subs")
+    assert [e["format"] for e in entries] == ["pgs", "vobsub"]
+    shown = [t for t, s in _pgs_sets(tmp_path / entries[0]["path"]) if s]
+    idx = (tmp_path / entries[1]["path"]).read_text()
+    assert [round(int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000, 3) for h, m, s, ms in
+            re.findall(r"^timestamp: (\d+):(\d\d):(\d\d):(\d{3}),", idx, re.M)] == shown
+    assert shown == [0.0, round(2.0 - 0.1 - first, 3)]  # the .sup is read from its first set
+
+
+def test_a_subtitle_file_beside_the_source_is_on_the_first_frame(early: Path,
+                                                                 tmp_path: Path) -> None:
+    # Its times count from the source's start, as a player counts them (a
+    # transport stream's file start, Matroska's 0): it is moved as the
+    # source's own tracks are, the cue over before the first frame gone, the
+    # one across it from 0; a script beside it alike.
+    folder = tmp_path / "beside"
+    folder.mkdir()
+    (folder / "x.fr.srt").write_text(EARLY_SRT)
+    (folder / "x.de.ass").write_text(SCRIPT.split("Dialogue:")[0] + "".join(
+        f"Dialogue: 0,{_ass_time(a)},{_ass_time(b)},Default,,0,0,0,,{text}\n"
+        for a, b, text in EARLY_EVENTS))
+    probe = pk._ffprobe(early)
+    first = float(probe.video["start_time"])
+    start = probe.start_time if early.suffix == ".m2ts" else 0.0
+    shift = pk._file_shift("normalize", 0.0, probe)
+    assert shift == pytest.approx(start - first, abs=0.0005) and shift < -0.5
+    files = [pk._SubtitleFile(folder / "x.fr.srt", "fre", "", False),
+             pk._SubtitleFile(folder / "x.de.ass", "ger", "", False)]
+    entries = pk._convert_subtitle_files(files, tmp_path / "subs", tmp_path, first=0, shift=shift)
+    kept = [(max(a + shift, 0.0), b + shift, text) for a, b, text in EARLY_EVENTS[1:]]
+    for entry in entries:
+        lines = (tmp_path / entry["path"]).read_text().splitlines()
+        assert [(line, lines[n + 1]) for n, line in enumerate(lines) if " --> " in line] == [
+            (f"{_vtt_time(a)} --> {_vtt_time(b)}", text) for a, b, text in kept]
+    assert [e.get("styled") for e in entries] == [None, {"path": "subs/1.ass", "format": "ass"}]
+    assert _dialogue_times(tmp_path / "subs" / "1.ass") == [
+        (_ass_time(a), _ass_time(b)) for a, b, _ in kept]

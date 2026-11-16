@@ -71,7 +71,10 @@ muxed: 21 ms) as starting that long before the first frame, 9.0 from it,
 so the package is the same on both. A track that starts before the first
 frame (its priming) is before 0 and the MP4's edit list trims it. A
 subtitle event before it is taken out of its sidecar and script where it
-is over by then, and starts at 0 where it is not.
+is over by then, and starts at 0 where it is not. The VobSub pair
+(mkvextract writes the source's own clock) and the subtitle files next to
+the source (counted from its start, as a player counts them) are moved by
+as much as the source's own tracks, under the same rule.
 
 Each video rendition in the manifest (and in a library v2 `package.json`)
 records what made its stream as `encoder`: `"copy"` for the original's
