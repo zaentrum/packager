@@ -119,6 +119,16 @@ trickplay/  manifest.json  .complete
 hls.old-<stamp>/ subs.old-<stamp>/ …    replaced, until its grace period ends
 ```
 
+**The video's start.** Every shaka-packager run has
+`--mp4_reset_initial_composition_offset_to_zero=false`. A video that starts
+later than it decodes — B-frames whose first frame is presented a few frames
+after the first decode, as a Matroska file has them — comes to shaka as an
+MP4 with an empty edit of that delay and an edit from that far into its
+media. At its default shaka took the two for a missing edit list and moved
+the video that much earlier: the picture 83 ms before the sound at 23.976
+fps with two B-frames. Off, it keeps the edit list's timing; its warning
+"An EditList is probably missing" is then harmless.
+
 **Master.** shaka writes the media and I-frame playlists; the master is
 written by `packager/hls.py`. It keeps shaka's CODECS (read from the
 bitstreams), RESOLUTION, LANGUAGE and I-frame lines, and computes the rest:

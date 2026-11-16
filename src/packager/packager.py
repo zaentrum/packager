@@ -4305,6 +4305,19 @@ _LANG_TAG = re.compile(r"^[a-z]{2,3}(-[a-z0-9]{2,8})*$")
 # times are the media's, as both come from the same input timeline.
 _TEXT_TIMING = ["--transport_stream_timestamp_offset_ms", "0"]
 
+# Keep this off. An MP4 whose video starts later than its decoding does (a
+# source with B-frames whose first frame is presented a few frames after its
+# first decode, as a Matroska file always has it: 83 ms at 23.976 fps with two
+# B-frames) carries an empty edit of that delay and an edit from media_time =
+# that delay: ffmpeg's remux writes exactly what the source has. shaka-packager
+# adds the two, finds 0, takes it for "an EditList is probably missing" (its
+# warning) and, with this flag at its default (true), moves the video that much
+# earlier: the picture played that much before the sound. Off, shaka keeps the
+# edit list's timing, and every rendition is where the remux put it. Its
+# warning about the missing edit list then is no fault: don't turn the flag on
+# to silence it. Every run takes it (the text runs read no MP4: no effect).
+_COMPOSITION_OFFSET = ["--mp4_reset_initial_composition_offset_to_zero=false"]
+
 
 def _shaka_command(
     descriptors: list[str], segment_seconds: int, master: str,
@@ -4314,6 +4327,7 @@ def _shaka_command(
         "--segment_duration", str(segment_seconds),
         "--hls_master_playlist_output", master,
         "--hls_playlist_type", "VOD",
+        *_COMPOSITION_OFFSET,
     ]
 
 
