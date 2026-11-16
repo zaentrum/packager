@@ -15,7 +15,11 @@ sample, on the MP4's timeline and on the remux's offset alike, from signals
 of FLAC (24 bits, stereo, on the MP4's timeline); the 5.1 companions and
 the loud track's rendition are what they were, sample for sample; a track
 no client offers is made as before. Packaged, the lifted renditions'
-segments are cut at the same instants as before. A track whose timestamps
+segments are cut at the same instants as before, but that the last may split
+off at most one audio frame as a segment of its own (the lift counts its
+timestamps from its first sample, where the rendition before keeps the
+source's rounding: ffmpeg 7.1 decodes this film's AAC tracks, its priming and
+all, from Matroska's milliseconds). A track whose timestamps
 are not contiguous (a container's rounding) is lifted with its timing: a
 stereo one its first sample and its samples, its length to the rounding,
 where the limiter, given those timestamps, puts the rest 10 ms late; a
@@ -283,13 +287,31 @@ def test_a_lifted_rendition_is_packaged_on_the_segments_it_had(
     # What the done step's details say of it: three lifted, the loud one kept.
     assert stereo == {"before": pk.StereoLoudness(known=True, off=True),
                       "after": pk.StereoLoudness(known=True, lifted=3, kept=1, skipped=0)}
+    # One audio frame of a stereo rendition (48 kHz); half the millisecond an
+    # EXTINF is rounded to; the millisecond the source's timestamps are
+    # (Matroska's), which the rendition before keeps and the lift doesn't.
+    frame, rounding, source = 1024 / 48000, 0.0005, 0.001
     for a in ("a0", "a1", "a2", "a3", "a4", "a5"):
-        playlists = [(roots[label] / "hls" / a / "playlist.m3u8").read_text()
-                     for label in ("before", "after")]
-        assert [re.findall(r"#EXTINF:([\d.]+)", p) for p in playlists[1:]] == [
-            re.findall(r"#EXTINF:([\d.]+)", playlists[0])]
-        starts = [_segment_starts(roots[label] / "hls" / a) for label in ("before", "after")]
-        assert starts[1] == starts[0] and len(starts[0]) == 4
+        extinf = [re.findall(r"#EXTINF:([\d.]+)",
+                             (roots[label] / "hls" / a / "playlist.m3u8").read_text())
+                  for label in ("before", "after")]
+        segments = [_segments(roots[label] / "hls" / a) for label in ("before", "after")]
+        (before, after), (was, now) = extinf, segments
+        n = len(before)
+        # Every segment but the last as it was: its length, its frames ...
+        assert n == 4 and after[:n - 1] == before[:-1], extinf
+        assert [k for _, k in now[:n - 1]] == [k for _, k in was[:n - 1]], segments
+        # ... at most one more, a tail of one frame ...
+        assert n <= len(after) <= n + 1 and len(now) == len(after), extinf
+        if len(after) > n:
+            assert float(after[-1]) <= frame + rounding and now[-1][1] == 1, segments
+        assert sum(k for _, k in now[n - 1:]) == was[-1][1], segments
+        # ... the whole within one frame of it ...
+        assert abs(sum(map(float, after)) - sum(map(float, before))) <= frame + rounding * (
+            n + len(after)), extinf
+        # ... and the segments it shares starting where they did.
+        assert all(abs(s - r) <= source for (s, _), (r, _) in zip(now, was, strict=False)), (
+            segments)
     # The lifted rendition is the one packaged.
     joined = tmp_path / "a1.mp4"
     joined.write_bytes(b"".join(p.read_bytes() for p in [
@@ -298,18 +320,19 @@ def test_a_lifted_rendition_is_packaged_on_the_segments_it_had(
     assert _r128(joined)["I"] == pytest.approx(-20.0, abs=1.0)
 
 
-def _segment_starts(rendition: Path) -> list[float]:
-    """The first timestamp of every media segment of one rendition."""
-    starts = []
+def _segments(rendition: Path) -> list[tuple[float, int]]:
+    """Every media segment of one rendition: its first timestamp, and how
+    many frames it holds."""
+    out = []
     for seg in sorted(rendition.glob("seg-*.m4s")):
         joined = rendition / f".{seg.name}.mp4"
         joined.write_bytes((rendition / "init.mp4").read_bytes() + seg.read_bytes())
-        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "packet=pts_time",
-                              "-of", "csv=p=0", str(joined)], capture_output=True,
-                             text=True).stdout
+        times = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "packet=pts_time",
+                                "-of", "csv=p=0", str(joined)], capture_output=True,
+                               text=True).stdout.split()
         joined.unlink()
-        starts.append(min(float(t.split(",")[0]) for t in out.split()))
-    return starts
+        out.append((min(float(t.split(",")[0]) for t in times), len(times)))
+    return out
 
 
 @pytest.mark.parametrize("layout", ["stereo", "5.1(side)"])

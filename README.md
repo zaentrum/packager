@@ -292,7 +292,11 @@ lookahead limiter at -4 dBFS. The AAC is decoded and measured, its true
 peak there only, and one whose true peak is not under -2 dBTP or whose
 loudness is more than 0.5 LU off is made again, once. A lifted rendition is
 an MP4 of its own, with the first timestamp, the samples and the length of
-the one made before. On film mixes lifted 5 to 13 dB the limiter takes off
+the one made before. It is packaged on that one's segments, but for its
+last: the lift counts its timestamps from its first sample, where the one
+made before keeps the source's rounding (Matroska's milliseconds), so its
+last segment may split off at most one audio frame (a tail of 1024 samples
+or fewer) as a segment of its own. On film mixes lifted 5 to 13 dB the limiter takes off
 more than 3 dB for at most 0.12 % of the time, the dialogue's level moves
 by under 0.5 dB, and the loudness range stays within 1.1 LU. A mix at the
 target or above, one shorter than 3 s and a silent one are made as before,
