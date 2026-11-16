@@ -46,18 +46,29 @@ EXTRA_KINDS = frozenset({"featurette", "behind-the-scenes", "making-of", "delete
 @dataclass(frozen=True)
 class OriginalProbe:
     """The verbatim probe of an original (libv2_records.FFPROBE_ARGS), the
-    ffprobe that made it, and the first bytes of the attachments the probe
+    ffprobe that made it, the first bytes of the attachments the probe
     gives no role by itself, by stream index (libv2_records.attachment_heads):
-    what tells a font by its signature alone."""
+    what tells a font by its signature alone; and the caption windows of its
+    picture, by stream index (libv2_records.caption_windows): where its
+    closed captions are."""
     raw: dict[str, Any]
     version: str | None
     heads: dict[int, bytes] = field(default_factory=dict)
+    captions: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
+
+    def windows(self) -> list[dict[str, Any]] | None:
+        """The caption windows of its picture, or None where they were not
+        read."""
+        picture = rec.picture_stream(self.raw)
+        return rec.caption_windows_of(self.captions.get(picture["index"])) if picture else None
 
 
 def probe_original(path: Path) -> OriginalProbe:
-    """Probe an original for its record. Raises PackageError when ffprobe
-    can't read it, and when ffmpeg gives none of the first bytes of an
-    attachment in time (libv2_records.AttachmentTimeout): a record written
+    """Probe an original for its record, and read its picture's caption
+    windows. Raises PackageError when ffprobe can't read it, when ffmpeg
+    gives none of the first bytes of an attachment in time
+    (libv2_records.AttachmentTimeout), and when ffprobe gives nothing of a
+    caption window in time (libv2_records.CaptionsTimeout): a record written
     once is never written without the probe that describes its file."""
     raw = rec.ffprobe(str(path))
     if not isinstance(raw, dict):
@@ -68,7 +79,13 @@ def probe_original(path: Path) -> OriginalProbe:
         # what an attachment is can't be told: a record that counted a font
         # as none would let it go with the original
         raise PackageError(f"the original {path.name} gets no record this time: {e}") from e
-    return OriginalProbe(raw=raw, version=rec.ffprobe_version(), heads=heads)
+    try:
+        captions = rec.caption_windows(str(path), raw)
+    except rec.CaptionsTimeout as e:
+        # what its picture carries can't be told: a record that said it
+        # carries no captions would let them go with the original
+        raise PackageError(f"the original {path.name} gets no record this time: {e}") from e
+    return OriginalProbe(raw=raw, version=rec.ffprobe_version(), heads=heads, captions=captions)
 
 
 # ---------------------------------------------------------------- sources
@@ -87,13 +104,14 @@ def source_record(
     holds several episodes covers them as the worker record lists them,
     this item, their holder, first. An attachment the probe gives no role
     by itself is a font in it when its first bytes are a font's signature
-    (probe.heads), as the package then carries it."""
+    (probe.heads), as the package then carries it; its picture keeps the
+    caption windows it was read in (probe.captions)."""
     doc, probe_bytes = rec.source_record(
         lib.source.source_id, original.name, original.stat().st_size, taken_at=now,
         taken_by="packager", library_path=lib.source.library_path or original.name,
         qh1=fixity_qh1, mtime=rec.ts_of_mtime(str(original)),
         probe=probe.raw, probe_version=probe.version, sidecars=sidecars,
-        covers=list(lib.source.covers), heads=probe.heads)
+        covers=list(lib.source.covers), heads=probe.heads, captions=probe.captions)
     return doc, probe_bytes
 
 
@@ -293,4 +311,5 @@ def extra_record(
         and season >= 0 else None,
         origin=origin, probe=probe.raw, probe_version=probe.version, probed_at=now,
         packaged_from=[{"name": original_name, "sizeBytes": original.stat().st_size,
-                        "fixity": {"qh1": fixity_qh1}}], heads=probe.heads)
+                        "fixity": {"qh1": fixity_qh1}}], heads=probe.heads,
+        captions=probe.captions)

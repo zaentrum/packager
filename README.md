@@ -465,21 +465,29 @@ the original's, an encoded one carries those its encoder wrote (the
 transcoder names `-a53cc 1` for every encode), and shaka-packager keeps
 the SEI in every segment. No container or init segment says so, and
 ffprobe's `closed_captions` is no help on its own (7.1 sets it only for a
-stream it decoded a frame of, 9.0 has no such field), so after
-shaka-packager the packager reads each rung in five windows across it and
-looks for the A53 captions FFmpeg's decoder exports with a frame
-(`_closed_captions`). An encoder may write caption data only where there is
-text, so the first frames of a programme whose captions start late carry
-none: each window is the first 48 packets of the segment that holds 10, 30,
-50, 70 or 90 % of the rung's duration, from its start, a keyframe, read
-after the init segment (`concat:`, nothing copied); the windows are read one
-after the other until one shows captions. A rung whose frames carry them is
-`closedCaptions: true` in the manifest and in a v2 record's `package.json`
-(record logic 11), and the package's essence has closed captions when its
-top rung does, so the deletion gate no longer holds an original for
-captions its package carries. A rung none of whose windows shows them says
-nothing, and the package has none; a window that can't be read in time, or
-decodes no frame, says nothing either (logged), which keeps the original.
+stream it decoded a frame of, 9.0 has no such field), so what tells is the
+A53 captions FFmpeg's decoder exports with a frame. An encoder may write
+caption data only where there is text, so the first frames of a programme
+whose captions start late carry none: the original and its package are read
+in windows, window by window. The original's record (record logic 11) keeps
+the windows its picture was read in when it is recorded
+(`libv2_records.caption_windows`: 48 packets from the keyframe at 10, 30,
+50, 70 and 90 % of its duration). After shaka-packager, every rung is read
+at the times of those windows (where the original's record keeps none, at
+the same fractions of the title's duration from its first picture): the
+segments that cover a window, read after the init segment (`concat:`,
+nothing copied) from the first one's start, a keyframe, its frames those
+whose presentation times fall in the window (`_caption_windows_of`). Each
+video rendition of the manifest and of a v2 record's `package.json` keeps
+its windows, `captionWindows: [{at, start, end, frames, captions}]` — a
+window that decoded no frame is `frames: 0, captions: false`, a failed read
+— says `closedCaptions: true` when one shows them, and how far the package's
+times run ahead of the original's (`timestampOffset`: its first picture's
+time less the original's, as ffprobe decodes both). The deletion gate lets
+an original's captions go only where every window of the original that
+shows them overlaps, less that offset, a window of the package's top
+rendition that decoded frames and shows them; a rendition's `closedCaptions`
+alone carries nothing, and a window that can't be read keeps the original.
 
 **Compatibility.** Rendition dirs stay `vN` / `aN`, so the existing
 playback routes serve every rung and both audio groups. `renditions.video[0]`
