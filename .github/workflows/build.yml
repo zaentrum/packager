@@ -31,7 +31,18 @@ jobs:
           chmod +x /usr/local/bin/packager
           packager --version && mkvextract --version && ffmpeg -version | head -1
       - uses: actions/checkout@v4
+      # The schemas repository at the commit the vendored record logic is
+      # (tests/test_libv2_records.py), for the tests to validate the library
+      # trees they write with its validate-library-v2.py; on CI a test that
+      # cannot validate fails rather than skips.
+      - uses: actions/checkout@v4
+        with:
+          repository: zaentrum/schemas
+          ref: 392d01d3b93c7446952e36a7c71dc1987a4685aa
+          path: .schemas
+          persist-credentials: false
       - run: pip install -e '.[dev]'
+      - run: pip install 'jsonschema[format-nongpl]==4.26.0' 'referencing==0.37.0'
       - run: python -m compileall src
       - run: ruff check src
-      - run: pytest
+      - run: ZAENTRUM_SCHEMAS="$GITHUB_WORKSPACE/.schemas" pytest -rs

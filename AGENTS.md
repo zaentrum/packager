@@ -58,6 +58,9 @@ pytest
   and `tests/test_styled_subtitles.py`) with the schemas repository's
   `validate-library-v2.py --check-checksums`, when a checkout of it is beside this one (or `ZAENTRUM_SCHEMAS` names one) and a Python with
   `jsonschema[format-nongpl]` and `referencing` (this one, or `LIBRARY_V2_PYTHON`) runs it.
+  `build.yml` checks the schemas repository out at the commit the vendored record logic is
+  (`tests/test_libv2_records.py`) and installs both, pinned; with `CI` set, a test that
+  cannot validate fails instead of skipping.
 
 ## Run it
 
@@ -82,8 +85,6 @@ each failed connection. No mock server or recorded answers ship; the tests' fake
 
 ## What the tests leave unchecked
 
-- The library v2 validation needs a schemas checkout, which `build.yml` does not make: on its
-  runner the trees the tests write are not validated.
 - No test plays a package in a player, talks to a real broker or catalog, or fetches a token;
   `scripts/backfill_image_subs.py` and `scripts/populate_item_diagnostics.py` have no tests.
 - The image is built only by `image.yml`, on `main`, on tags and when started by hand; no

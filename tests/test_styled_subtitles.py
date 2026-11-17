@@ -27,7 +27,7 @@ from pathlib import Path
 
 import fontmaker
 import pytest
-from test_library_real import Catalog, _catalogs_part, _has_x265, _validator
+from test_library_real import Catalog, _cannot_validate, _catalogs_part, _has_x265, _validator
 
 from packager import libv2_records as rec
 from packager import packager as pk
@@ -284,8 +284,8 @@ def test_the_tree_validates(packaged) -> None:
     cmd = _validator(extras=False)
     package = Path(cmd[-1]) / "package.schema.json" if cmd else None
     if cmd is None or "fonts" not in json.loads(package.read_text())["properties"]:
-        pytest.skip("no schemas checkout with record logic 10's fields, or no Python with "
-                    "jsonschema, to validate with")
+        _cannot_validate("no schemas checkout with record logic 10's fields, or no Python "
+                         "with jsonschema, to validate with")
     out = subprocess.run([*cmd, "--check-checksums", str(lib)], capture_output=True, text=True)
     assert out.returncode == 0, out.stdout + out.stderr
     assert out.stdout.rstrip().endswith("OK"), out.stdout

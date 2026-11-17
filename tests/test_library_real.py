@@ -198,11 +198,19 @@ def _validator(extras: bool, hdr10: bool = False) -> list[str] | None:
     return [python, str(tool), "--schemas", str(schemas)]
 
 
+def _cannot_validate(why: str) -> None:
+    """Skip a validation there is no validator for; on CI (`CI` set), where
+    build.yml checks the schemas repository out for it, fail."""
+    if os.environ.get("CI"):
+        pytest.fail(f"CI: {why} (build.yml's schemas checkout, ZAENTRUM_SCHEMAS)")
+    pytest.skip(why)
+
+
 def _validate(lib: Path, *, extras: bool = False, hdr10: bool = False) -> None:
     cmd = _validator(extras, hdr10)
     if cmd is None:
-        pytest.skip("no schemas checkout with the platform's fields, or no Python with "
-                    "jsonschema, to validate with")
+        _cannot_validate("no schemas checkout with the platform's fields, or no Python with "
+                         "jsonschema, to validate with")
     out = subprocess.run([*cmd, "--check-checksums", str(lib)], capture_output=True, text=True)
     assert out.returncode == 0, out.stdout + out.stderr
     assert out.stdout.rstrip().endswith("OK"), out.stdout

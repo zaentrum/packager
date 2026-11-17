@@ -957,7 +957,9 @@ repository's `validate-library-v2.py --check-checksums` when a checkout
 of it is beside this one (or `ZAENTRUM_SCHEMAS` names one) whose schemas
 know the platform's additive package and extra fields, and a Python with
 `jsonschema[format-nongpl]` and `referencing` can run it (this one, or
-`LIBRARY_V2_PYTHON`). `tests/test_library_modes_real.py` runs each build
+`LIBRARY_V2_PYTHON`); CI checks the schemas repository out at the commit
+the vendored record logic is, and there a test that cannot validate fails
+instead of skipping. `tests/test_library_modes_real.py` runs each build
 mode on such a clip, a takein with `ffmpeg` and `ffprobe` alone, finds no
 name the clip arrived under anywhere in the title's folder or its
 handovers, and validates each tree the same way.
