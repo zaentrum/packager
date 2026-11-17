@@ -97,8 +97,21 @@ import copy, datetime, hashlib, json, os, re, shutil, subprocess, threading, uui
 # opentype, truetype, sfnt), by a font's file name (.ttf .otf .ttc .woff .woff2), or, where neither says
 # so and no picture's MIME type says otherwise, by its first bytes — a font's signature (attachment_role;
 # attachment_heads reads them, and the stream then says it: signature) — in a source and as a package
-# carries it alike, so no font goes uncounted with its original.
-LIBV2_RECORDS = 10
+# carries it alike, so no font goes uncounted with its original. 11: a video rendition whose manifest
+# entry says its own stream carries closed captions (closedCaptions: CEA-608/708 in its SEI, as the
+# packager read them from its frames) says so in its record, and the package's essence has closed
+# captions when its top rendition says so (package_essence), where it had none whatever it carried; a
+# rendition keeps the caption windows it was read in (captionWindows: {at, start, end, frames,
+# captions}) and how far its times run ahead of its original's (timestampOffset), what its video
+# shows, kept for a later day. A manifest that says nothing of them gives the record it gave. A
+# source's picture whose caption windows were read (captions: caption_windows) keeps them
+# (captionWindows), and its essence knows its captions where they tell them (closedCaptionsKnown); one
+# they weren't read of says what the probe says, which can't tell none from not seen. A manifest's scan
+# — what the transcoder made of the picture as far as fields go — is the package's (scan: done, found
+# and how) and its essence's done of it (scan). The deletion gate does not use the package's captions:
+# an original that has closed captions, or whose captions are not known, is kept (closedCaptions);
+# and an original in fields is kept unless the package's scan kept every moment of it (SCAN_RELEASES).
+LIBV2_RECORDS = 11
 
 NS = uuid.uuid5(uuid.NAMESPACE_URL, "https://zaentrum.github.io/schemas/library")
 PACKAGE_DIRS = ("hls", "subs", "trickplay", "trailers")
@@ -150,6 +163,53 @@ class AttachmentTimeout(Exception):
     """attachment_heads got no first bytes of an attachment within HEAD_TIMEOUT. What the attachment is
     can't be told then — a font by its bytes alone is none to a record without them — so a writer records
     no source of the file this time rather than one that may not count a font it holds."""
+
+
+# Closed captions (EIA/CEA-608/708) are in a video stream itself — an A53 cc_data with each picture, in
+# an H.264 or HEVC SEI or an MPEG-2 picture's user data — and nothing in a container says so: ffprobe
+# gives a stream's closed_captions (7.1) only once it has decoded a frame of it, and (9.0) not at all.
+# What tells is the decoder's own reading, the side data it exports with each frame that carries them:
+# caption_windows decodes CAPTION_PACKETS packets of an original's picture in each of five windows
+# across it (CAPTION_WINDOWS, fractions of its own presentation span, picture_span, each from the
+# keyframe the seek lands on), each
+# read within CAPTION_TIMEOUT seconds: an encoder may write caption data only where there is text, so
+# the first frames of a programme whose captions start later carry none. A record keeps each window as
+# caption_window makes it, {at, start, end, frames, captions}: the fraction it is at (0 to 1), the presentation
+# seconds its decoded frames cover, how many were decoded — none: the window could not be read, its
+# captions false says nothing, and a picture with such a window and none that shows captions does not
+# know its captions — and whether one carried captions. A package's renditions are read at the same
+# times, for what their video shows.
+CAPTION_PACKETS = 48
+CAPTION_WINDOWS = (0.1, 0.3, 0.5, 0.7, 0.9)
+# How many packets picture_span reads from the last keyframe for the picture's end: past a group of
+# pictures of any stream; a read that reaches this many did not land near the end.
+SPAN_PACKETS = 2000
+CAPTION_TIMEOUT = 120
+CAPTION_SIDE_DATA = "ATSC A53 Part 4 Closed Captions"
+
+
+class CaptionsTimeout(Exception):
+    """caption_windows got no answer of a window of a picture's frames within CAPTION_TIMEOUT. Whether it carries
+    closed captions can't be told then, so a writer records no source of the file this time rather than
+    one that says it carries none."""
+
+
+# What a package's video is as far as fields go, as the transcoder's contract says it (scan) and the
+# manifest keeps it: what was done (done) — a film at its own frames (inverse-telecine), whole frames as
+# found (progressive), video deinterlaced at the field rate (deinterlaced-field, one frame a field) or
+# at the frame rate (deinterlaced-frame, every second moment dropped), film and video field-matched at
+# the source's rate (field-matched), HEVC field pictures kept as they are (fields-kept), an examination
+# that told nothing (unexamined), or nothing to do (none) — and what the picture was found to be
+# (found). An original in fields goes, by the deletion gate, only with a package whose picture kept
+# its every moment (SCAN_RELEASES).
+SCAN_DONE = ("inverse-telecine", "progressive", "deinterlaced-field", "deinterlaced-frame", "field-matched",
+             "fields-kept", "unexamined", "none")
+SCAN_FOUND = ("fields", "film", "telecine", "mixed", "progressive", "unknown", "field-pictures")
+SCAN_RELEASES = ("inverse-telecine", "progressive", "deinterlaced-field")
+# The words of a scan a record keeps beside done and found, and the counts of the examination (idet).
+SCAN_WORDS = ("judgedBy", "fieldOrder", "order", "orderBy", "frameRate", "filter")
+SCAN_COUNTS = ("frames", "tff", "bff", "progressive", "undetermined", "repeatedTop", "repeatedBottom")
+SCAN_SHARES = ("cadence", "coverage")
 
 
 # ---------------------------------------------------------------- small helpers
@@ -649,15 +709,163 @@ def attachment_heads(path, probe):
     return out
 
 
-def norm_stream(s, head=None):
+def picture_stream(probe):
+    """The stream of a probe a source's essence reads its picture of: the first video stream that is
+    no attached picture (a cover), or None."""
+    return next((s for s in (probe or {}).get("streams") or [] if s.get("codec_type") == "video"
+                 and not (s.get("disposition") or {}).get("attached_pic") and isinstance(s.get("index"), int)),
+                None)
+
+
+def seconds(v):
+    """A time ffprobe gives ('12.345000'), as seconds, or None."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def caption_window(at, frames, where):
+    """One window of a picture as a record keeps it, {at, start, end, frames, captions}, from the frames
+    ffprobe decoded of it (-show_frames, best_effort_timestamp_time or pts_time, duration_time and the
+    side data): at, the fraction of the picture's span it is at (0 to 1; this module reads it at
+    CAPTION_WINDOWS, a reader may read its start, 0, too); start and end, the
+    presentation seconds its frames cover, the first one's time to the last one's end, rounded to the
+    millisecond; frames, how many were decoded; captions, whether one exports A53 captions. A window
+    that decoded none could not be read: it covers its point, where (seconds), alone, and its captions
+    false says nothing — no frames: it failed, never one without them, and a picture with such a window
+    and none that shows captions does not know its captions (source_essence)."""
+    spans = []
+    for f in frames:
+        t = seconds(f.get("best_effort_timestamp_time")) if f.get("best_effort_timestamp_time") not in (None, "N/A") \
+            else seconds(f.get("pts_time"))
+        if t is not None:
+            spans.append((t, t + (seconds(f.get("duration_time")) or 0.0)))
+    if not frames or not spans:
+        point = round(float(where or 0.0), 3)
+        return {"at": at, "start": point, "end": point, "frames": 0, "captions": False}
+    return {"at": at, "start": round(min(a for a, _ in spans), 3), "end": round(max(b for _, b in spans), 3),
+            "frames": len(frames),
+            "captions": any(x.get("side_data_type") == CAPTION_SIDE_DATA for f in frames for x in f.get("side_data_list") or [])}
+
+
+def caption_windows_of(windows):
+    """The caption windows a manifest or a reading gives, as a record keeps them (caption_window's
+    shape), in their order; None for anything that is no list. A window that decoded no frame and says
+    nothing of captions (null, as a reader may write a failed window) is kept as one that could not be
+    read, captions false. A window at no fraction from 0 to 1, without its times or its count, that says
+    nothing of captions of frames it decoded, or that shows captions of no frame, is left out."""
+    if not isinstance(windows, list):
+        return None
+    out = []
+    for w in windows:
+        if not isinstance(w, dict):
+            continue
+        at, start, end = seconds(w.get("at")), seconds(w.get("start")), seconds(w.get("end"))
+        frames, captions = w.get("frames"), w.get("captions")
+        if frames == 0 and captions is None:
+            captions = False
+        if at is None or not 0 <= at <= 1 or start is None or end is None or end < start \
+                or not isinstance(frames, int) or isinstance(frames, bool) or frames < 0 \
+                or not isinstance(captions, bool) or (frames == 0 and captions):
+            continue
+        out.append({"at": round(at, 3), "start": round(start, 3), "end": round(end, 3), "frames": frames,
+                    "captions": captions})
+    return out
+
+
+def picture_span(path, probe, picture):
+    """The presentation span of the stream picture (a probe's stream) of the file at path, (start, end)
+    in seconds: from its start_time (the file's where the stream gives none) to the end of its last
+    packet, read from the last keyframe a seek past its end lands on, no frame decoded — where a
+    container counts its duration from 0 rather than from its start (Matroska), the probe's duration is
+    no end. Where that read fails, or does not reach the file's end, the start plus the probe's duration.
+    None without a start and a duration."""
+    fmt = (probe or {}).get("format") or {}
+    start = seconds(picture.get("start_time"))
+    if start is None:
+        start = seconds(fmt.get("start_time")) or 0.0
+    duration = seconds(picture.get("duration")) or seconds(fmt.get("duration"))
+    if not duration or duration <= 0:
+        return None
+    guess = (start, start + duration)
+    try:
+        p = subprocess.run(["ffprobe", "-v", "error", "-select_streams", str(picture["index"]),
+                            "-read_intervals", f"{start + duration + 60:.3f}%+#{SPAN_PACKETS}", "-show_entries",
+                            "packet=pts_time,duration_time", "-of", "json", path],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=CAPTION_TIMEOUT)
+        packets = json.loads(p.stdout or b"{}").get("packets") or []
+    except subprocess.TimeoutExpired:
+        raise CaptionsTimeout(f"ffprobe gave nothing of the end of stream {picture['index']} of {path} within "
+                              f"{CAPTION_TIMEOUT} s")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return guess
+    ends = [t + (seconds(x.get("duration_time")) or 0.0) for x in packets if isinstance(x, dict)
+            and (t := seconds(x.get("pts_time"))) is not None]
+    if not ends or len(packets) >= SPAN_PACKETS or max(ends) <= start:
+        return guess
+    return start, round(max(ends), 3)
+
+
+def caption_windows(path, probe):
+    """The caption windows of the picture of the file at path, by its stream index: {index: [window, ...]}
+    for the stream its essence reads (picture_stream), one window (caption_window) at each of
+    CAPTION_WINDOWS of its own presentation span (picture_span: start + at x (end - start)), each the
+    CAPTION_PACKETS packets ffprobe decodes from the keyframe its seek to that point lands on; a window
+    ffprobe fails on or decodes no frame of is kept as one that could not be read. Empty — nothing told
+    — for a file without such a stream, without ffprobe, or of no known span. Nothing is written. An
+    ffprobe that gives no answer of a window within CAPTION_TIMEOUT seconds is killed, and
+    CaptionsTimeout raised: what the picture carries can't be told."""
+    v = picture_stream(probe)
+    if v is None or not shutil.which("ffprobe"):
+        return {}
+    span = picture_span(path, probe, v)
+    if span is None:
+        return {}
+    origin, end = span
+    out = []
+    for at in CAPTION_WINDOWS:
+        where = origin + at * (end - origin)
+        try:
+            p = subprocess.run(["ffprobe", "-v", "error", "-select_streams", str(v["index"]),
+                                "-read_intervals", f"{where:.3f}%+#{CAPTION_PACKETS}", "-show_frames",
+                                "-show_entries", "frame=best_effort_timestamp_time,pts_time,duration_time:"
+                                                 "frame_side_data=side_data_type", "-of", "json", path],
+                               stdin=subprocess.DEVNULL, capture_output=True, timeout=CAPTION_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise CaptionsTimeout(f"ffprobe gave nothing of the frames of stream {v['index']} of {path} from "
+                                  f"{where:.3f} s within {CAPTION_TIMEOUT} s")
+        except (OSError, subprocess.SubprocessError):
+            return {}
+        try:
+            frames = [f for f in json.loads(p.stdout or b"{}").get("frames") or [] if isinstance(f, dict)]
+        except ValueError:
+            frames = []
+        out.append(caption_window(at, frames, where))
+    return {v["index"]: out}
+
+
+def picture_windows(record):
+    """The caption windows a source record's picture keeps (its first video stream that is no attached
+    picture), or None where it keeps none."""
+    picture = next((x for x in (record or {}).get("streams") or []
+                    if x.get("type") == "video" and not (x.get("dispositions") or {}).get("attachedPic")), None)
+    return caption_windows_of((picture or {}).get("captionWindows"))
+
+
+def norm_stream(s, head=None, captions=None):
     """One stream of a probe as a record keeps it. head is an attachment's first bytes, where they were
-    read (attachment_heads): what its role is told by when its MIME type and its name say nothing."""
+    read (attachment_heads): what its role is told by when its MIME type and its name say nothing.
+    captions are a video stream's caption windows, where they were read (caption_windows): the stream
+    keeps them (captionWindows), and carries closed captions when one shows them; without them only a
+    probe that decoded a frame of it says it carries them, and one that says none may not have looked."""
     t = s.get("codec_type")
     tags = s.get("tags") or {}
     language, raw = lang(tags.get("language"))
     base = {"index": s["index"], "codec": s.get("codec_name"), "language": language, "languageRaw": raw,
             "title": text(tags.get("title")), "dispositions": dispositions(s)}
     if t == "video":
+        windows = caption_windows_of(captions)
         base.update({
             "type": "video", "profile": s.get("profile"),
             "level": s.get("level") if isinstance(s.get("level"), (int, float)) and s.get("level") >= 0 else None,
@@ -668,9 +876,12 @@ def norm_stream(s, head=None):
             "fieldOrder": s.get("field_order"), "bitrate": num(s.get("bit_rate")),
             "colour": {"primaries": s.get("color_primaries"), "transfer": s.get("color_transfer"),
                        "matrix": s.get("color_space"), "range": s.get("color_range")},
-            "hdr": hdr_info(s), "stereo3d": stereo3d(s), "closedCaptions": bool(s.get("closed_captions")),
+            "hdr": hdr_info(s), "stereo3d": stereo3d(s),
+            "closedCaptions": bool(s.get("closed_captions")) or any(w["captions"] for w in windows or []),
             "encoder": text(tags.get("ENCODER") or tags.get("encoder")),
         })
+        if windows is not None:
+            base["captionWindows"] = windows
         return base
     if t == "audio":
         codec = (s.get("codec_name") or "").lower()
@@ -735,6 +946,12 @@ def track_essence(audio, subs, closed_captions):
 
 
 def source_essence(streams, chapters):
+    """What a file carries, reduced to what a package can fail to carry. Its closed captions are its
+    first picture's, and known (closedCaptionsKnown) only where that stream's caption windows tell
+    them — one shows them, or every one was read and none does: of a stream they weren't read of, or
+    of one a window of which could not be read (no frames, captions false) and none shows them,
+    closedCaptions false says nothing was seen, not that there is nothing, and the deletion gate keeps
+    the original for it."""
     v = [x for x in streams if x["type"] == "video" and not x["dispositions"].get("attachedPic")]
     a = [x for x in streams if x["type"] == "audio"]
     sub = [x for x in streams if x["type"] == "subtitle"]
@@ -757,7 +974,31 @@ def source_essence(streams, chapters):
         "chapters": bool(chapters),
         "commentaryTracks": sum(1 for x in a if x.get("purpose") == "commentary"),
         **track_essence(a, sub, v0.get("closedCaptions", False)),
+        **({"closedCaptionsKnown": True} if (w := v0.get("captionWindows"))
+           and (any(x["captions"] for x in w) or all(x["frames"] > 0 for x in w)) else {}),
     }
+
+
+def scan_block(scan):
+    """A package's scan as its record keeps it, from the manifest's — the transcoder's contract's, as the
+    packager copies it: what was done (done, one of SCAN_DONE) and found (found, one of SCAN_FOUND), the
+    words of how (SCAN_WORDS: what judged it, the field order it was marked with and the one taken and
+    what named it, the package's frame rate, the filters), each a text or null, and the counts of the
+    examination (idet: SCAN_COUNTS and SCAN_SHARES), null without one. None for a manifest without one,
+    and for one whose done or found is no word the record knows."""
+    if not isinstance(scan, dict) or scan.get("done") not in SCAN_DONE or scan.get("found") not in SCAN_FOUND:
+        return None
+    out = {"found": scan["found"], "done": scan["done"], **{k: text(scan.get(k)) for k in SCAN_WORDS}}
+    idet = scan.get("idet")
+    if isinstance(idet, dict):
+        counts = {k: idet.get(k) for k in SCAN_COUNTS}
+        shares = {k: idet.get(k) for k in SCAN_SHARES}
+        ok = all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in counts.values()) \
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in shares.values())
+        out["idet"] = {**counts, **{k: float(v) for k, v in shares.items()}} if ok else None
+    else:
+        out["idet"] = None
+    return out
 
 
 def package_essence(man, source=None, streams=None):
@@ -769,6 +1010,16 @@ def package_essence(man, source=None, streams=None):
     which in PQ, the top one among them, says its init segment carries the original's (hdr10Metadata),
     encoded or not. One in PQ that says nothing of it — one whose init segment could not take it — and
     anything else re-encoded is taken to have lost it.
+
+    A package has closed captions when its top video rendition says its own stream carries them
+    (closedCaptions): CEA-608/708 captions in the stream's SEI, as the packager read them from the
+    rendition's frames — a copy of the original's stream keeps the original's, an encode those
+    its encoder wrote. The top rendition is the package's full picture, as a source's essence has the
+    captions of its first video stream: what a lower rung lacks, the top one still carries. A top
+    rendition that says nothing of them has none, and neither has the package.
+
+    A package whose manifest says what its picture is as far as fields go (scan, scan_block) has what
+    was done of it (scan: its done), and none says nothing of it.
 
     A package has styled subtitles when a subtitle keeps its styled original (styled), and fonts when
     it lists a font file (fonts). Where the source's streams are given — a source record's streams —
@@ -808,7 +1059,8 @@ def package_essence(man, source=None, streams=None):
         "fonts": carried(fonts, lambda x: x.get("type") == "attachment" and x.get("role") == "font"),
         "chapters": False,
         "commentaryTracks": sum(1 for x in auds if x.get("purpose") == "commentary"),
-        **track_essence(auds, subs, False),
+        **track_essence(auds, subs, v0.get("closedCaptions") is True),
+        **({"scan": scan["done"]} if (scan := scan_block(man.get("scan"))) else {}),
     }
 
 
@@ -882,7 +1134,7 @@ def losses_against(src, pkg_essence, streams, renditions, subs):
 
 # What an original carries that a package can fail to carry, in the terms an original-deleted event
 # accepts. 'chapters' is not here (the version keeps the marks, not the file) and neither is
-# 'interlaced' (a deinterlaced picture is not a poorer one).
+# 'interlaced': an original in fields is lost by the package's scan, not by a flag (deletion_gate).
 LOSS_FLAGS = ("surround", "losslessAudio", "objectAudio", "hdr10Metadata", "dolbyVision", "stereo3d",
               "imageSubtitles", "styledSubtitles", "fonts", "closedCaptions")
 LOSS_COUNTS = ("maxAudioChannels", "maxVideoHeight", "videoBitDepth", "subtitleTracks",
@@ -893,11 +1145,22 @@ LOSS_LANGUAGES = ("audioLanguages", "subtitleLanguages", "sdhSubtitleLanguages",
 def deletion_gate(sources, package):
     """What deleting a version's originals costs: the essence of its sources minus that of its
     package, sorted. Nothing records it, so every reader computes it the same way, and an
-    original-deleted event accepts no more than it."""
+    original-deleted event accepts no more than it.
+
+    The deletion gate does not use the package's captions: an original that has closed captions, or
+    whose captions are not known (no closedCaptionsKnown: its picture's windows were never read, or one
+    could not be read and none shows captions, as of every source recorded before record logic 11), is
+    kept — 'closedCaptions' —, whatever its package carries. An original in fields (interlaced) is lost —
+    'interlaced' — unless its package's scan says its picture kept every moment of it (SCAN_RELEASES):
+    no scan, a frame-rate deinterlace or fields kept as they are keep it."""
     lost = set()
     for key in LOSS_FLAGS:
         if any(s.get(key) for s in sources) and not package.get(key):
             lost.add(key)
+    if any(s.get("closedCaptions") or not s.get("closedCaptionsKnown") for s in sources):
+        lost.add("closedCaptions")
+    if any(s.get("interlaced") for s in sources) and package.get("scan") not in SCAN_RELEASES:
+        lost.add("interlaced")
     for key in LOSS_COUNTS:
         had = [s[key] for s in sources if s.get(key) is not None]
         kept = package.get(key)
@@ -971,14 +1234,16 @@ def fidelity(streams, container):
     return {"class": "derivative" if evidence else "unknown", "fingerprint": fingerprint, "evidence": evidence}
 
 
-def probed(probe, heads=None):
+def probed(probe, heads=None, captions=None):
     """What a probe found in a file, in the terms a source record and an extra share: its container,
     every stream, whether it was already a re-encode, and its essence. The container's title tag is
     not among them, in any case: it routinely names where the file came from. heads are the first bytes
-    of the attachments the probe gives no role by itself, by stream index (attachment_heads)."""
+    of the attachments the probe gives no role by itself, by stream index (attachment_heads), and
+    captions a picture's caption windows, by stream index (caption_windows)."""
     fmt = probe.get("format") or {}
     tags = {k: text(v) for k, v in (fmt.get("tags") or {}).items() if text(v) and str(k).lower() != "title"}
-    streams = [norm_stream(s, (heads or {}).get(s.get("index"))) for s in probe.get("streams") or []]
+    streams = [norm_stream(s, (heads or {}).get(s.get("index")), (captions or {}).get(s.get("index")))
+               for s in probe.get("streams") or []]
     infer_forced_by_size(streams)
     duration = fmt.get("duration")
     container = {"format": fmt.get("format_name") or "",
@@ -1080,7 +1345,8 @@ def sidecar_entry(source_id, n, path, arrival_name, language=None, forced=False)
 
 
 def source_record(source_id, name, size_bytes, *, taken_at, taken_by, library_path, qh1=None, mtime=None,
-                  probe=None, probe_version=None, sidecars=(), note=None, covers=(), heads=None):
+                  probe=None, probe_version=None, sidecars=(), note=None, covers=(), heads=None,
+                  captions=None):
     """sources/<sourceId>/source.json for one original, and the bytes of the ffprobe.json written
     beside it (None without a probe). Returns (record, probe bytes).
 
@@ -1100,7 +1366,12 @@ def source_record(source_id, name, size_bytes, *, taken_at, taken_by, library_pa
 
     heads are the first bytes of the attachments the probe gives no role by itself, by stream index, as
     attachment_heads() reads them from the original: an attachment that is a font by its signature alone
-    is one in the record, and its stream says so (signature)."""
+    is one in the record, and its stream says so (signature).
+
+    captions are the original's picture's caption windows, by stream index, as caption_windows() reads
+    them, five across it: the stream keeps them (captionWindows), and the essence knows its captions
+    where they tell them (closedCaptionsKnown). Without them, as the probe alone says them — only one
+    that decoded a frame says the stream carries them — the record can't tell none from not seen."""
     if qh1 is None and not text(note):
         raise ValueError("a source record without the original's fixity needs a note that says why it has none")
     covers = [str(c) for c in covers or ()]
@@ -1120,7 +1391,7 @@ def source_record(source_id, name, size_bytes, *, taken_at, taken_by, library_pa
     rec["labels"] = labels(name, folder)
     raw = None
     if probe:
-        facts = probed(probe, heads)
+        facts = probed(probe, heads, captions)
         raw = json_bytes(scrub_probe(probe, file["name"]))
         rec.update(container=facts["container"], fidelity=facts["fidelity"], streams=facts["streams"],
                    sidecars=list(sidecars), covers=covers, essence=facts["essence"],
@@ -1197,6 +1468,14 @@ def video_rendition(v):
             out[key] = text(v[key])
     if v.get("hdr10Metadata") is True:
         out["hdr10Metadata"] = True
+    if v.get("closedCaptions") is True:
+        out["closedCaptions"] = True
+    windows = caption_windows_of(v.get("captionWindows"))
+    if windows is not None:
+        out["captionWindows"] = windows
+    offset = v.get("timestampOffset")
+    if isinstance(offset, (int, float)) and not isinstance(offset, bool):
+        out["timestampOffset"] = round(float(offset), 3)
     return out
 
 
@@ -1386,12 +1665,16 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
     audio rendition likewise (audio_purpose): a commentary (commentary), for the visually impaired
     (visualImpaired), then its title. A video rendition whose init segment carries the original's
     HDR10 static metadata (hdr10Metadata) says so, and the package's essence has it when the source's
-    has and every rendition in PQ, the top one among them, says so (package_essence). A subtitle that
+    has and every rendition in PQ, the top one among them, says so (package_essence). A video rendition
+    whose own stream carries closed captions (closedCaptions) says so, and the package's essence has
+    them when its top rendition says so (package_essence). A subtitle that
     keeps its styled original names it (styled_original), and the font files the manifest lists are the
     record's fonts (font_file), listed only when there are any — each only when it is one of the files
     listed, the package's own, or it is left out with a note; the package's essence has styled
     subtitles and fonts when it carries them for every stream of the source that has them
-    (package_essence). The playlist flags a reader could
+    (package_essence). What the manifest says the picture is as far as fields go (scan) is the record's
+    scan (scan_block), and the essence has what was done of it, left out where it says nothing the
+    record can read. The playlist flags a reader could
     not follow are normalised, each with a note: a second default audio rendition is not one, a
     package with none has its first, a forced subtitle is never the default, and of the rest only
     the first default is one."""
@@ -1440,7 +1723,8 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
     if surround:
         renditions["audioSurround"] = surround
     streams = (source or {}).get("streams") or []
-    pkg_essence = package_essence({"renditions": renditions, "subtitles": subs, "fonts": fonts},
+    scan = scan_block(manifest.get("scan"))
+    pkg_essence = package_essence({"renditions": renditions, "subtitles": subs, "fonts": fonts, "scan": scan},
                                   (source or {}).get("essence"), streams)
     if streams:
         losses = losses_against(source.get("essence") or {}, pkg_essence, streams, renditions, subs)
@@ -1459,6 +1743,8 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
     hls = hls_block(manifest.get("hls"))
     if hls:
         doc["hls"] = hls
+    if scan:
+        doc["scan"] = scan
     doc.update(trailers=[],
                sizeBytes=sum(size for rel, _, size in listed if rel.split("/", 1)[0] in PACKAGE_DIRS),
                peakBandwidthBps=peak_bandwidth_bps,
@@ -1470,14 +1756,15 @@ def package_record(package_id, manifest, listed, *, source=None, role="canonical
 # ---------------------------------------------------------------- extras/<extraId>/extra.json
 def extra_record(extra_id, *, created_at, created_by, kind, title, localized_titles=None, language=None,
                  season_number=None, origin=None, probe=None, probe_version=None, probed_at=None,
-                 original_files=(), originals=(), packaged_from=(), heads=None):
+                 original_files=(), originals=(), packaged_from=(), heads=None, captions=None):
     """extras/<extraId>/extra.json: what the extra is, as the catalog took it in, and what a probe of
     its original found. An extra of the platform keeps no original — it is deleted once the package is
     recorded — so original_files and originals stay empty, and packaged_from describes the original the
     package was made from: [{name, sizeBytes, fixity: {qh1}}], each named here as the library names an
     original, library_original_name() of the name it arrived under — the nth of several original-<n> —
     whatever name it is given. Without a language, the language spoken in its first audio track is the
-    extra's. heads, as a source record's (source_record), are its attachments' first bytes."""
+    extra's. heads and captions, as a source record's (source_record), are its attachments' first bytes
+    and whether its picture's frames carry closed captions."""
     doc = {"schema": "zaentrum.library.extra/2", "extraId": extra_id, "createdAt": created_at,
            "createdBy": created_by, "kind": kind, "title": title, "localizedTitles": dict(localized_titles or {}),
            "language": language, "runtimeMs": None}
@@ -1491,7 +1778,7 @@ def extra_record(extra_id, *, created_at, created_by, kind, title, localized_tit
     if origin:
         doc["origin"] = origin
     if probe:
-        facts = probed(probe, heads)
+        facts = probed(probe, heads, captions)
         spoken = [x["language"] for x in facts["streams"] if x["type"] == "audio" and x.get("language")]
         doc.update(language=language or (spoken[0] if spoken else None), runtimeMs=facts["container"]["durationMs"],
                    **facts, probe={"tool": "ffprobe", "version": probe_version, "at": probed_at or created_at,

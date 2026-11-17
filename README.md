@@ -496,6 +496,40 @@ the metadata while one of them lacks it. The init segment of an SDR rung,
 an HLG one and every rung of an original without the metadata is
 shaka-packager's, byte for byte.
 
+**Closed captions.** Closed captions (EIA/CEA-608/708) are in the video
+stream itself: an A53 `cc_data` SEI with each picture. A copied rung keeps
+the original's, an encoded one carries those its encoder wrote (the
+transcoder names `-a53cc 1` for every encode), and shaka-packager keeps
+the SEI in every segment. No container or init segment says so, and
+ffprobe's `closed_captions` is no help on its own (7.1 sets it only for a
+stream it decoded a frame of, 9.0 has no such field), so what tells is the
+A53 captions FFmpeg's decoder exports with a frame. An encoder may write
+caption data only where there is text, so the first frames of a programme
+whose captions start late carry none: the original and its package are read
+in windows. The original's record (record logic 11) keeps the windows its
+picture was read in when it is recorded (`libv2_records.caption_windows`:
+48 packets from the keyframe at 10, 30, 50, 70 and 90 % of its picture's own
+presentation span, its first picture to the end of its last packet — not of
+the file's duration, which Matroska counts from 0 even where the picture
+starts later); a window that decoded no frame is `frames: 0, captions:
+false`, and a picture with such a window and none that shows captions does
+not know its captions, so it is never read as having none. The deletion
+gate does not use the package's captions: an original with closed
+captions, or with captions not known, is kept (ADR-0015). What the
+package's video shows is kept for a later day: after shaka-packager, every
+rung is read at the times of the original's windows (where the original's
+record keeps none, at the same fractions of the top rendition's own span,
+its first picture to the end of its last segment) — the segments that cover
+a window, read after the init segment (`concat:`, nothing copied) from the
+first one's start, a keyframe, its frames those whose presentation times
+fall in the window, a frame that starts where it ends none of them
+(`_caption_windows_of`) —, and each video rendition of the manifest and of a
+v2 record's `package.json` keeps its windows (`captionWindows: [{at, start,
+end, frames, captions}]`), says `closedCaptions: true` when one shows them,
+and how far the package's times run ahead of the original's
+(`timestampOffset`: its first picture's time less the original's, as
+ffprobe decodes both).
+
 **Compatibility.** Rendition dirs stay `vN` / `aN`, so the existing
 playback routes serve every rung and both audio groups. `renditions.video[0]`
 is still the top rung. Before a ladder is enabled, the playback service

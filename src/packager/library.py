@@ -514,6 +514,7 @@ def _stage_version(
     sid, vid = lib.source.source_id, lib.build.version_id
     vstage = staging / "version"
     vstage.mkdir()
+    probe = records.probe_original(Path(item.path))
     built = build_package(
         item.id, item.path, item.type, vstage, inputs=inputs, options=options,
         language_whitelist=language_whitelist, keep_original_if_single=keep_original_if_single,
@@ -522,8 +523,8 @@ def _stage_version(
         tmdb_id=item.tmdb_id, track_languages=item.track_languages,
         subtitle_files=item.subtitle_files, codecs=HEVC_ONLY,
         subtitle_folders=(Path(lib.source.record_dir),),
+        caption_windows=_caption_windows(Path(lib.source.record_dir), probe),
     )
-    probe = records.probe_original(Path(item.path))
     now = utc_now()
     source, copies, staged_source = _source_of(item, lib, staging, probe, fixity, now)
     sidecars = {sub_id: f"sources/{sid}/{c.name}"
@@ -552,6 +553,18 @@ def _stage_version(
     return Placed(vdir, body, package, _handover(item, package, copies, sid),
                   original=vdir / lib.build.original_name if lib.build.original_name else None,
                   stereo=built.stereo)
+
+
+def _caption_windows(sdir: Path, probe: records.OriginalProbe) -> list[dict[str, Any]] | None:
+    """The windows the original's closed captions were read in, at which
+    its package is read: its source record's where it is recorded (None
+    where that keeps none), else those its probe read now."""
+    if (sdir / SUMS).is_file():
+        try:
+            return rec.picture_windows(json.loads((sdir / records.SOURCE_RECORD).read_text()))
+        except (OSError, ValueError):
+            return None
+    return probe.windows()
 
 
 def _source_of(
@@ -646,6 +659,7 @@ def _add_package(
     vstage = staging / "version"
     try:
         vstage.mkdir()
+        probe = records.probe_original(original)
         built = build_package(
             item.id, item.path, item.type, vstage, inputs=inputs, options=options,
             language_whitelist=language_whitelist,
@@ -654,9 +668,8 @@ def _add_package(
             season_number=item.season_number, episode_number=item.episode_number,
             tmdb_id=item.tmdb_id, track_languages=item.track_languages,
             subtitle_files=item.subtitle_files, codecs=HEVC_ONLY,
-            subtitle_folders=(sdir,),
+            subtitle_folders=(sdir,), caption_windows=_caption_windows(sdir, probe),
         )
-        probe = records.probe_original(original)
         now = utc_now()
         source, copies = _recorded_source(sdir, sid)
         sidecars = {sub_id: f"sources/{sid}/{c.name}"
@@ -1184,12 +1197,13 @@ def package_extra(
     try:
         xstage = staging / "extra"
         xstage.mkdir()
+        probe = records.probe_original(original)
         built = build_package(
             extra.id, extra.path, "extra", xstage, inputs=inputs, options=options,
             language_whitelist=language_whitelist,
             keep_original_if_single=keep_original_if_single, title=extra.title,
-            track_languages=track_languages, trickplay=False, codecs=HEVC_ONLY)
-        probe = records.probe_original(original)
+            track_languages=track_languages, trickplay=False, codecs=HEVC_ONLY,
+            caption_windows=probe.windows())
         now = utc_now()
         doc = records.extra_record(extra.id, lib, original, str(named.get("name") or original.name),
                                    fixity, probe, now)

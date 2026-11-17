@@ -12,7 +12,11 @@ Design rules:
   hevc/h264 (the transcoder produced or chose them); anything else fails
   the package job. The init segment of every HEVC rung in PQ gets the
   original's HDR10 static metadata, which shaka-packager leaves out
-  (hdr10.py).
+  (hdr10.py). Every rendition is read for closed captions (CEA-608/708 in
+  its SEI, which shaka-packager keeps) in windows at the original's
+  (`captionWindows`), one that carries them says so (`closedCaptions`), and
+  each says how far its times run ahead of the original's
+  (`timestampOffset`).
 * N video renditions -> one master with one variant per rendition and
   audio group, plus one I-frame playlist per rendition. The master is
   assembled by `packager.hls` from shaka's media playlists.
@@ -696,6 +700,7 @@ def build_package(
     manifest_extra: dict[str, Any] | None = None,
     codecs: tuple[str, ...] = VIDEO_CODECS,
     subtitle_folders: tuple[Path, ...] = (),
+    caption_windows: list[dict[str, Any]] | None = None,
 ) -> Built:
     """Build one package into `stage`, a folder the caller made and owns:
     hls/ (the media playlists, the master), subs/ and trickplay/. Writes
@@ -703,8 +708,10 @@ def build_package(
     passes them (see there). `codecs` are the video codecs a rendition may
     have: v0 in another fails the run, a lower rung in another is left out.
     `subtitle_folders` are where else than beside the source its subtitle
-    files may be (_subtitle_files). Raises on any failure, leaving what it
-    wrote."""
+    files may be (_subtitle_files). `caption_windows` are the windows the
+    original's closed captions were read in (its source record's), at which
+    every video rendition is read (_read_captions); None: at the title's
+    fractions. Raises on any failure, leaving what it wrote."""
     src = inputs.primary.path
     segment_seconds = inputs.segment_seconds or options.segment_seconds
     probe = _ffprobe(src)
@@ -818,6 +825,10 @@ def build_package(
             subtitle_meta=subtitle_meta,
             hdr10_metadata=_hdr10_metadata(inputs, probe, Path(source_path), videos),
         )
+
+    # Each video rendition's closed captions, read at the original's windows.
+    _read_captions(stage / "hls", video_meta, Path(source_path), caption_windows,
+                   probe.duration_ms / 1000)
 
     # Trickplay runs against the original source — only 1 frame
     # per TRICKPLAY_INTERVAL_SEC, so HEVC decode cost is small
@@ -4373,6 +4384,197 @@ def _carries_hdr10(stream: dict[str, Any]) -> bool:
     """Whether a rung's init segment takes HDR10 static metadata: an HEVC
     stream in PQ. Not an SDR one (a tone-mapped rung), not an HLG one."""
     return stream.get("codec_name") == "hevc" and _video_range(stream) == "PQ"
+
+
+# Closed captions (EIA/CEA-608/708) ride in a video stream itself: an A53
+# cc_data SEI (ITU-T T.35, "GA94") with each picture, which a copy of the
+# stream keeps and an encode carries when its encoder writes it (the
+# transcoder's -a53cc 1). Nothing in a container says so: ffprobe 7.1 gives
+# a stream's closed_captions only once it has decoded a frame of it, and 9.0
+# gives none, so the decoder's own reading is what tells — the side data it
+# exports with each frame whose SEI carries them. An encoder may write
+# caption data only where there is text, so a programme whose captions start
+# late has none in its first frames: every rendition is read in windows, at
+# the times its original's were read in (its source record's caption
+# windows), or where it keeps none at CLOSED_CAPTION_WINDOWS of the top
+# rendition's own presentation span, its first picture to the end of its
+# last segment, each the segments that cover the window read after the init
+# segment and filtered by their frames' presentation times
+# (_caption_windows_of), each with how far the package's times run ahead of
+# the original's (timestampOffset, _caption_offset): what the package's video
+# shows, kept for a later day. The deletion gate does not use the package's
+# captions: an original with closed captions, or whose captions are not
+# known, is kept (ADR-0015).
+CLOSED_CAPTION_WINDOWS = rec.CAPTION_WINDOWS
+CLOSED_CAPTION_PACKETS = rec.CAPTION_PACKETS
+CLOSED_CAPTION_TIMEOUT = 120
+# How long a window is where nothing gives its end: CLOSED_CAPTION_PACKETS
+# frames at 24 a second.
+CLOSED_CAPTION_SPAN = 2.0
+# How far a frame's time may fall short of a window's edge and still be on
+# it: half the millisecond the times are kept to.
+_EDGE = 0.0005
+_FRAME_ENTRIES = ("frame=best_effort_timestamp_time,pts_time,duration_time:"
+                  "frame_side_data=side_data_type")
+
+
+def _frames_of(target: str, *args: str) -> list[dict[str, Any]] | None:
+    """The video frames ffprobe decodes of `target` (a file, or ffmpeg's
+    concat protocol over an init segment and segments), with their times
+    and side data; None, logged, when it fails or can't be read in
+    CLOSED_CAPTION_TIMEOUT seconds."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", *args, "-show_frames", "-show_entries", _FRAME_ENTRIES,
+             "-of", "json", target],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            stdin=subprocess.DEVNULL, timeout=CLOSED_CAPTION_TIMEOUT, check=True,
+        ).stdout
+        frames = json.loads(out or "{}").get("frames") or []
+    except (OSError, ValueError, AttributeError, subprocess.SubprocessError) as e:
+        log.warning("packager.closed_captions.unread", target=target[:300], error=str(e)[:300])
+        return None
+    return [f for f in frames if isinstance(f, dict)]
+
+
+def _time_of(frame: dict[str, Any]) -> float | None:
+    best = frame.get("best_effort_timestamp_time")
+    return rec.seconds(best) if best not in (None, "N/A") else rec.seconds(frame.get("pts_time"))
+
+
+def _first_time(target: str, *select: str) -> float | None:
+    """The presentation time of the first picture ffprobe decodes of
+    `target`'s video (its first eight packets: a decoder's delay), or None."""
+    frames = _frames_of(target, *select, "-read_intervals", "%+#8")
+    times = [t for t in (_time_of(f) for f in frames or []) if t is not None]
+    return min(times) if times else None
+
+
+def _concat(*parts: Path) -> str | None:
+    """ffmpeg's concat protocol over these files, or None for a path it
+    can't take (one with '|')."""
+    if any("|" in str(p) for p in parts):
+        return None
+    return "concat:" + "|".join(str(p) for p in parts)
+
+
+def _rendition_start(playlist: Path) -> tuple[Path, list[tuple[float, float, Path]]] | None:
+    """A rendition's init segment and its segments, each with the
+    presentation seconds it covers: its first picture's time (read from its
+    first segment) on, by the EXTINF durations. None for a playlist that
+    can't be read, names no init segment or no segment, or whose first
+    picture can't be read."""
+    try:
+        init, segments = hls.media_segments(playlist)
+    except OSError:
+        return None
+    if init is None or not segments:
+        return None
+    first = _concat(playlist.parent / init, playlist.parent / segments[0][1])
+    at = _first_time(first, "-select_streams", "v:0") if first else None
+    if at is None:
+        return None
+    spans = []
+    for duration, uri in segments:
+        spans.append((at, at + duration, playlist.parent / uri))
+        at += duration
+    return playlist.parent / init, spans
+
+
+def _caption_offset(original: Path, playlist: Path
+                    ) -> tuple[tuple[float, float] | None, float | None]:
+    """(the top rendition's presentation span, its first picture to the end
+    of its last segment; the package's timestampOffset): how far the
+    package's presentation times run ahead of the original's — its first
+    picture's time in the top rendition less its time in the original, as
+    ffprobe decodes both — rounded to the millisecond. None of either that
+    can't be read: an original that is gone, or one ffprobe can't open."""
+    start = _rendition_start(playlist)
+    span = (start[1][0][0], start[1][-1][1]) if start else None
+    first = span[0] if span else None
+    try:
+        picture = _ffprobe(original).video_index if original.exists() else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        picture = None
+    there = (_first_time(str(original), "-select_streams", str(picture))
+             if picture is not None else None)
+    return span, (round(first - there, 3) if there is not None and first is not None else None)
+
+
+def _caption_targets(windows: list[dict[str, Any]] | None, offset: float | None,
+                     span: tuple[float, float] | None,
+                     duration_s: float) -> list[tuple[float, float, float]]:
+    """Where the renditions are read, (at, start, end) in seconds of the
+    package's timeline: at the times of the original's windows (its source
+    record's, `windows`), its timestampOffset ahead — one that could not be
+    read CLOSED_CAPTION_SPAN from its point —; without them each of
+    CLOSED_CAPTION_WINDOWS of the top rendition's own span (start + at x
+    (end - start); where it can't be read, of the title's duration from 0),
+    CLOSED_CAPTION_SPAN long."""
+    ahead = offset or 0.0
+    if windows:
+        return [(w["at"], w["start"] + ahead,
+                 max(w["end"], w["start"] + (0 if w["frames"] else CLOSED_CAPTION_SPAN)) + ahead)
+                for w in windows]
+    origin, end = span if span else (0.0, duration_s)
+    return [(at, origin + at * (end - origin), origin + at * (end - origin) + CLOSED_CAPTION_SPAN)
+            for at in CLOSED_CAPTION_WINDOWS]
+
+
+def _caption_windows_of(playlist: Path,
+                        targets: list[tuple[float, float, float]]) -> list[dict[str, Any]]:
+    """The caption windows of the video rendition of the media playlist at
+    `playlist`, one at each target (at, start, end) as the record keeps it
+    (libv2_records.caption_window): the segments that cover its span, read
+    after the init segment (concat, nothing copied) from the first one's
+    start, a keyframe, to the span's end, its frames those whose times fall
+    in the span. A window that can't be read, or decodes no frame there,
+    could not be read (no frames, captions false), logged."""
+    start = _rendition_start(playlist)
+    out = []
+    for at, begin, end in targets:
+        frames = None
+        if start is not None:
+            init, spans = start
+            covering = [x for x in spans if x[1] > begin and x[0] < end] \
+                or [spans[-1] if begin >= spans[-1][1] else spans[0]]
+            target = _concat(init, *(p for _, _, p in covering))
+            if target is not None:
+                frames = _frames_of(target, "-select_streams", "v:0", "-read_intervals",
+                                    f"%+{max(end - covering[0][0], 0) + 0.5:.3f}")
+        # a frame that starts where the window ends, or ends where it starts,
+        # is none of it: times are kept to the millisecond
+        inside = [f for f in frames or []
+                  if (t := _time_of(f)) is not None and t < end - _EDGE
+                  and t + (rec.seconds(f.get("duration_time")) or 0.0) > begin + _EDGE]
+        if not inside:
+            log.warning("packager.closed_captions.unread", playlist=str(playlist), at=at,
+                        error="no frame decoded in the window")
+        out.append(rec.caption_window(at, inside, begin))
+    return out
+
+
+def _read_captions(hls_dir: Path, video_meta: list[dict[str, Any]], original: Path,
+                   windows: list[dict[str, Any]] | None, duration_s: float) -> None:
+    """Read every video rendition's caption windows into its manifest entry
+    — captionWindows; closedCaptions when one shows them; timestampOffset,
+    how far the package's times run ahead of the original's, where it can
+    be measured (else the windows are read as if both timelines were one) —
+    at the times of the original's windows, or the title's fractions
+    (_caption_targets)."""
+    if not video_meta:
+        return
+    span, offset = _caption_offset(original, hls_dir / video_meta[0]["id"] / "playlist.m3u8")
+    targets = _caption_targets(windows, offset, span, duration_s)
+    for entry in video_meta:
+        found = _caption_windows_of(hls_dir / entry["id"] / "playlist.m3u8", targets)
+        entry["captionWindows"] = found
+        if any(w["captions"] for w in found):
+            entry["closedCaptions"] = True
+        if offset is not None:
+            entry["timestampOffset"] = offset
+    log.info("packager.closed_captions", offset=offset, windows=len(targets),
+             renditions={e["id"]: [w["captions"] for w in e["captionWindows"]] for e in video_meta})
 
 
 def _hdr10_metadata(inputs: PackageInputs, probe: _Probe, original: Path,

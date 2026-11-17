@@ -27,9 +27,11 @@ from packager import library, records
 from packager import libv2_records as rec
 from packager.katalog import ClaimedItem
 
-# zaentrum/schemas 392d01d3b93c7446952e36a7c71dc1987a4685aa, tools/libv2_records.py
-SHA256 = "a7ad958d94d0eb6182b7428cd848170099f6fc4b8d24ea806d67fc2ab7cb92f9"
-LIBV2_RECORDS = 10
+# zaentrum/schemas, branch record-logic-11 on 392d01d3b93c7446952e36a7c71dc1987a4685aa,
+# tools/libv2_records.py (record logic 11: closed captions window by window, a package's scan); pin
+# its commit here once it is merged
+SHA256 = "d3b4f8959ed0697d1644919853925497b5f9cc3656ccab01ebcf4a25b767153b"
+LIBV2_RECORDS = 11
 
 GOLDEN = Path(__file__).parent / "fixtures" / "libv2_records"
 ITEM = "f0f0f0f0-1111-4222-8333-444444444444"

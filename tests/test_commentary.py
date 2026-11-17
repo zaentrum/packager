@@ -24,6 +24,18 @@ from packager import libv2_records as rec
 from packager import packager as pk
 
 NOW = "2026-11-01T10:00:00Z"
+
+
+def _read_none(raw: dict) -> dict:
+    """The original's picture read for closed captions as probe_original
+    reads a file: five windows, none showing any."""
+    picture = rec.picture_stream(raw)
+    if picture is None:
+        return {}
+    return {picture["index"]: [{"at": at, "start": at * 60, "end": at * 60 + 2, "frames": 48,
+                                "captions": False} for at in rec.CAPTION_WINDOWS]}
+
+
 SOURCE = "0b6c3d2e-2222-4a2b-8c3d-4e5f60718293"
 ORIGINAL = "Example Film (2024).mkv"
 
@@ -119,7 +131,7 @@ def _records(raw: dict, probe: pk._Probe, audio: list[dict], subtitles: list[dic
     source, _ = rec.source_record(
         SOURCE, ORIGINAL, 1, taken_at=NOW, taken_by="packager",
         library_path=f"Example Film (2024)/{ORIGINAL}", qh1="sha256:" + "0" * 64,
-        probe=raw, probe_version="ffprobe test")
+        probe=raw, probe_version="ffprobe test", captions=_read_none(raw))
     manifest = {
         "packagedAt": NOW, "packager": "packager-test", "durationMs": 60_000,
         "renditions": {
@@ -187,7 +199,7 @@ def test_without_the_marks_the_gate_names_them(monkeypatch: pytest.MonkeyPatch,
     source, _ = rec.source_record(
         SOURCE, ORIGINAL, 1, taken_at=NOW, taken_by="packager",
         library_path=f"Example Film (2024)/{ORIGINAL}", qh1="sha256:" + "0" * 64,
-        probe=raw, probe_version="ffprobe test")
+        probe=raw, probe_version="ffprobe test", captions=_read_none(raw))
     lost = rec.deletion_gate([source["essence"]], rec.package_essence(manifest, source["essence"]))
     assert [x for x in lost if x in ("commentaryTracks", "commentarySubtitles",
                                      "audioDescriptionTracks")] == [

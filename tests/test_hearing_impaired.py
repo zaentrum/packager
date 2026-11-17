@@ -20,6 +20,18 @@ from packager import libv2_records as rec
 from packager import packager as pk
 
 NOW = "2026-10-27T10:00:00Z"
+
+
+def _read_none(raw: dict) -> dict:
+    """The original's picture read for closed captions as probe_original
+    reads a file: five windows, none showing any."""
+    picture = rec.picture_stream(raw)
+    if picture is None:
+        return {}
+    return {picture["index"]: [{"at": at, "start": at * 60, "end": at * 60 + 2, "frames": 48,
+                                "captions": False} for at in rec.CAPTION_WINDOWS]}
+
+
 SOURCE = "0b6c3d2e-1111-4a2b-8c3d-4e5f60718293"
 ORIGINAL = "Example Film (2024).mkv"
 
@@ -116,7 +128,7 @@ def _record(raw: dict, probe: pk._Probe, entries: list[dict]) -> tuple[dict, dic
     source, _ = rec.source_record(
         SOURCE, ORIGINAL, 1, taken_at=NOW, taken_by="packager",
         library_path=f"Example Film (2024)/{ORIGINAL}", qh1="sha256:" + "0" * 64,
-        probe=raw, probe_version="ffprobe test")
+        probe=raw, probe_version="ffprobe test", captions=_read_none(raw))
     manifest = {
         "packagedAt": NOW, "packager": "packager-test", "durationMs": 60_000,
         "renditions": {
