@@ -2,10 +2,8 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: packager
-  namespace: stube
   labels:
     app: packager
-    value-stream: stube
     component: pipeline
     plane: worker
 spec:
@@ -25,7 +23,6 @@ spec:
     metadata:
       labels:
         app: packager
-        value-stream: stube
         component: pipeline
         plane: worker
     spec:
@@ -47,7 +44,7 @@ spec:
               # (get_item, get_steps, upsert_step, packaging_complete).
               # Service URL with no /api suffix; the client prepends
               # "/api/...".
-              value: "http://katalog-manager-api.stube.svc.cluster.local"
+              value: "http://katalog-manager-api"
             - name: OIDC_TOKEN_URL
               # Your identity provider's OAuth2 token endpoint.
               value: "https://sso.example.com/realms/your-realm/protocol/openid-connect/token"
@@ -66,7 +63,7 @@ spec:
             # and produces nothing (terminal stage). Topic + group are
             # env-overridable; the defaults match the shared contract.
             - name: KAFKA_BROKERS
-              value: "kafka.stube.svc.cluster.local:9092"
+              value: "kafka:9092"
             - name: KAFKA_SECURITY_PROTOCOL
               value: "PLAINTEXT"
             - name: KAFKA_GROUP_ID
