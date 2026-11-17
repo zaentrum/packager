@@ -130,22 +130,21 @@ def _from_contract(path: Path, inbox: Path, original: Path) -> PackageInputs:
 # (every second moment dropped), film and video field-matched at the
 # source's rate, HEVC field pictures kept as they are, fields too few to make
 # a source over left as they are, an examination that told nothing, or
-# nothing to do. No word lets an original go (ADR-0015): the deletion gate
-# keeps an original marked as fields or found to hold them (`scan.found`
-# anything but "progressive"). SCAN_RELEASES are the words that say the
-# package lost nothing to its fields, each borne out by the transcoder's
-# read-through of the whole title (`scan.verified`).
+# nothing to do. No word decides an original's fate (ADR-0015). The words
+# are the transcoder's; one the packager does not know is kept all the same
+# (scan_of).
 SCAN_DONE = ("inverse-telecine", "progressive", "deinterlaced-field", "deinterlaced-frame",
              "field-matched", "fields-kept", "fields-left", "unexamined", "none")
-SCAN_RELEASES = ("inverse-telecine", "progressive", "deinterlaced-field")
-SCAN_FOUND = ("fields", "film", "telecine", "mixed", "progressive", "unknown", "field-pictures")
+SCAN_FOUND = ("fields", "film", "telecine", "mixed", "progressive", "unexamined", "unknown",
+              "field-pictures")
 
 
 def scan_of(contract: dict[str, Any]) -> dict[str, Any] | None:
     """renditions.json's `scan`, as the transcoder wrote it, for the package's
     record: what the package's video is as far as fields go (`found`,
     SCAN_FOUND: video in fields, a film, a telecined film, film and video
-    mixed, whole frames, not told, HEVC field pictures), what was done
+    mixed, whole frames over the whole title, whole frames on a partial
+    basis, not told, HEVC field pictures), what was done
     (`done`, SCAN_DONE), the package's frame rate, and what the read-through
     of the whole title said (`verified`: its `ok` beside a `done` it did not
     bear out). Taken as it is, never dropped: a `found` or `done` that is not

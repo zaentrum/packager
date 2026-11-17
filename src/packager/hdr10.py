@@ -274,10 +274,13 @@ def _grow(buf: bytearray, pos: int, header: int, by: int) -> None:
 _MEDIA = frozenset({b"mdat", b"moof", b"sidx", b"ssix", b"mfra"})
 
 
-def insert_boxes(init: bytes, boxes: bytes) -> bytes:
-    """`init`, an init segment of one video track with an HEVC sample entry,
-    with every box of `boxes` its sample entry doesn't hold yet, after its
-    colr (else at its end), each box around them grown by their size.
+def insert_boxes(init: bytes, boxes: bytes, entries: frozenset[bytes] = HEVC_ENTRIES,
+                 *, after_config: bool = False) -> bytes:
+    """`init`, an init segment of one video track whose sample entry is one
+    of `entries` (an HEVC one by default), with every box of `boxes` its
+    sample entry doesn't hold yet, after its colr (else at its end), or with
+    `after_config` right after its first box (the decoder configuration:
+    where FFmpeg writes a `fiel`), each box around them grown by their size.
     Raises ValueError for anything else: more than one track, media data,
     fragments or an index of them, chunk offsets, another sample entry, a
     box that doesn't fit."""
@@ -301,10 +304,10 @@ def insert_boxes(init: bytes, boxes: bytes) -> bytes:
                     raise _Malformed("the track has chunk offsets: no init segment")
     if struct.unpack_from(">I", buf, start + 4)[0] != 1:
         raise _Malformed("the stsd holds more than one sample entry")
-    entries = list(_boxes(buf, start + _STSD_FIELDS, end))
-    if len(entries) != 1 or entries[0][3] not in HEVC_ENTRIES:
-        raise _Malformed("the sample entry is no HEVC one")
-    pos, header, size, _kind = entries[0]
+    held_entries = list(_boxes(buf, start + _STSD_FIELDS, end))
+    if len(held_entries) != 1 or held_entries[0][3] not in entries:
+        raise _Malformed("the sample entry is none this box goes into")
+    pos, header, size, _kind = held_entries[0]
     chain.append((pos, header))
     first = pos + header + _VISUAL_FIELDS
     children = list(_boxes(buf, first, pos + size))
@@ -313,7 +316,10 @@ def insert_boxes(init: bytes, boxes: bytes) -> bytes:
                    if k not in held)
     if not add:
         return bytes(buf)
-    at = next((p + s for p, _h, s, k in children if k == b"colr"), pos + size)
+    if after_config and children:
+        at = children[0][0] + children[0][2]
+    else:
+        at = next((p + s for p, _h, s, k in children if k == b"colr"), pos + size)
     buf[at:at] = add
     for p, h in chain:
         _grow(buf, p, h, len(add))

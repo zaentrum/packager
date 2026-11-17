@@ -77,7 +77,7 @@ from typing import Any, TypeVar
 
 import structlog
 
-from . import hdr10, hls, regions
+from . import fields, hdr10, hls, regions
 from . import libv2_records as rec
 from .fonts import font_format, font_names
 from .renditions import PackageInputs, VideoInput, scan_of
@@ -801,12 +801,15 @@ def build_package(
         log.info("packager.subs.default", audio_language=audio_language,
                  subtitle=subtitle_meta[default_subtitle]["id"]
                  if default_subtitle is not None else None)
+        source_mark = (fields.container_mark(Path(source_path))
+                       if any(v.rung.encoder == "copy" for v in videos) else None)
         video_meta, audio_meta, surround_meta = _run_shaka_packager(
             packaging_source, videos, audio_meta, surround_meta, stage,
             segment_seconds=segment_seconds,
             hls_subtitles=options.hls_subtitles,
             subtitle_meta=subtitle_meta,
             hdr10_metadata=_hdr10_metadata(inputs, probe, Path(source_path), videos),
+            source_mark=source_mark,
         )
 
     # Trickplay runs against the original source — only 1 frame
@@ -845,10 +848,14 @@ def build_package(
         # carried any; a client that shows the WebVTT copies needs none.
         **({"fonts": font_meta} if font_meta else {}),
         # What the video is as far as fields go, as the transcoder's
-        # contract says it (deinterlaced and at which rate, inverse
-        # telecine, progressive as found), where it says it: the package
-        # keeps the original's fields only as they were made progressive.
-        **({"scan": scan} if (scan := scan_of(inputs.contract)) else {}),
+        # contract says it (scan.found, scan.done, scan.verified): kept as it
+        # is, an empty one too (scan_of logs words it does not know).
+        **({"scan": scan} if (scan := scan_of(inputs.contract)) is not None else {}),
+        # A copy's fields as the original's container states them, which no
+        # packet carries (fields.py): its FlagInterlaced and FieldOrder, its
+        # fiel, its vprp, beside the field order ffprobe gives the original.
+        **({"sourceFields": _source_fields(Path(source_path), src, probe)}
+           if any(v.get("encoder") == "copy" for v in video_meta) else {}),
         "hls": {
             "master": "hls/master.m3u8",
             "segmentSeconds": segment_seconds,
@@ -1368,6 +1375,19 @@ def _with_track_languages(
     log.info("packager.track_languages", applied=applied or None,
              unmatched=[f"{k} {o}" for k, o in sorted(set(overrides) - used)] or None)
     return replace(probe, audio=audio, subtitles=subtitles)
+
+
+def _source_fields(source: Path, packaged: Path, probe: _Probe) -> dict[str, Any]:
+    """The manifest's `sourceFields` (fields.source_fields) for the original
+    at `source`: its container's field mark, and ffprobe's field order of its
+    video (the packaged file's probe where that is the original)."""
+    order = probe.video.get("field_order") if packaged == source else None
+    if packaged != source and source.exists():
+        try:
+            order = _ffprobe(source).video.get("field_order")
+        except (OSError, ValueError, subprocess.CalledProcessError) as e:
+            log.warning("packager.source_probe_failed", path=str(source), error=str(e)[:200])
+    return fields.source_fields(source, order if order not in (None, "", "unknown") else None)
 
 
 def _probe_of_source(packaged: Path, source: Path) -> _Probe | None:
@@ -3852,6 +3872,22 @@ def _write_hdr10(videos: list[_StagedVideo], hls_dir: Path,
     return set(rungs)
 
 
+def _write_fiel(videos: list[_StagedVideo], hls_dir: Path,
+                mark: fields.ContainerMark | None) -> dict[str, str]:
+    """Write the original container's field order (`mark`) into the init
+    segment of every copied rung as an MP4 `fiel` (fields.py), and return
+    those rungs with it. None where the container gave no field order; a
+    rung whose init segment can't take it stays as shaka wrote it (logged)."""
+    order = mark.field_order if mark else None
+    if order is None:
+        return {}
+    rungs = [v.rung.id for v in videos if v.rung.encoder == "copy"]
+    done = {rid: order for rid in rungs if fields.write_fiel(hls_dir / rid / "init.mp4", order)}
+    log.info("packager.fields.fiel", rungs=rungs or None, written=sorted(done) or None,
+             field_order=order, container=mark.container if mark else None)
+    return done
+
+
 def _run_shaka_packager(
     primary: Path,
     videos: list[_StagedVideo],
@@ -3863,6 +3899,7 @@ def _run_shaka_packager(
     hls_subtitles: bool = False,
     subtitle_meta: list[dict[str, Any]] | None = None,
     hdr10_metadata: hdr10.StaticMetadata | None = None,
+    source_mark: fields.ContainerMark | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Package every video rung + audio rendition in one shaka run (media
     playlists + one I-frame playlist per rung), the WebVTT subtitles in
@@ -3919,6 +3956,8 @@ def _run_shaka_packager(
 
     # ---- the HDR10 static metadata shaka leaves out of the PQ rungs' init
     with_hdr10 = _write_hdr10(videos, hls_dir, hdr10_metadata)
+    # ---- the original's container field order, into each copy's init
+    with_fiel = _write_fiel(videos, hls_dir, source_mark)
 
     # ---- video
     video_meta: list[dict[str, Any]] = []
@@ -3957,6 +3996,9 @@ def _run_shaka_packager(
             # Its init segment carries the original's HDR10 static
             # metadata (mdcv, clli), as nothing else says.
             **({"hdr10Metadata": True} if v.rung.id in with_hdr10 else {}),
+            # Its init segment states the original container's field
+            # order (an MP4 fiel), as the copied packets don't.
+            **({"fieldOrder": with_fiel[v.rung.id]} if v.rung.id in with_fiel else {}),
             "frameRate": rate,
             "segments": stats.segments,
             "targetDuration": stats.target_duration or segment_seconds,

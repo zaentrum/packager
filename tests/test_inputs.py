@@ -300,6 +300,7 @@ def test_no_record_of_fields_is_none(contract: dict) -> None:
     {**SCAN, "done": "deinterlaced"},                      # an older word, without its rate
     {**SCAN, "done": "unverified"},
     {**SCAN, "found": "maybe"},
+    {},                                                    # empty: kept, not dropped unsaid
 ])
 def test_a_record_of_fields_in_words_it_does_not_know_is_kept_and_logged(scan: dict) -> None:
     from structlog.testing import capture_logs
@@ -311,17 +312,16 @@ def test_a_record_of_fields_in_words_it_does_not_know_is_kept_and_logged(scan: d
 
 def test_the_word_lists_are_the_transcoders() -> None:
     # The transcoder writes these words (its decision.SCAN_DONE,
-    # decision.SCAN_RELEASES, and decision.FIELDS_FOUND as scan.found writes
+    # and decision.FIELDS_FOUND with FOUND_UNEXAMINED as scan.found writes
     # them, "_" as "-"): a word added there is added here, or its packages'
     # scans are logged as in words it does not know.
-    from packager.renditions import SCAN_DONE, SCAN_FOUND, SCAN_RELEASES
+    from packager.renditions import SCAN_DONE, SCAN_FOUND
 
     assert SCAN_DONE == ("inverse-telecine", "progressive", "deinterlaced-field",
                          "deinterlaced-frame", "field-matched", "fields-kept", "fields-left",
                          "unexamined", "none")
-    assert SCAN_RELEASES == ("inverse-telecine", "progressive", "deinterlaced-field")
-    assert SCAN_FOUND == ("fields", "film", "telecine", "mixed", "progressive", "unknown",
-                          "field-pictures")
+    assert SCAN_FOUND == ("fields", "film", "telecine", "mixed", "progressive", "unexamined",
+                          "unknown", "field-pictures")
 
 
 def test_a_record_of_fields_that_is_no_object_is_refused_and_logged() -> None:
