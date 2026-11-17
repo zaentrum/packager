@@ -61,6 +61,52 @@ the transcoder README, "Rendition contract"):
 
 The handoff is deleted after a successful package.
 
+A contract's `scan` (the transcoder README, "Fields") says what the video
+is as far as fields go — video, film, a telecined film, film and video
+mixed, progressive (only for a whole title the transcoder read through),
+unexamined (whole frames on a partial basis), unknown or HEVC field
+pictures — and, in `done`, what was
+done: `inverse-telecine`, `progressive` (as found), `deinterlaced-field`,
+`deinterlaced-frame`, `field-matched`, `fields-kept`, `fields-left`,
+`unexamined` or `none`, with the package's `frameRate` and, in `verified`,
+what the transcoder's read-through of the whole title said (its `ok` false
+beside a `done` it did not bear out, the title then made again). No word
+decides an original's fate (ADR-0015); the record is kept honest for the
+people and rules that read it. The manifest takes the block as it is, at
+its top level (`scan`), and never drops it: a `found` or `done` it does not
+know is logged (`packager.contract.scan_words_unknown`) and kept; on the v2
+layout that is the manifest the package's record is made from. A `scan`
+that is not an object is logged (`packager.contract.scan_refused`) and left
+out. The record logic (`libv2_records.py`, the schemas repository's, vendored
+byte for byte) does not keep it yet: until it does, a package's essence says
+`interlaced: false` whatever it was made from.
+
+A container's own field mark (a Matroska track's FlagInterlaced and
+FieldOrder, an MP4 or QuickTime sample entry's `fiel`, an AVI's OpenDML
+`vprp`) is not in the packets, and shaka-packager writes every sample entry
+anew: a copied rendition would lose it. So for a package with a copied
+video rendition the manifest records the original's, beside the scan:
+
+    "sourceFields": {"containerMark": {"container": "matroska", "interlaced": true,
+                                       "fieldOrder": "tb",
+                                       "raw": {"FlagInterlaced": 1, "FieldOrder": 9}},
+                     "fieldOrder": "tb"}
+
+`containerMark` is what the container states (`interlaced` and `fieldOrder`
+null where it states none; the whole of it null for an MPEG-TS, an MPEG-PS
+or an elementary stream, which have no such mark, their stream's own staying
+in its packets), `fieldOrder` the original's field order as ffprobe gives it
+(container and stream together). Where the container gave a field order,
+the init segment of every copied rendition takes it as an MP4 `fiel` box,
+FFmpeg's (its muxer's values, right after the decoder configuration, where
+FFmpeg writes it), and its manifest entry says so (`fieldOrder`): a player
+that reads `fiel` (QuickTime's, FFmpeg's, the players built on them) knows
+the copy is in fields as the original said; a player that reads none (a
+browser's MSE player, as far as its MP4 parser goes) plays the copy as it
+played before, and the catalog has the mark from the record. An encoded rendition is
+progressive (the transcoder's scan) and takes none. The record logic does
+not keep `sourceFields` yet.
+
 Each video rendition in the manifest (and in a library v2 `package.json`)
 records what made its stream as `encoder`: `"copy"` for the original's
 own stream, played as it is (a rung with `"file": null`, or no handoff at

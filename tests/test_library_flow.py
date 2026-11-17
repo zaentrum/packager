@@ -456,6 +456,34 @@ def test_a_handover_the_catalog_refuses_fails_the_step_and_keeps_the_version(
     assert not share.inbox.exists() and not share.staging.exists()
 
 
+def test_the_contracts_record_of_fields_reaches_the_manifest_the_record_is_made_from(
+    binaries: Binaries, share: Share, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The transcoder's scan (here: marked as fields, found whole frames,
+    # copied) is in the manifest the package's record is built from, as the
+    # contract wrote it; one without it has none.
+    scan = {"found": "progressive", "judgedBy": "pictures", "fieldOrder": "tb",
+            "done": "progressive", "order": "tff", "orderBy": "mark",
+            "frameRate": "25/1", "filter": None, "idet": None}
+    given: list[dict] = []
+    real = rec.package_record
+    monkeypatch.setattr(rec, "package_record",
+                        lambda _id, manifest, *a, **k: given.append(manifest) or real(
+                            _id, manifest, *a, **k))
+    share.inbox.mkdir(parents=True)
+    (share.inbox / "renditions.json").write_text(json.dumps({
+        "version": 1, "segmentSeconds": 6, "source": SOURCE_BLOCK, "scan": scan,
+        "video": [{"id": "v0", "label": "source", "file": None, "mode": "copy"}]}))
+    catalog = Catalog()
+    run(share.record(), catalog)
+    assert catalog.statuses == ["in_progress", "done"]
+    assert given and all(m["scan"] == scan for m in given)
+
+    given.clear()
+    run(share.record(version=NEXT_VERSION, recorded=True), Catalog())
+    assert given and all("scan" not in m for m in given)
+
+
 def test_a_second_version_of_a_recorded_source(binaries: Binaries, share: Share) -> None:
     # The first version recorded the source; a re-encode builds another
     # version of the same original, and the source stays as it is.

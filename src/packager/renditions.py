@@ -124,6 +124,45 @@ def _from_contract(path: Path, inbox: Path, original: Path) -> PackageInputs:
     )
 
 
+# What the transcoder's record of fields says was done (its README,
+# "Fields"): a film at its own frames, whole frames as found, video
+# deinterlaced at the field rate (one frame a field) or at the frame rate
+# (every second moment dropped), film and video field-matched at the
+# source's rate, HEVC field pictures kept as they are, fields too few to make
+# a source over left as they are, an examination that told nothing, or
+# nothing to do. No word decides an original's fate (ADR-0015). The words
+# are the transcoder's; one the packager does not know is kept all the same
+# (scan_of).
+SCAN_DONE = ("inverse-telecine", "progressive", "deinterlaced-field", "deinterlaced-frame",
+             "field-matched", "fields-kept", "fields-left", "unexamined", "none")
+SCAN_FOUND = ("fields", "film", "telecine", "mixed", "progressive", "unexamined", "unknown",
+              "field-pictures")
+
+
+def scan_of(contract: dict[str, Any]) -> dict[str, Any] | None:
+    """renditions.json's `scan`, as the transcoder wrote it, for the package's
+    record: what the package's video is as far as fields go (`found`,
+    SCAN_FOUND: video in fields, a film, a telecined film, film and video
+    mixed, whole frames over the whole title, whole frames on a partial
+    basis, not told, HEVC field pictures), what was done
+    (`done`, SCAN_DONE), the package's frame rate, and what the read-through
+    of the whole title said (`verified`: its `ok` beside a `done` it did not
+    bear out). Taken as it is, never dropped: a `found` or `done` that is not
+    a word the transcoder writes is logged (packager.contract.scan_words_unknown)
+    and kept. None when the contract has none (an older transcoder), or one
+    that is not an object (logged, packager.contract.scan_refused)."""
+    scan = contract.get("scan")
+    if scan is None:
+        return None
+    if not isinstance(scan, dict):
+        log.warning("packager.contract.scan_refused", kind=type(scan).__name__)
+        return None
+    if scan.get("done") not in SCAN_DONE or scan.get("found") not in SCAN_FOUND:
+        log.warning("packager.contract.scan_words_unknown", done=scan.get("done"),
+                    found=scan.get("found"))
+    return dict(scan)
+
+
 def _encoder_of(rung: dict[str, Any]) -> str | None:
     """What made a contract rung's stream: its `encoder` where the contract
     names one; else "copy" for a rung with `"file": null`, which is the

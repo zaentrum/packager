@@ -226,7 +226,7 @@ def test_a_sample_entry_that_holds_them_is_left_as_it_is() -> None:
     (init(extra=box(b"moof", full(b"mfhd", bytes(4)))), "points into it"),
     (init(extra=full(b"sidx", bytes(24))), "points into it"),
     (init(stco=1), "chunk offsets"),
-    (init(entry(b"avc1", HVCC)), "no HEVC"),
+    (init(entry(b"avc1", HVCC)), "none this box goes into"),
     (init(handler=b"soun"), "no video"),
     (init(entries=2), "more than one sample entry"),
     (init()[:-10], "past its parent"),
