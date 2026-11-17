@@ -69,6 +69,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -2211,15 +2212,18 @@ def _prepare_source(
     )
     transmuxed = tmpdir / "transmux.mp4"
     vmap = f"0:{probe.video_index}" if probe.video_index is not None else "0:v:0"
+    hevc = probe.video.get("codec_name") == "hevc"
+    src_input, hevc_args = (_hevc_input(src, probe.video_index, probe.container, tmpdir) if hevc
+                            else (str(src), []))
     args = [
         "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
         *origin.input_args,
-        "-i", str(src),
+        "-i", src_input,
         "-map", vmap,
         "-c:v", "copy",
     ]
-    if probe.video.get("codec_name") == "hevc":
-        args += _hevc_copy_args(src, probe.video_index)
+    if hevc:
+        args += hevc_args
         # Tag HEVC as hvc1 so MP4 readers (and shaka-packager) recognise
         # the codec — many MKV→MP4 muxers leave it as hev1, which some
         # tools then reject. ONLY for HEVC sources; forcing it on H.264
@@ -2271,7 +2275,7 @@ def _prepare_source(
     # (where it starts before 0, that much later: _Origin.signal_args).
     for i, path in signals.items():
         args += ["-map", f"[l{i}]", *_SIGNAL_CODEC, *origin.signal_args, "-f", "nut", str(path)]
-    _run_ffmpeg_capturing("transmux", args)
+    _run_copy("transmux", args, src_input, src, transmuxed, probe)
     # What became of each shown track's stereo rendition; one without a
     # signal is one the temp space left out.
     lifts: dict[int, tuple[str, Path | None]] = (
@@ -2347,18 +2351,20 @@ def _remux_video(
     target = tmpdir / f"{rung.id}.mp4"
     vmap = f"0:{probe.video_index}" if probe.video_index is not None else "0:v:0"
     origin = _origin(rung.timeline, ts_offset, probe, [probe.video])
+    rung_input, hevc_args = (_hevc_input(rung.path, probe.video_index, probe.container, tmpdir,
+                                         name=rung.id)
+                             if codec == "hevc" else (str(rung.path), []))
     args = [
         "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
         *origin.input_args,
-        "-i", str(rung.path),
+        "-i", rung_input,
         "-map", vmap, "-c:v", "copy",
-        *([*_hevc_copy_args(rung.path, probe.video_index), "-tag:v", "hvc1"]
-          if codec == "hevc" else []),
+        *([*hevc_args, "-tag:v", "hvc1"] if codec == "hevc" else []),
         "-an", "-sn", "-dn", *NO_GLOBAL_METADATA, *origin.output_args,
         "-movflags", "+faststart", str(target),
     ]
     try:
-        _run_ffmpeg_capturing(f"remux {rung.id}", args)
+        _run_copy(f"remux {rung.id}", args, rung_input, rung.path, target, probe)
     except PackageError as e:
         log.warning("packager.rung.remux_failed", rung=rung.id, error=str(e)[:300])
         return None
@@ -2380,14 +2386,392 @@ _HEVC_PARAMETER_SETS = frozenset({32, 33, 34})  # VPS, SPS, PPS
 _DUMP_LINE = re.compile(r"[0-9a-f]{8}: ")
 
 
-def _hevc_copy_args(path: Path, stream_index: int | None) -> list[str]:
-    """What a stream copy of the HEVC stream at stream_index needs on top
-    to become an hvc1 track shaka-packager reads: the Annex B round trip
-    when its decoder configuration has no parameter sets, else nothing."""
+# A Matroska original stores no decode times. FFmpeg's demuxer derives each
+# packet's from the presentation times and the stream's reorder delay, which it
+# takes from the SPS in the decoder configuration record. Where the record
+# holds no parameter sets, that delay is not known while the first packets are
+# timed: the first takes its own presentation time as its decode time, the
+# next ones follow on from it, and a B-picture of the first group, shown
+# before them, has a presentation time below its decode time, which FFmpeg's
+# muxing step raises to it. The copy is whole, bit for bit, but mistimed at
+# its start: a picture the original shows at 42 ms comes at 82 ms, and the MP4
+# has no edit list, its first decode time being its first presentation time.
+# Every output of the run gets the same times, on ffmpeg 7.1 and 9.0 alike,
+# with Annex B or without. An MP4 original keeps its decode times and is not
+# affected. So a Matroska original whose record lacks them is read through a
+# head of its own file whose CodecPrivate is a whole record, the one FFmpeg's
+# MP4 muxer builds from the first packet's parameter sets (that packet copied
+# through Annex B), and the rest of the file where it is (the concat and
+# subfile protocols; nothing is copied): the demuxer knows the delay from the
+# first packet, as for any other original, and the stream is copied as one
+# with its parameter sets in its record. The head's SeekHead, which stands
+# before its Tracks, becomes a Void, so that nothing seeks by the offsets it
+# held.
+#
+# The head is taken only for a layout a test proves (tests/test_hevc_parameter_
+# sets.py, tests/test_hevc_parameter_sets_real.py); anything else takes main's
+# path, the file itself through the Annex B round trip as every such file was
+# copied before, and its start may be mistimed (packager.hevc.start_mistimed).
+# The layouts: FFmpeg's and mkvmerge's, the Segment's elements before its first
+# Cluster within _HEAD_LIMIT and no more than _HEAD_ELEMENTS of them, an Info
+# before Tracks (the head hides a SeekHead that might name one after it), only
+# _BEFORE_TRACKS before Tracks and _AFTER_TRACKS between it and the first
+# Cluster (no SeekHead there, whose offsets the head would make stale), in
+# Tracks only TrackEntries and a CRC-32 of the six-byte form at its head, and
+# exactly one HEVC TrackEntry whose record lacks parameter sets, holding no
+# CRC-32 and no ContentEncodings (a compressed CodecPrivate), whose NAL
+# length size is the one of the record built for it. Before the run, the join
+# is proven: the first _PROOF_PACKETS packets of the file read through the head
+# are its own, every one's stream, time, size and bytes (_first_packets_differ),
+# or the head is not taken. After the run, a copy through the head must have
+# the original's video length (_head_copy_off); a copy that hasn't, or that
+# fails outright, is made again as before (_run_copy). Neither sees a copy of
+# the right length whose samples don't decode, which is why such layouts are
+# refused before any run.
+_EBML_HEADER, _SEGMENT, _SEEKHEAD, _TRACKS = 0x1A45DFA3, 0x18538067, 0x114D9B74, 0x1654AE6B
+_CLUSTER, _TRACK_ENTRY, _CODEC_ID, _CODEC_PRIVATE = 0x1F43B675, 0xAE, 0x86, 0x63A2
+_EBML_CRC32, _EBML_VOID, _INFO, _TAGS = 0xBF, 0xEC, 0x1549A966, 0x1254C367
+_CHAPTERS, _ATTACHMENTS, _CONTENT_ENCODINGS = 0x1043A770, 0x1941A469, 0x6D80
+_BEFORE_TRACKS = frozenset({_SEEKHEAD, _EBML_VOID, _INFO})
+_AFTER_TRACKS = frozenset({_EBML_VOID, _TAGS, _ATTACHMENTS, _CHAPTERS})
+_HEAD_LIMIT = 16 << 20
+_HEAD_ELEMENTS = 1024
+_PROOF_PACKETS = 48
+
+
+def _hevc_input(path: Path, stream_index: int | None, container: str, tmpdir: Path,
+                name: str = "v0") -> tuple[str, list[str]]:
+    """The input a stream copy of the HEVC stream at stream_index reads, and
+    what the copy needs on top to become an hvc1 track shaka-packager reads:
+    the file and nothing where its record holds its parameter sets; else a
+    Matroska file read through a head with a whole record
+    (_whole_record_input); else the file through the Annex B round trip."""
     if not _parameter_sets_in_band_only(path, stream_index):
-        return []
+        return str(path), []
+    if "matroska" in container.split(","):
+        url = _whole_record_input(path, stream_index, tmpdir, name)
+        if url is not None:
+            log.info("packager.hevc.whole_record", path=str(path), stream=stream_index)
+            return url, []
+        log.warning("packager.hevc.start_mistimed", path=str(path), stream=stream_index)
     log.info("packager.hevc.in_band_parameter_sets", path=str(path), stream=stream_index)
-    return ["-bsf:v", "hevc_mp4toannexb"]
+    return str(path), ["-bsf:v", "hevc_mp4toannexb"]
+
+
+def _run_copy(label: str, args: list[str], used: str, path: Path, made: Path,
+              probe: _Probe) -> None:
+    """Run a stream copy that reads `used` and writes the video to `made`; its
+    original's probe is `probe`. One that read a Matroska file through a head
+    with a whole record (_whole_record_input) and failed, or made a copy
+    _head_copy_off finds off, is run again as without one: the file itself,
+    through the Annex B round trip, as every such file was copied before."""
+    try:
+        _run_ffmpeg_capturing(label, args)
+    except PackageError as e:
+        if used == str(path):
+            raise
+        log.warning("packager.hevc.whole_record_failed", label=label, path=str(path),
+                    error=str(e)[:300])
+        _run_ffmpeg_capturing(label, _annex_b_instead(args, used, path))
+        return
+    if used == str(path):
+        return
+    off = _head_copy_off(made, probe)
+    if off is not None:
+        log.warning("packager.hevc.whole_record_off", label=label, path=str(path), why=off)
+        _run_ffmpeg_capturing(label, _annex_b_instead(args, used, path))
+
+
+def _head_copy_off(made: Path, probe: _Probe) -> str | None:
+    """Why a copy made through the head is not kept, None where it is: its
+    video not as long as the original's (within 0.1 %, at least 0.5 s). It
+    sees a copy cut short or retimed, not one of the right length that
+    doesn't decode."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=duration", "-of", "json", str(made)],
+            capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL, timeout=120)
+        streams = json.loads(out.stdout).get("streams") or []
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return f"the copy can't be probed: {str(e)[:200]}"
+    if len(streams) != 1:
+        return "the copy has no video stream"
+    got = _seconds(streams[0].get("duration"))
+    wants = _video_seconds(probe)
+    if got is None or (wants and not any(abs(got - w) <= max(0.5, 0.001 * w) for w in wants)):
+        return f"its video is {got} s, the original's {' or '.join(map(str, wants))} s"
+    return None
+
+
+def _seconds(value: Any) -> float | None:
+    """Seconds from a probe's number or a tag's HH:MM:SS.fraction; None."""
+    text = str(value or "").strip()
+    try:
+        if ":" not in text:
+            return float(text) if text and text != "N/A" else None
+        h, m, sec = text.split(":")
+        return int(h) * 3600 + int(m) * 60 + float(sec)
+    except ValueError:
+        return None
+
+
+def _video_seconds(probe: _Probe) -> list[float]:
+    """What the original's video may last, a copy counting from its first
+    picture: its stream's duration; else its DURATION tag's (Matroska), or the
+    file's. Where the video starts late the tag may be the track's own length
+    (mkvmerge's) or count from 0 (FFmpeg's muxer's), so it is taken as it is
+    or less that start, and the file's own duration tells them apart where it
+    can: start plus tag past the file's end leaves only less the start, start
+    plus tag at the file's end only as it is. None known: []."""
+    seconds = _seconds(probe.video.get("duration"))
+    if seconds is not None:
+        return [seconds]
+    tags = probe.video.get("tags") or {}
+    end = next((s for k, v in tags.items() if k.upper().startswith("DURATION")
+                and (s := _seconds(v)) is not None), None)
+    whole = probe.duration_ms / 1000 if probe.duration_ms else None
+    if end is None:
+        end = whole
+    if end is None:
+        return []
+    start = max(0.0, _seconds(probe.video.get("start_time")) or 0.0)
+    if not start:
+        return [end]
+    if whole is not None:
+        slack = max(0.5, 0.001 * whole)
+        if start + end > whole + slack:     # counted from 0
+            return [end - start]
+        if abs(start + end - whole) <= slack:   # the track's own length, to the file's end
+            return [end]
+    return [end, end - start]
+
+
+def _annex_b_instead(args: list[str], used: str, path: Path) -> list[str]:
+    """`args` reading the file at path itself, its video copied through Annex B,
+    where they read it through the input `used`."""
+    out = [str(path) if a == used else a for a in args]
+    at = next(i for i in range(len(out) - 1) if out[i:i + 2] == ["-c:v", "copy"])
+    return [*out[:at + 2], "-bsf:v", "hevc_mp4toannexb", *out[at + 2:]]
+
+
+def _whole_record_input(path: Path, stream_index: int | None, tmpdir: Path,
+                        name: str) -> str | None:
+    """An ffmpeg input that is the Matroska file at path with a whole hvcC in
+    the CodecPrivate of its HEVC track: a head written in tmpdir, then the
+    file's own bytes from the end of its Tracks. None where it can't be made."""
+    source = os.path.abspath(path)
+    head = tmpdir / f"{name}-head.mkv"
+    if "|" in source or "|" in str(head):   # the concat protocol's separator
+        return None
+    record = _whole_hvcc(Path(source), stream_index, tmpdir / f"{name}-record.mp4")
+    if record is None:
+        return None
+    try:
+        rest = _matroska_head(Path(source), record, head)
+    except (OSError, ValueError, IndexError, StopIteration) as e:   # a 0x00 lead byte: next()
+        log.warning("packager.hevc.head_failed", path=source, error=str(e)[:200])
+        return None
+    if rest is None:
+        return None
+    url = f"concat:{head}|subfile,,start,{rest},end,0,,:{source}"
+    try:
+        differ = _first_packets_differ(source, url)
+    except Exception as e:              # nothing in the proof fails a package: not proven
+        differ = f"the proof failed: {type(e).__name__}: {str(e)[:160]}"
+    if differ is not None:
+        log.warning("packager.hevc.head_unproven", path=source, why=differ)
+        return None
+    return url
+
+
+def _first_packets_differ(source: str, url: str) -> str | None:
+    """How the first _PROOF_PACKETS packets read through the head differ from
+    the file's own (every stream's: its index, time, size and bytes), None
+    where they don't. They come from the first Cluster, where the head ends:
+    a join off by a byte that matters there, a dropped Cluster or another
+    timestamp scale shows in them. A cover picture's packet is left out on
+    both sides: no copy maps it, and one attached behind the Clusters is found
+    only through the SeekHead the head makes a Void."""
+    def first(url: str) -> list[tuple[Any, ...]] | None:
+        try:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-read_intervals", f"%+#{_PROOF_PACKETS + 8}",
+                 "-show_entries", "packet=stream_index,pts_time,size,data_hash:stream=index"
+                 ":stream_disposition=attached_pic", "-show_data_hash", "md5", "-of", "json",
+                 url],
+                capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
+                timeout=120)
+            got = json.loads(out.stdout)
+        except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+            return None
+        covers = {st.get("index") for st in got.get("streams") or []
+                  if isinstance(st, dict) and (st.get("disposition") or {}).get("attached_pic")}
+        packets = [(p.get("stream_index"), p.get("pts_time"), p.get("size"), p.get("data_hash"))
+                   for p in got.get("packets") or []
+                   if isinstance(p, dict) and p.get("stream_index") not in covers]
+        return packets[:_PROOF_PACKETS]
+    own, read = first(source), first(url)
+    if not own or read is None:
+        return "the first packets can't be read"
+    if read != own:
+        at = next((i for i, (a, b) in enumerate(zip(own, read, strict=False)) if a != b),
+                  min(len(own), len(read)))
+        return (f"packet {at} differs: {read[at] if at < len(read) else None} "
+                f"for {own[at] if at < len(own) else None}")
+    return None
+
+
+def _whole_hvcc(path: Path, stream_index: int | None, out: Path) -> bytes | None:
+    """The hvcC FFmpeg's MP4 muxer builds from the first packet's parameter
+    sets (that packet copied through Annex B); None where it holds none."""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
+             "-map", f"0:{stream_index}" if stream_index is not None else "0:v:0",
+             "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-tag:v", "hvc1", "-frames:v", "1",
+             "-an", "-sn", "-dn", "-f", "mp4", str(out)],
+            capture_output=True, check=True, stdin=subprocess.DEVNULL, timeout=120)
+        record = _codec_private(out, 0)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("packager.hevc.record_failed", path=str(path), error=str(e)[:200])
+        return None
+    finally:
+        out.unlink(missing_ok=True)
+    return record if record is not None and not _hvcc_lacks_parameter_sets(record) else None
+
+
+def _ebml_element(data: bytes, p: int) -> tuple[int, int, int, int, int]:
+    """(id, start, payload start, end, size width) of the element at p; end is
+    -1 for an unknown size."""
+    lead = data[p]
+    id_len = next(n for n in range(1, 5) if lead & (0x80 >> (n - 1)))
+    eid = int.from_bytes(data[p:p + id_len], "big")
+    q = p + id_len
+    first = data[q]
+    width = next(n for n in range(1, 9) if first & (0x80 >> (n - 1)))
+    value = int.from_bytes(data[q:q + width], "big") & ((1 << (7 * width)) - 1)
+    unknown = value == (1 << (7 * width)) - 1
+    return eid, p, q + width, -1 if unknown else q + width + value, width
+
+
+def _ebml_size(value: int, width: int | None = None) -> bytes:
+    """An EBML size field holding value, `width` bytes long (the shortest
+    where None); all ones is reserved for an unknown size."""
+    width = width or next(w for w in range(1, 9) if value < (1 << (7 * w)) - 1)
+    if value >= (1 << (7 * width)) - 1:
+        raise ValueError(f"{value} does not fit {width} bytes")
+    return ((1 << (7 * width)) | value).to_bytes(width, "big")
+
+
+def _ebml_children(data: bytes, start: int, end: int) -> list[tuple[int, int, int, int, int]]:
+    """The elements in data[start:end], no more than _HEAD_ELEMENTS of them."""
+    out, p = [], start
+    while p < end:
+        if len(out) >= _HEAD_ELEMENTS:
+            raise ValueError(f"more than {_HEAD_ELEMENTS} elements")
+        el = _ebml_element(data, p)
+        if el[3] < 0 or el[3] > end:
+            raise ValueError("a child element without a size, or past its parent")
+        out.append(el)
+        p = el[3]
+    return out
+
+
+def _ebml_void(total: int) -> bytes:
+    """An EBML Void element `total` bytes long, in all."""
+    for width in range(1, 9):
+        payload = total - 1 - width
+        if payload >= 0 and payload < (1 << (7 * width)) - 1:
+            return bytes([_EBML_VOID]) + _ebml_size(payload, width) + bytes(payload)
+    raise ValueError(f"no Void of {total} bytes")
+
+
+def _matroska_head(path: Path, record: bytes, head: Path) -> int | None:
+    """Write `head`: the Matroska file's start up to and including its Tracks,
+    the CodecPrivate of its one HEVC track that lacks parameter sets replaced
+    by `record`, its SeekHead by a Void, the sizes and a CRC-32 that hold them
+    made true. Returns where in the file the bytes after its Tracks start;
+    None where the file is not laid out as a test proves (see above)."""
+    with open(path, "rb") as f:
+        data = f.read(_HEAD_LIMIT)
+    eid, _, _, end, _ = _ebml_element(data, 0)
+    if eid != _EBML_HEADER or end < 0:
+        return None
+    seg_id, seg_at, seg_payload, seg_end, seg_width = _ebml_element(data, end)
+    if seg_id != _SEGMENT:
+        return None
+    level = []                          # the Segment's elements up to its first Cluster
+    p = seg_payload
+    while True:
+        if p >= len(data) or len(level) >= _HEAD_ELEMENTS:
+            return None
+        el = _ebml_element(data, p)
+        level.append(el)
+        if el[0] == _CLUSTER:
+            break
+        if el[3] < 0 or el[3] > len(data):
+            return None
+        p = el[3]
+    ids = [el[0] for el in level[:-1]]
+    if _TRACKS not in ids:              # a second one is in neither list below
+        return None
+    t = ids.index(_TRACKS)
+    if not set(ids[:t]) <= _BEFORE_TRACKS or _INFO not in ids[:t] \
+            or not set(ids[t + 1:]) <= _AFTER_TRACKS:
+        return None
+    before = b"".join(_ebml_void(e - start) if eid == _SEEKHEAD else data[start:e]
+                      for eid, start, _, e, _ in level[:t])
+    _, tracks_at, tracks_payload, tracks_end, _ = level[t]
+    children = _ebml_children(data, tracks_payload, tracks_end)
+    for i, (cid, cstart, _, cend, _) in enumerate(children):
+        if cid == _EBML_CRC32 and (i != 0 or cend - cstart != 6):
+            return None                 # only the six-byte form, at Tracks' head
+        if cid not in (_EBML_CRC32, _TRACK_ENTRY):
+            return None
+    hevc = []
+    for cid, cstart, cpayload, cend, _ in children:
+        if cid != _TRACK_ENTRY:
+            continue
+        fields = _ebml_children(data, cpayload, cend)
+        by_id = {fid: data[fp:fe] for fid, _, fp, fe, _ in fields}
+        private = by_id.get(_CODEC_PRIVATE)
+        if (by_id.get(_CODEC_ID) or b"").rstrip(b"\x00") == b"V_MPEGH/ISO/HEVC" \
+                and private is not None \
+                and _hvcc_lacks_parameter_sets(private):
+            hevc.append((cstart, cpayload, cend, [f[0] for f in fields], private))
+    if len(hevc) != 1:
+        return None
+    entry_at, entry_payload, entry_end, entry_ids, private = hevc[0]
+    if _EBML_CRC32 in entry_ids or _CONTENT_ENCODINGS in entry_ids \
+            or entry_ids.count(_CODEC_PRIVATE) != 1:
+        return None
+    if private[21] & 3 != record[21] & 3:   # the samples' NAL length size
+        return None
+    entry = bytearray()
+    for fid, fstart, _fp, fe, _ in _ebml_children(data, entry_payload, entry_end):
+        entry += (_CODEC_PRIVATE.to_bytes(2, "big") + _ebml_size(len(record)) + record
+                  if fid == _CODEC_PRIVATE else data[fstart:fe])
+    entry = bytes([_TRACK_ENTRY]) + _ebml_size(len(entry)) + bytes(entry)
+    body = bytearray()
+    crc_at = None
+    for cid, cstart, _, cend, _ in children:
+        if cid == _EBML_CRC32 and not body:
+            crc_at = len(body)
+        body += entry if cstart == entry_at else data[cstart:cend]
+    if crc_at is not None:          # the CRC-32 of the rest of Tracks, little-endian
+        body[crc_at + 2:crc_at + 6] = zlib.crc32(bytes(body[crc_at + 6:])).to_bytes(4, "little")
+    tracks = _TRACKS.to_bytes(4, "big") + _ebml_size(len(body)) + bytes(body)
+    delta = len(tracks) - (tracks_end - tracks_at)
+    if seg_end < 0:
+        size = data[seg_payload - seg_width:seg_payload]
+    else:
+        try:
+            size = _ebml_size(seg_end - seg_payload + delta, seg_width)
+        except ValueError:          # an unknown size, as wide
+            size = ((1 << (7 * seg_width + 1)) - 1).to_bytes(seg_width, "big")
+    head.write_bytes(bytes(data[:seg_payload - seg_width]) + size + bytes(before) + tracks)
+    return tracks_end
 
 
 def _parameter_sets_in_band_only(path: Path, stream_index: int | None) -> bool:

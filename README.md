@@ -462,13 +462,27 @@ neither, and holds it still for a package that kept a styled track as
 WebVTT alone, or left a font out.
 
 **HEVC parameter sets.** Some files carry an HEVC decoder configuration
-(the Matroska CodecPrivate) that names no VPS, SPS or PPS: they are in
-the stream only. FFmpeg's MP4 muxer (7.1 and later) writes an empty
-`hvcC` for such a stream copied as `hvc1`, which shaka-packager can't
-parse, so the packager copies it through Annex B (`hevc_mp4toannexb`),
-and the muxer builds the `hvcC` from the parameter sets of the first
-frame. Nothing is re-encoded; every other stream is copied exactly as
-before.
+(the Matroska CodecPrivate, an MP4's `hvcC`) that names no VPS, SPS or
+PPS: they are in the stream only. FFmpeg's MP4 muxer (7.1 and later)
+writes an empty `hvcC` for such a stream copied as `hvc1`, which
+shaka-packager can't parse.
+
+- An MP4 is copied through Annex B (`hevc_mp4toannexb`), and the muxer
+  builds the `hvcC` from the parameter sets of the first frame.
+- A Matroska file, which stores no decode times, would come out of that
+  mistimed at its start: FFmpeg can't tell the stream's reorder delay
+  without the SPS while it times the first packets. It is read instead
+  through a head of its own file whose CodecPrivate is the whole `hvcC`
+  built from its first packet, then the rest of the file where it is
+  (the `concat` and `subfile` protocols; nothing is copied), and copied
+  as a stream whose record holds its parameter sets.
+- The head is made only for a layout a test proves (FFmpeg's and
+  mkvmerge's, the conditions in `packager.py`); any other Matroska file,
+  and a copy through the head that fails or comes out other than the
+  original (a demuxer warning, another length, another picture count),
+  is copied through Annex B as before.
+
+Nothing is re-encoded; every other stream is copied exactly as before.
 
 **HDR10 static metadata.** An HDR10 original's mastering display colour
 volume and content light level are in its container (Matroska's
